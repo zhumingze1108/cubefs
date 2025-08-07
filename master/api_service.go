@@ -894,12 +894,14 @@ func (m *Server) getCluster(w http.ResponseWriter, r *http.Request) {
 		ForbidWriteOpOfProtoVer0:     m.cluster.cfg.forbidWriteOpOfProtoVer0,
 		LegacyDataMediaType:          m.cluster.legacyDataMediaType,
 		RaftPartitionCanUsingDifferentPortEnabled: m.cluster.RaftPartitionCanUsingDifferentPortEnabled(),
+		FlashNodes: make([]proto.NodeView, 0),
 	}
 
 	vols := m.cluster.allVolNames()
 	cv.MasterNodes = m.cluster.allMasterNodes()
 	cv.MetaNodes = m.cluster.allMetaNodes()
 	cv.DataNodes = m.cluster.allDataNodes()
+	cv.FlashNodes = m.cluster.allFlashNodes()
 	cv.DataNodeStatInfo = m.cluster.dataNodeStatInfo
 	cv.MetaNodeStatInfo = m.cluster.metaNodeStatInfo
 	for _, name := range vols {
@@ -2112,8 +2114,7 @@ func (m *Server) decommissionDataPartition(w http.ResponseWriter, r *http.Reques
 	}
 	err = m.cluster.markDecommissionDataPartition(dp, node, raftForce, uint32(decommissionType))
 	if err != nil {
-		rstMsg = err.Error()
-		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: rstMsg})
+		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
 	auditlog.LogMasterOp("DataPartitionDecommission", fmt.Sprintf("decommission dp %v by manual", dp.decommissionInfo()), nil)
@@ -2502,7 +2503,26 @@ func (m *Server) updateVol(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newArgs := getVolVarargs(vol)
+	if err = parseArgs(r,
+		newArg("remoteCacheEnable", &newArgs.remoteCacheEnable).OmitEmpty(),
+		newArg("remoteCacheEnable", &newArgs.remoteCacheEnable).OmitEmpty(),
+		newArg("remoteCachePath", &newArgs.remoteCachePath).OmitEmpty(),
+		newArg("remoteCacheAutoPrepare", &newArgs.remoteCacheAutoPrepare).OmitEmpty(),
+		newArg("remoteCacheTTL", &newArgs.remoteCacheTTL).OmitEmpty(),
+		newArg("remoteCacheReadTimeoutSec", &newArgs.remoteCacheReadTimeoutSec).OmitEmpty(),
+		newArg("remoteCacheMaxFileSizeGB", &newArgs.remoteCacheMaxFileSizeGB).OmitEmpty(),
+		newArg("remoteCacheOnlyForNotSSD", &newArgs.remoteCacheOnlyForNotSSD).OmitEmpty(),
+		newArg("remoteCacheMultiRead", &newArgs.remoteCacheMultiRead).OmitEmpty(),
+	); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
 
+	if newArgs.remoteCacheReadTimeoutSec < proto.ReadDeadlineTime {
+		err = fmt.Errorf("remoteCacheReadTimeoutSec cannot < %v", proto.ReadDeadlineTime)
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
 	if req.quotaClass != 0 {
 		newArgs.quotaByClass[req.quotaClass] = req.quotaOfClass
 		log.LogWarnf("updateVol: try update vol capcity, class %d, cap %d, name %s", req.quotaClass, req.quotaOfClass, req.name)
@@ -2516,6 +2536,9 @@ func (m *Server) updateVol(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(newArgs.remoteCachePath) != 0 {
+		newArgs.remoteCachePath = deduplicateAndRemoveContained(newArgs.remoteCachePath)
+	}
 	newArgs.zoneName = req.zoneName
 	newArgs.crossZone = req.crossZone
 	newArgs.description = req.description
@@ -2524,6 +2547,7 @@ func (m *Server) updateVol(w http.ResponseWriter, r *http.Request) {
 	newArgs.followerRead = req.followerRead
 	newArgs.metaFollowerRead = req.metaFollowerRead
 	newArgs.directRead = req.directRead
+	newArgs.maximallyRead = req.maximallyRead
 	newArgs.authenticate = req.authenticate
 	newArgs.dpSelectorName = req.dpSelectorName
 	newArgs.dpSelectorParm = req.dpSelectorParm
@@ -2548,8 +2572,8 @@ func (m *Server) updateVol(w http.ResponseWriter, r *http.Request) {
 	newArgs.volStorageClass = req.volStorageClass
 	newArgs.forbidWriteOpOfProtoVer0 = req.forbidWriteOpOfProtoVer0
 
-	log.LogWarnf("[updateVolOut] name [%s], z1 [%s], z2[%s] replicaNum[%v], FR[%v], metaFR[%v]",
-		req.name, req.zoneName, vol.zoneName, req.replicaNum, req.followerRead, req.metaFollowerRead)
+	log.LogWarnf("[updateVolOut] name [%s], z1 [%s], z2[%s] replicaNum[%v], FR[%v], metaFR[%v], MMR[%v]",
+		req.name, req.zoneName, vol.zoneName, req.replicaNum, req.followerRead, req.metaFollowerRead, req.maximallyRead)
 	if err = m.cluster.updateVol(req.name, req.authKey, newArgs); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
@@ -2956,6 +2980,13 @@ func (m *Server) checkCreateVolReq(req *createVolReq) (err error) {
 		return err
 	}
 
+	if req.remoteCacheReadTimeout < proto.ReadDeadlineTime {
+		err = fmt.Errorf("remoteCacheReadTimeout(%v) less than %v",
+			req.remoteCacheReadTimeout, proto.ReadDeadlineTime)
+		log.LogErrorf("[checkCreateVolReq] creating vol(%v) err:%v", req.name, err.Error())
+		return err
+	}
+
 	return nil
 }
 
@@ -3085,7 +3116,8 @@ func newSimpleView(vol *Vol) (view *proto.SimpleVolView) {
 		volInodeCount = volInodeCount + mp.InodeCount
 	}
 	vol.mpsLock.RUnlock()
-	maxPartitionID := vol.maxPartitionID()
+	maxMetaPartitionID := vol.maxMetaPartitionID()
+	maxDataPartitionID := vol.dataPartitions.getMaxDataPartitionID()
 
 	quotaOfClass := []*proto.StatOfStorageClass{}
 	for t, c := range vol.getQuotaByClass() {
@@ -3101,12 +3133,14 @@ func newSimpleView(vol *Vol) (view *proto.SimpleVolView) {
 		MpReplicaNum:       vol.mpReplicaNum,
 		InodeCount:         volInodeCount,
 		DentryCount:        volDentryCount,
-		MaxMetaPartitionID: maxPartitionID,
+		MaxMetaPartitionID: maxMetaPartitionID,
+		MaxDataPartitionID: maxDataPartitionID,
 		Status:             vol.Status,
 		Capacity:           vol.Capacity,
 		FollowerRead:       vol.FollowerRead,
 		MetaFollowerRead:   vol.MetaFollowerRead,
 		DirectRead:         vol.DirectRead,
+		MaximallyRead:      vol.MaximallyRead,
 		LeaderRetryTimeOut: vol.LeaderRetryTimeout,
 
 		EnablePosixAcl:          vol.enablePosixAcl,
@@ -3156,6 +3190,15 @@ func newSimpleView(vol *Vol) (view *proto.SimpleVolView) {
 		CacheDpStorageClass:      vol.cacheDpStorageClass,
 		ForbidWriteOpOfProtoVer0: vol.ForbidWriteOpOfProtoVer0.Load(),
 		QuotaOfStorageClass:      quotaOfClass,
+
+		RemoteCacheEnable:         vol.remoteCacheEnable,
+		RemoteCachePath:           vol.remoteCachePath,
+		RemoteCacheAutoPrepare:    vol.remoteCacheAutoPrepare,
+		RemoteCacheTTL:            vol.remoteCacheTTL,
+		RemoteCacheReadTimeoutSec: vol.remoteCacheReadTimeoutSec,
+		RemoteCacheMaxFileSizeGB:  vol.remoteCacheMaxFileSizeGB,
+		RemoteCacheOnlyForNotSSD:  vol.remoteCacheOnlyForNotSSD,
+		RemoteCacheMultiRead:      vol.remoteCacheMultiRead,
 	}
 	view.AllowedStorageClass = make([]uint32, len(vol.allowedStorageClass))
 	copy(view.AllowedStorageClass, vol.allowedStorageClass)
@@ -3298,6 +3341,44 @@ func (m *Server) getDataNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sendOkReply(w, r, newSuccessHTTPReply(dataNodeInfo))
+}
+
+func (m *Server) setDpCntLimit(w http.ResponseWriter, r *http.Request) {
+	var (
+		nodeAddr   string
+		dpCntLimit uint64
+		dataNode   *DataNode
+		err        error
+	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.SetDpCntLimit))
+	defer func() {
+		doStatAndMetric(proto.SetDpCntLimit, metric, err, nil)
+	}()
+
+	if nodeAddr, err = parseAndExtractNodeAddr(r); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	if dataNode, err = m.cluster.dataNode(nodeAddr); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(proto.ErrDataNodeNotExists))
+		return
+	}
+
+	if dpCntLimit, err = strconv.ParseUint(r.FormValue(maxDpCntLimitKey), 10, 64); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	oldDpCntLimit := dataNode.DpCntLimit
+	dataNode.DpCntLimit = dpCntLimit
+
+	if err = m.cluster.syncUpdateDataNode(dataNode); err != nil {
+		dataNode.DpCntLimit = oldDpCntLimit
+		sendErrReply(w, r, newErrHTTPReply(proto.ErrDataNodeNotExists))
+		return
+	}
+	sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("set dpCntLimit to %v successfully", dataNode.DpCntLimit)))
 }
 
 // Decommission a data node. This will decommission all the data partition on that node.
@@ -4039,6 +4120,7 @@ func (m *Server) buildNodeSetGrpInfo(nsg *nodeSetGroup) *proto.SimpleNodeSetGrpI
 				SelectedTimes:      node.SelectedTimes,
 				DataPartitionCount: node.DataPartitionCount,
 				NodeSetID:          node.NodeSetID,
+				MaxDpCntLimit:      node.GetPartitionLimitCnt(),
 			}
 			nsStat.DataNodes = append(nsStat.DataNodes, dataNodeInfo)
 			return true
@@ -4068,6 +4150,7 @@ func (m *Server) buildNodeSetGrpInfo(nsg *nodeSetGroup) *proto.SimpleNodeSetGrpI
 				ReportTime:         node.ReportTime,
 				MetaPartitionCount: node.MetaPartitionCount,
 				NodeSetID:          node.NodeSetID,
+				MaxMpCntLimit:      node.GetPartitionLimitCnt(),
 			}
 
 			nsStat.MetaNodes = append(nsStat.MetaNodes, metaNodeInfo)
@@ -5030,6 +5113,43 @@ func (m *Server) getMetaNode(w http.ResponseWriter, r *http.Request) {
 	sendOkReply(w, r, newSuccessHTTPReply(metaNodeInfo))
 }
 
+func (m *Server) setMpCntLimit(w http.ResponseWriter, r *http.Request) {
+	var (
+		nodeAddr   string
+		mpCntLimit uint64
+		metaNode   *MetaNode
+		err        error
+	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.SetMpCntLimit))
+	defer func() {
+		doStatAndMetric(proto.SetMpCntLimit, metric, err, nil)
+	}()
+
+	if nodeAddr, err = parseAndExtractNodeAddr(r); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	if metaNode, err = m.cluster.metaNode(nodeAddr); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(proto.ErrMetaNodeNotExists))
+		return
+	}
+
+	if mpCntLimit, err = strconv.ParseUint(r.FormValue(maxMpCntLimitKey), 10, 64); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	oldMpCntLimit := metaNode.MpCntLimit
+	metaNode.MpCntLimit = mpCntLimit
+	if err = m.cluster.syncUpdateMetaNode(metaNode); err != nil {
+		metaNode.MpCntLimit = oldMpCntLimit
+		sendErrReply(w, r, newErrHTTPReply(proto.ErrMetaNodeNotExists))
+		return
+	}
+	sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("set MpCntLimit to %v successfully", metaNode.MpCntLimit)))
+}
+
 func (m *Server) decommissionMetaPartition(w http.ResponseWriter, r *http.Request) {
 	var (
 		partitionID uint64
@@ -5642,15 +5762,16 @@ func (m *Server) getVolStatInfo(w http.ResponseWriter, r *http.Request) {
 	hostName := r.FormValue(proto.HostKey)
 	role := r.FormValue(proto.RoleKey)
 	enableBcache := r.FormValue(proto.BcacheOnlyForNotSSDKey)
-	log.LogInfof("getVolStatInfo: get client ver info %s, ip %s, host %s, vol %s, role %s, enableBcache %s",
-		clientVer, remoteIp, hostName, name, role, enableBcache)
+	enableRCache := r.FormValue(proto.EnableRemoteCache)
+	log.LogInfof("getVolStatInfo: get client ver info %s, ip %s, host %s, vol %s, role %s, enableBcache %s, enableRCache %s",
+		clientVer, remoteIp, hostName, name, role, enableBcache, enableRCache)
 
 	if vol, err = m.cluster.getVol(name); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(proto.ErrVolNotExists))
 		return
 	}
 
-	m.cliMgr.PutItem(remoteIp, hostName, name, clientVer, role, enableBcache)
+	m.cliMgr.PutItem(remoteIp, hostName, name, clientVer, role, enableBcache, enableRCache)
 
 	if proto.IsCold(vol.VolType) && ver != proto.LFClient {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: "ec-vol is supported by LF client only"})
@@ -5696,6 +5817,7 @@ func volStat(vol *Vol, countByMeta bool) (stat *proto.VolStatInfo) {
 	stat.StatMigrateStorageClass = vol.StatMigrateStorageClass
 	stat.StatByDpMediaType = vol.StatByDpMediaType
 	stat.MetaFollowerRead = vol.MetaFollowerRead
+	stat.MaximallyRead = vol.MaximallyRead
 	stat.LeaderRetryTimeOut = int(vol.LeaderRetryTimeout)
 
 	log.LogDebugf("[volStat] vol[%v] total[%v],usedSize[%v] TrashInterval[%v] DefaultStorageClass[%v]",
@@ -5730,6 +5852,7 @@ func getMetaPartitionView(mp *MetaPartition) (mpView *proto.MetaPartitionView) {
 	mpView.TxRbInoCnt = mp.TxRbInoCnt
 	mpView.TxRbDenCnt = mp.TxRbDenCnt
 	mpView.IsRecover = mp.IsRecover
+	mpView.IsFreeze = mp.IsFreeze
 	return
 }
 
@@ -6606,31 +6729,92 @@ func (m *Server) getConfigHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Server) setConfig(key string, value string) (err error) {
-	var metaPartitionInodeIdStep uint64
-	if key == cfgmetaPartitionInodeIdStep {
-		if metaPartitionInodeIdStep, err = strconv.ParseUint(value, 10, 64); err != nil {
+	var (
+		oldUint64Value           uint64
+		metaPartitionInodeIdStep uint64
+		oldFloat64Value          float64
+		memRatioPercent          float64
+		oldBoolValue             bool
+		autoMigrate              bool
+	)
+
+	switch key {
+	case cfgmetaPartitionInodeIdStep:
+		metaPartitionInodeIdStep, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
 			return err
 		}
-		oldValue := m.config.MetaPartitionInodeIdStep
+		oldUint64Value = m.config.MetaPartitionInodeIdStep
 		m.config.MetaPartitionInodeIdStep = metaPartitionInodeIdStep
-		if err = m.cluster.syncPutCluster(); err != nil {
-			m.config.MetaPartitionInodeIdStep = oldValue
-			log.LogErrorf("setConfig syncPutCluster fail err %v", err)
+	case cfgMetaNodeMemoryHighPer:
+		memRatioPercent, err = strconv.ParseFloat(value, 64)
+		if err != nil {
 			return err
 		}
-	} else {
+		if memRatioPercent <= m.config.metaNodeMemLowPer {
+			return fmt.Errorf("high percent[%f] must be larger than low percent[%f]", memRatioPercent, m.config.metaNodeMemLowPer)
+		}
+		oldFloat64Value = m.config.metaNodeMemHighPer
+		m.config.metaNodeMemHighPer = memRatioPercent
+	case cfgMetaNodeMemoryLowPer:
+		memRatioPercent, err = strconv.ParseFloat(value, 64)
+		if err != nil {
+			return err
+		}
+		if memRatioPercent >= m.config.metaNodeMemHighPer {
+			return fmt.Errorf("low percent[%f] must be smaller than high percent[%f]", memRatioPercent, m.config.metaNodeMemHighPer)
+		}
+		oldFloat64Value = m.config.metaNodeMemLowPer
+		m.config.metaNodeMemLowPer = memRatioPercent
+	case cfgAutoMpMigrate:
+		autoMigrate, err = strconv.ParseBool(value)
+		if err != nil {
+			return err
+		}
+		oldBoolValue = m.config.AutoMpMigrate
+		m.config.AutoMpMigrate = autoMigrate
+	default:
 		err = keyNotFound("config")
+		return err
 	}
+
+	if err = m.cluster.syncPutCluster(); err != nil {
+		switch key {
+		case cfgmetaPartitionInodeIdStep:
+			m.config.MetaPartitionInodeIdStep = oldUint64Value
+		case cfgMetaNodeMemoryHighPer:
+			m.config.metaNodeMemHighPer = oldFloat64Value
+		case cfgMetaNodeMemoryLowPer:
+			m.config.metaNodeMemLowPer = oldFloat64Value
+		case cfgAutoMpMigrate:
+			m.config.AutoMpMigrate = oldBoolValue
+		}
+		log.LogErrorf("setConfig syncPutCluster fail err %v", err)
+		return err
+	}
+
+	// update the middle value
+	if key == cfgMetaNodeMemoryHighPer || key == cfgMetaNodeMemoryLowPer {
+		m.config.metaNodeMemMidPer = (m.config.metaNodeMemHighPer + m.config.metaNodeMemLowPer) / 2.0
+	}
+
 	return err
 }
 
 func (m *Server) getConfig(key string) (value string, err error) {
-	if key == cfgmetaPartitionInodeIdStep {
-		v := m.config.MetaPartitionInodeIdStep
-		value = strconv.FormatUint(v, 10)
-	} else {
+	switch key {
+	case cfgmetaPartitionInodeIdStep:
+		value = strconv.FormatUint(m.config.MetaPartitionInodeIdStep, 10)
+	case cfgMetaNodeMemoryHighPer:
+		value = strconv.FormatFloat(m.config.metaNodeMemHighPer, 'f', -1, 64)
+	case cfgMetaNodeMemoryLowPer:
+		value = strconv.FormatFloat(m.config.metaNodeMemLowPer, 'f', -1, 64)
+	case cfgAutoMpMigrate:
+		value = strconv.FormatBool(m.config.AutoMpMigrate)
+	default:
 		err = keyNotFound("config")
 	}
+
 	return value, err
 }
 
@@ -8347,4 +8531,47 @@ func (m *Server) getUpgradeCompatibleSettings(w http.ResponseWriter, r *http.Req
 		len(cInfo.VolsForbidWriteOpOfProtoVer0), cInfo.VolsForbidWriteOpOfProtoVer0)
 
 	sendOkReply(w, r, newSuccessHTTPReply(cInfo))
+}
+
+func removeDuplicatePaths(paths []string) []string {
+	uniquePaths := make(map[string]bool)
+	var result []string
+	for _, path := range paths {
+		if _, exists := uniquePaths[path]; !exists {
+			uniquePaths[path] = true
+			result = append(result, path)
+		}
+	}
+	return result
+}
+
+func removeSubPaths(paths []string) []string {
+	sort.Slice(paths, func(i, j int) bool {
+		return len(paths[i]) < len(paths[j])
+	})
+
+	var result []string
+	for _, path := range paths {
+		shouldAdd := true
+		if path == "/" {
+			return []string{"/"}
+		}
+		for i := range result {
+			if strings.HasPrefix(path+"/", result[i]+"/") && path != result[i] {
+				shouldAdd = false
+				break
+			}
+		}
+		if shouldAdd {
+			result = append(result, path)
+		}
+	}
+	return result
+}
+
+func deduplicateAndRemoveContained(pathStr string) string {
+	paths := strings.Split(pathStr, ",")
+	uniquePaths := removeDuplicatePaths(paths)
+	finalPaths := removeSubPaths(uniquePaths)
+	return strings.Join(finalPaths, ",")
 }

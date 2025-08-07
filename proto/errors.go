@@ -112,6 +112,8 @@ var (
 	ErrNoSupportStorageClass                   = errors.New("Lifecycle storage class not allowed")
 	ErrDataNodeAdd                             = errors.New("DataNode mediaType not match")
 	ErrNeedForbidVer0                          = errors.New("Need set volume ForbidWriteOpOfProtoVer0 first")
+	ErrTmpfsNoSpace                            = errors.New("no space left on device")
+	ErrNoMpMigratePlan                         = errors.New("no meta partition migrate plan")
 )
 
 // http response error code and error message definitions
@@ -183,6 +185,7 @@ const (
 	ErrCodeNodeSetNotExists
 	ErrCodeNoSuchLifecycleConfiguration
 	ErrCodeNoSupportStorageClass
+	ErrCodeTmpfsNoSpace
 )
 
 // Err2CodeMap error map to code
@@ -250,6 +253,7 @@ var Err2CodeMap = map[error]int32{
 	ErrNodeSetNotExists:                ErrCodeNodeSetNotExists,
 	ErrNoSuchLifecycleConfiguration:    ErrCodeNoSuchLifecycleConfiguration,
 	ErrNoSupportStorageClass:           ErrCodeNoSupportStorageClass,
+	ErrTmpfsNoSpace:                    ErrCodeTmpfsNoSpace,
 }
 
 func ParseErrorCode(code int32) error {
@@ -326,6 +330,7 @@ var code2ErrMap = map[int32]error{
 	ErrCodeVolHasDeleted:                   ErrVolHasDeleted,
 	ErrCodeNoSuchLifecycleConfiguration:    ErrNoSuchLifecycleConfiguration,
 	ErrCodeNoSupportStorageClass:           ErrNoSupportStorageClass,
+	ErrCodeTmpfsNoSpace:                    ErrTmpfsNoSpace,
 }
 
 type GeneralResp struct {

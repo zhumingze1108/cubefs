@@ -21,6 +21,7 @@ const (
 	CliOpStatus                      = "stat"
 	CliOpCreate                      = "create"
 	CliOpDelete                      = "delete"
+	CliOpRemove                      = "remove"
 	CliOpInfo                        = "info"
 	CliOpAdd                         = "add"
 	CliOpSet                         = "set"
@@ -92,6 +93,7 @@ const (
 	CliFlagVolType                      = "vol-type"
 	CliFlagFollowerRead                 = "follower-read"
 	CliFlagMetaFollowerRead             = "meta-follower-read"
+	CliFlagMaximallyRead                = "maximally-read"
 	CliFlagCacheRuleKey                 = "cache-rule-key"
 	CliFlagEbsBlkSize                   = "ebs-blk-size"
 	CliFlagCacheCapacity                = "cache-capacity"
@@ -160,6 +162,16 @@ const (
 	CliForbidWriteOpOfProtoVersion0     = "forbidWriteOpOfProtoVersion0"
 	CliFlagVolQuotaClass                = "quotaClass"
 	CliFlagVolQuotaOfClass              = "quotaOfStorageClass"
+
+	CliFlagRemoteCacheEnable         = "remoteCacheEnable"
+	CliFlagRemoteCachePath           = "remoteCachePath"
+	CliFlagRemoteCacheAutoPrepare    = "remoteCacheAutoPrepare"
+	CliFlagRemoteCacheTTL            = "remoteCacheTTL"
+	CliFlagRemoteCacheReadTimeoutSec = "remoteCacheReadTimeoutSec"
+	CliFlagRemoteCacheMaxFileSizeGB  = "remoteCacheMaxFileSizeGB"
+	CliFlagRemoteCacheOnlyForNotSSD  = "remoteCacheOnlyForNotSSD"
+	CliFlagRemoteCacheMultiRead      = "remoteCacheMultiRead"
+
 	// CliFlagSetDataPartitionCount	= "count" use dp-count instead
 
 	// Shorthand format of resource name

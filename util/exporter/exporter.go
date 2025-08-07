@@ -50,13 +50,16 @@ const (
 	ConfigKeySubDir         = "subdir"
 
 	// monitor label name
-	Vol     = "vol"
-	Disk    = "disk"
-	PartId  = "partid"
-	Op      = "op"
-	Type    = "type"
-	Err     = "err"
-	Version = "version"
+	Vol       = "vol"
+	Disk      = "disk"
+	PartId    = "partid"
+	Op        = "op"
+	Type      = "type"
+	Err       = "err"
+	Version   = "version"
+	FlashNode = "flashnode"
+	Client    = "client"
+	DateNode  = "datanode"
 )
 
 var (
@@ -326,6 +329,9 @@ var (
 )
 
 func RecodCost(api string, costUs int64) {
+	if recoder == nil {
+		return
+	}
 	obLk.RLock()
 	ob := obMap[api]
 	obLk.RUnlock()

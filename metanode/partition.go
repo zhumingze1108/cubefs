@@ -102,6 +102,7 @@ type MetaPartitionConfig struct {
 	ConnPool                 *util.ConnectPool   `json:"-"`
 	Forbidden                bool                `json:"-"`
 	ForbidWriteOpOfProtoVer0 bool                `json:"ForbidWriteOpOfProtoVer0"`
+	Freeze                   bool                `json:"freeze"`
 }
 
 func (c *MetaPartitionConfig) checkMeta() (err error) {
@@ -154,6 +155,7 @@ type OpInode interface {
 	InodeGetWithEk(req *InodeGetReq, p *Packet) (err error)
 	SetCreateTime(req *SetCreateTimeRequest, reqData []byte, p *Packet) (err error) // for debugging
 	DeleteMigrationExtentKey(req *proto.DeleteMigrationExtentKeyRequest, p *Packet, remoteAddr string) (err error)
+	UpdateInodeMeta(req *proto.UpdateInodeMetaRequest, p *Packet) (err error)
 }
 
 type OpExtend interface {
@@ -271,6 +273,7 @@ type OpPartition interface {
 	CanRemoveRaftMember(peer proto.Peer) error
 	IsEquareCreateMetaPartitionRequst(request *proto.CreateMetaPartitionRequest) (err error)
 	GetUniqID(p *Packet, num uint32) (err error)
+	CloseAndBackupRaft() error
 }
 
 // MetaPartition defines the interface for the meta partition operations.
@@ -292,6 +295,7 @@ type MetaPartition interface {
 	UpdateVolumeView(dataView *proto.DataPartitionsView, volumeView *proto.SimpleVolView)
 	GetStatByStorageClass() []*proto.StatOfStorageClass
 	GetMigrateStatByStorageClass() []*proto.StatOfStorageClass
+	SetFreeze(req *proto.FreezeMetaPartitionRequest) (err error)
 }
 
 type UidManager struct {
@@ -621,7 +625,7 @@ func (mp *metaPartition) IsFollowerRead() (ok bool) {
 }
 
 func (mp *metaPartition) IsForbidden() bool {
-	return mp.config.Forbidden
+	return mp.config.Forbidden || mp.config.Freeze
 }
 
 func (mp *metaPartition) SetForbidden(status bool) {
@@ -915,7 +919,10 @@ func (mp *metaPartition) onStart(isCreate bool) (err error) {
 				Address: gClusterInfo.EbsAddr, // gClusterInfo is fetched from master in register procedure
 			},
 			MaxSizePutOnce: int64(volInfo.ObjBlockSize),
-			Logger:         &access.Logger{Filename: path.Join(log.LogDir, "ebs.log")},
+			Logger: &access.Logger{
+				Filename: path.Join(log.LogDir, "ebs.log"),
+			},
+			LogLevel: log.GetBlobLogLevel(),
 		})
 
 		if err != nil {
@@ -1928,4 +1935,30 @@ func (mp *metaPartition) GetStatByStorageClass() []*proto.StatOfStorageClass {
 
 func (mp *metaPartition) GetMigrateStatByStorageClass() []*proto.StatOfStorageClass {
 	return mp.statByMigrateStorageClass
+}
+
+func (mp *metaPartition) CloseAndBackupRaft() (err error) {
+	err = mp.raftPartition.CloseAndBackup()
+	return
+}
+
+func (mp *metaPartition) SetFreeze(req *proto.FreezeMetaPartitionRequest) (err error) {
+	mp.config.Freeze = req.Freeze
+
+	reqData, err := json.Marshal(*req)
+	if err != nil {
+		return
+	}
+	r, err := mp.submit(opFSMSetFreeze, reqData)
+	if err != nil {
+		return
+	}
+	if status := r.(uint8); status != proto.OpOk {
+		p := &Packet{}
+		p.ResultCode = status
+		err = errors.NewErrorf("[SetFreeze]: %s", p.GetResultMsg())
+		return
+	}
+
+	return nil
 }

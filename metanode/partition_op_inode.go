@@ -1143,7 +1143,7 @@ func (mp *metaPartition) UpdateExtentKeyAfterMigration(req *proto.UpdateExtentKe
 	var item BtreeItem
 	if item = mp.inodeTree.Get(inoParm); item == nil {
 		err = fmt.Errorf("mp(%v) can not find inode(%v)", mp.config.PartitionId, inoParm.Inode)
-		log.LogErrorf("action[UpdateExtentKeyAfterMigration] %v", err)
+		log.LogWarnf("action[UpdateExtentKeyAfterMigration] %v", err)
 		p.PacketErrorWithBody(proto.OpNotExistErr, []byte(err.Error()))
 		return
 	}
@@ -1160,24 +1160,24 @@ func (mp *metaPartition) UpdateExtentKeyAfterMigration(req *proto.UpdateExtentKe
 
 	if proto.IsDir(inoParm.Type) && req.NewObjExtentKeys != nil {
 		err = fmt.Errorf("mp(%v) inode(%v) is dir, but request NewObjExtentKeys is not nil", mp.config.PartitionId, inoParm.Inode)
-		log.LogErrorf("action[UpdateExtentKeyAfterMigration] %v", err)
+		log.LogWarnf("action[UpdateExtentKeyAfterMigration] %v", err)
 		p.PacketErrorWithBody(proto.OpArgMismatchErr, []byte(err.Error()))
 		return
 	}
 
 	if inoParm.LeaseNotExpire() {
-		err = fmt.Errorf("mp(%v) inode(%v) is forbidden to migration for lease is occupied by others",
+		errMsg := fmt.Sprintf("mp(%v) inode(%v) is forbidden to migration for lease is occupied by others",
 			mp.config.PartitionId, inoParm.Inode)
-		log.LogErrorf("action[UpdateExtentKeyAfterMigration] %v", err)
-		p.PacketErrorWithBody(proto.OpLeaseOccupiedByOthers, []byte(err.Error()))
+		log.LogWarnf("action[UpdateExtentKeyAfterMigration] %v", errMsg)
+		p.PacketErrorWithBody(proto.OpLeaseOccupiedByOthers, []byte(errMsg))
 		return
 	}
 	leaseExpire := inoParm.LeaseExpireTime
 	if leaseExpire != req.LeaseExpire {
-		err = fmt.Errorf("mp(%v) inode(%v) write generation not match, curent(%v) request(%v)",
+		errMsg := fmt.Sprintf("mp(%v) inode(%v) write generation not match, curent(%v) request(%v)",
 			mp.config.PartitionId, inoParm.Inode, leaseExpire, req.LeaseExpire)
-		log.LogErrorf("action[UpdateExtentKeyAfterMigration] %v", err)
-		p.PacketErrorWithBody(proto.OpLeaseGenerationNotMatch, []byte(err.Error()))
+		log.LogWarnf("action[UpdateExtentKeyAfterMigration] %v", errMsg)
+		p.PacketErrorWithBody(proto.OpLeaseGenerationNotMatch, []byte(errMsg))
 		return
 	}
 	// wal logs for UpdateExtentKeyAfterMigration is persisted, but return no leader later,
@@ -1420,5 +1420,21 @@ func (mp *metaPartition) DeleteMigrationExtentKey(req *proto.DeleteMigrationExte
 	}
 	msg := resp.(*InodeResponse)
 	p.PacketErrorWithBody(msg.Status, nil)
+	return
+}
+
+func (mp *metaPartition) UpdateInodeMeta(req *proto.UpdateInodeMetaRequest, p *Packet) (err error) {
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		log.LogErrorf("UpdateInodeMeta: marshal err(%v)", err)
+		return
+	}
+	_, err = mp.submit(opFSMUpdateInodeMeta, reqData)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
+		return
+	}
+	log.LogDebugf("action[UpdateInodeMeta] inode[%v] exit", req.Inode)
+	p.PacketOkReply()
 	return
 }

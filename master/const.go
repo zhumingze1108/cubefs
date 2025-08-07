@@ -157,6 +157,17 @@ const (
 	quotaClass                      = "quotaClass"
 	quotaOfClass                    = "quotaOfStorageClass"
 	dataMediaTypeKey                = "dataMediaType"
+
+	remoteCacheEnable            = "remoteCacheEnable"
+	remoteCacheAutoPrepare       = "remoteCacheAutoPrepare"
+	remoteCachePath              = "remoteCachePath"
+	remoteCacheTTL               = "remoteCacheTTL"
+	remoteCacheReadTimeout       = "remoteCacheReadTimeout"
+	remoteCacheMaxFileSizeGB     = "remoteCacheMaxFileSizeGB"
+	remoteCacheOnlyForNotSSD     = "remoteCacheOnlyForNotSSD"
+	remoteCacheMultiRead         = "remoteCacheMultiRead"
+	flashNodeHandleReadTimeout   = "flashNodeHandleReadTimeout"
+	flashNodeReadDataNodeTimeout = "flashNodeReadDataNodeTimeout"
 )
 
 const (
@@ -231,6 +242,12 @@ const (
 	defaultAutoDecommissionDiskInterval           = 10 * time.Second
 	maxMpCreationCount                            = 10
 	defaultVolForbidWriteOpOfProtoVersion0        = true
+	DefaultRemoteCacheMaxFileSizeGB               = 128
+	defaultMetaNodeMemHighPer                     = 0.75
+	defaultMetaNodeMemLowPer                      = 0.3
+	metaNodeReserveMemorySize                     = 3 * 1024 * 1024 * 1024
+	metaNodeMemoryRatio                           = 2
+	defaultPlanExpireHours                        = 72
 )
 
 const (
@@ -240,6 +257,12 @@ const (
 	unavailableZone      = 1
 	metaNodesUnAvailable = 2
 	dataNodesUnAvailable = 3
+
+	unusedFlashNodeFlashGroupID = 0
+	defaultFlashGroupSlotsCount = 32
+	RsvEmptyMetaPartitionCnt    = 2
+	WaitForClientUpdateTimeMin  = 10
+	WaitForTaskDeleteByHour     = 24
 )
 
 const (
@@ -284,6 +307,7 @@ const (
 	opSyncDeleteVolUser             uint32 = 0x1D
 	opSyncUpdateVolUser             uint32 = 0x1E
 	opSyncNodeSetGrp                uint32 = 0x1F
+	opSyncDataPartitionsView        uint32 = 0x20
 	opSyncExclueDomain              uint32 = 0x23
 	opSyncUpdateZone                uint32 = 0x24
 	opSyncAllocClientID             uint32 = 0x25
@@ -294,11 +318,9 @@ const (
 	opSyncDeleteDecommissionDisk uint32 = 0x29
 	opSyncUpdateDecommissionDisk uint32 = 0x2A
 
-	DecommissionDiskAcronym = "dd"
-	DecommissionDiskPrefix  = keySeparator + DecommissionDiskAcronym + keySeparator
-
 	opSyncAddLcNode    uint32 = 0x30
 	opSyncDeleteLcNode uint32 = 0x31
+	opSyncUpdateLcNode uint32 = 0x32
 	opSyncAddLcConf    uint32 = 0x33
 	opSyncDeleteLcConf uint32 = 0x34
 	opSyncUpdateLcConf uint32 = 0x35
@@ -317,7 +339,93 @@ const (
 
 	opSyncS3QosSet    uint32 = 0x60
 	opSyncS3QosDelete uint32 = 0x61
+
+	opSyncAddFlashNode     uint32 = 0x6A
+	opSyncDeleteFlashNode  uint32 = 0x6B
+	opSyncUpdateFlashNode  uint32 = 0x6C
+	opSyncAddFlashGroup    uint32 = 0x6D
+	opSyncDeleteFlashGroup uint32 = 0x6E
+	opSyncUpdateFlashGroup uint32 = 0x6F
+
+	opSyncAddBalanceTask    uint32 = 0x70
+	opSyncUpdateBalanceTask uint32 = 0x71
 )
+
+func init() {
+	set := make(map[uint32]struct{})
+	for _, op := range []uint32{
+		opSyncAddMetaNode,
+		opSyncAddDataNode,
+		opSyncAddDataPartition,
+		opSyncAddVol,
+		opSyncAddMetaPartition,
+		opSyncUpdateDataPartition,
+		opSyncUpdateMetaPartition,
+		opSyncDeleteDataNode,
+		opSyncDeleteMetaNode,
+		opSyncAllocDataPartitionID,
+		opSyncAllocMetaPartitionID,
+		opSyncAllocCommonID,
+		opSyncPutCluster,
+		opSyncUpdateVol,
+		opSyncDeleteVol,
+		opSyncDeleteDataPartition,
+		opSyncDeleteMetaPartition,
+		opSyncAddNodeSet,
+		opSyncUpdateNodeSet,
+		opSyncBatchPut,
+		opSyncUpdateDataNode,
+		opSyncUpdateMetaNode,
+		opSyncAddUserInfo,
+		opSyncDeleteUserInfo,
+		opSyncUpdateUserInfo,
+		opSyncAddAKUser,
+		opSyncDeleteAKUser,
+		opSyncAddVolUser,
+		opSyncDeleteVolUser,
+		opSyncUpdateVolUser,
+		opSyncNodeSetGrp,
+		opSyncDataPartitionsView,
+		opSyncExclueDomain,
+		opSyncUpdateZone,
+		opSyncAllocClientID,
+		opSyncPutApiLimiterInfo,
+		opSyncPutFollowerApiLimiterInfo,
+
+		opSyncAddDecommissionDisk,
+		opSyncDeleteDecommissionDisk,
+		opSyncUpdateDecommissionDisk,
+
+		opSyncAddLcNode,
+		opSyncDeleteLcNode,
+		opSyncUpdateLcNode,
+		opSyncAddLcConf,
+		opSyncDeleteLcConf,
+		opSyncUpdateLcConf,
+		opSyncAcl,
+		opSyncUid,
+
+		opSyncAddFlashNode,
+		opSyncDeleteFlashNode,
+		opSyncUpdateFlashNode,
+		opSyncAddFlashGroup,
+		opSyncDeleteFlashGroup,
+		opSyncUpdateFlashGroup,
+
+		opSyncAllocQuotaID,
+		opSyncSetQuota,
+		opSyncDeleteQuota,
+		opSyncMulitVersion,
+
+		opSyncS3QosSet,
+		opSyncS3QosDelete,
+	} {
+		if _, in := set[op]; in {
+			panic(op)
+		}
+		set[op] = struct{}{}
+	}
+}
 
 const (
 	keySeparator           = "#"
@@ -371,6 +479,14 @@ const (
 	lcTaskPrefix     = keySeparator + lcTaskAcronym + keySeparator
 	lcResultPrefix   = keySeparator + lcResultAcronym + keySeparator
 	S3QoSPrefix      = keySeparator + S3QoS + keySeparator
+
+	DecommissionDiskAcronym = "dd"
+	DecommissionDiskPrefix  = keySeparator + DecommissionDiskAcronym + keySeparator
+
+	flashNodePrefix  = keySeparator + "fn" + keySeparator
+	flashGroupPrefix = keySeparator + "fg" + keySeparator
+
+	balanceTaskKey = keySeparator + "balanceTask"
 )
 
 // selector enum
@@ -391,3 +507,15 @@ func NodeTypeString(nodeType NodeType) string {
 		return fmt.Sprintf("unKnownNodeType(%v)", nodeType)
 	}
 }
+
+const (
+	CleanTaskFreezing  = "freezing"
+	CleanTaskFreezed   = "freezeDone"
+	CleanTaskBackuping = "backuping"
+	CleanTaskBackuped  = "backupDone"
+	PlanTaskInit       = "init"
+	PlanTaskRun        = "running"
+	PlanTaskError      = "error"
+	PlanTaskStop       = "stop"
+	PlanTaskDone       = "done"
+)

@@ -129,6 +129,7 @@ import (
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/stat"
+	sysutil "github.com/cubefs/cubefs/util/sys"
 )
 
 const (
@@ -139,7 +140,10 @@ const (
 	MaxSizePutOnce = int64(1) << 23
 )
 
-var gClientManager *clientManager
+var (
+	gClientManager *clientManager
+	sysOutputFile  *os.File
+)
 
 var (
 	statusOK = C.int(0)
@@ -673,6 +677,10 @@ func cfs_close_client(id C.int64_t) {
 	}
 	auditlog.StopAudit()
 	log.LogFlush()
+	if sysOutputFile != nil {
+		sysOutputFile.Sync()
+		sysOutputFile.Close()
+	}
 }
 
 //export cfs_chdir
@@ -850,7 +858,7 @@ func cfs_open(id C.int64_t, path *C.char, flags C.int, mode C.mode_t) C.int {
 	}
 
 	if proto.IsRegular(info.Mode) {
-		c.openStream(f)
+		c.openStream(f, absPath)
 		if fuseFlags&uint32(C.O_TRUNC) != 0 {
 			if accFlags != uint32(C.O_WRONLY) && accFlags != uint32(C.O_RDWR) {
 				c.closeStream(f)
@@ -1510,6 +1518,20 @@ func (c *client) absPath(path string) string {
 func (c *client) start() (err error) {
 	masters := strings.Split(c.masterAddr, ",")
 	if c.logDir != "" {
+		outputFilePath := gopath.Join(c.logDir, "output.log")
+		outputFile, err := os.OpenFile(outputFilePath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o666)
+		sysOutputFile = outputFile
+		if err != nil {
+			err = errors.NewErrorf("Fatal: failed to open output path - %v", err)
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		syslog.SetOutput(outputFile)
+		if err = sysutil.RedirectFD(int(outputFile.Fd()), int(os.Stderr.Fd())); err != nil {
+			err = errors.NewErrorf("Fatal: failed to redirect fd - %v", err)
+			syslog.Println(err)
+			os.Exit(1)
+		}
 		if c.logLevel == "" {
 			c.logLevel = "WARN"
 		}
@@ -1594,6 +1616,7 @@ func (c *client) start() (err error) {
 		VolCacheDpStorageClass:      c.cacheDpStorageClass,
 		OnRenewalForbiddenMigration: mw.RenewalForbiddenMigration,
 		OnForbiddenMigration:        mw.ForbiddenMigration,
+		MetaWrapper:                 mw,
 	}); err != nil {
 		log.LogErrorf("newClient NewExtentClient failed(%v)", err)
 		return
@@ -1774,12 +1797,12 @@ func (c *client) mkdir(pino uint64, name string, mode uint32, fullPath string) (
 	return c.mw.Create_ll(pino, name, fuseMode, 0, 0, nil, fullPath, false)
 }
 
-func (c *client) openStream(f *file) {
+func (c *client) openStream(f *file, fullPath string) {
 	isCache := false
 	if proto.IsCold(c.volType) || proto.IsStorageClassBlobStore(f.storageClass) {
 		isCache = true
 	}
-	_ = c.ec.OpenStream(f.ino, f.openForWrite, isCache)
+	_ = c.ec.OpenStream(f.ino, f.openForWrite, isCache, fullPath)
 }
 
 func (c *client) closeStream(f *file) {

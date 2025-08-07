@@ -17,12 +17,12 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"math"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -48,7 +48,10 @@ const (
 	ExtentMaxSize = 1024 * 1024 * 1024 * 1024 * 4 // 4TB
 	pageSize      = 4096
 	alignSize     = 4096
+	magicNumber   = byte('M')
 )
+
+var ErrNonBytecodeEncode = errors.New("non-bytecode serialization method")
 
 func alignment(block []byte, AlignSize int) int {
 	return int(uintptr(unsafe.Pointer(&block[0])) & uintptr(AlignSize-1))
@@ -117,6 +120,27 @@ func (ei *ExtentInfo) String() (m string) {
 	return fmt.Sprintf("FileID(%v)_Size(%v)_IsDeleted(%v)_Source(%v)_MT(%d)_AT(%d)_CRC(%d)", ei.FileID, ei.Size, ei.IsDeleted, source, ei.ModifyTime, ei.AccessTime, ei.Crc)
 }
 
+func MarshalBinarySlice(eiSlice []*ExtentInfo) (v []byte, err error) {
+	buff := bytes.NewBuffer([]byte{})
+	if err := buff.WriteByte(magicNumber); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buff, binary.BigEndian, int32(len(eiSlice))); err != nil {
+		return nil, err
+	}
+
+	for _, ei := range eiSlice {
+		data, err := ei.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := buff.Write(data); err != nil {
+			return nil, err
+		}
+	}
+	return buff.Bytes(), nil
+}
+
 func (ei *ExtentInfo) MarshalBinaryWithBuffer(buff *bytes.Buffer) (err error) {
 	if err = binary.Write(buff, binary.BigEndian, ei.FileID); err != nil {
 		return
@@ -152,6 +176,37 @@ func (ei *ExtentInfo) MarshalBinary() (v []byte, err error) {
 	}
 	v = buff.Bytes()
 	return
+}
+
+func UnmarshalBinarySlice(data []byte) ([]*ExtentInfo, error) {
+	if len(data) <= 0 {
+		return nil, ErrNonBytecodeEncode
+	}
+	magic := data[0]
+	if magic != magicNumber {
+		return nil, ErrNonBytecodeEncode
+	}
+
+	buff := bytes.NewBuffer(data[1:])
+	// Read the length of the slice
+	var length int32
+	if err := binary.Read(buff, binary.BigEndian, &length); err != nil {
+		return nil, err
+	}
+
+	eiSlice := make([]*ExtentInfo, length)
+
+	// Iterate and read each ExtentInfo
+	for i := int32(0); i < length; i++ {
+		// Read enough bytes for one ExtentInfo
+		var ei *ExtentInfo = new(ExtentInfo)
+		if err := ei.UnmarshalBinaryWithBuffer(buff); err != nil {
+			return nil, err
+		}
+		eiSlice[i] = ei
+	}
+
+	return eiSlice, nil
 }
 
 func (ei *ExtentInfo) UnmarshalBinaryWithBuffer(buff *bytes.Buffer) (err error) {
@@ -713,7 +768,9 @@ func (e *Extent) autoComputeExtentCrc(extSize int64, crcFunc UpdateCrcFunc) (crc
 
 // DeleteTiny deletes a tiny extent.
 func (e *Extent) punchDelete(offset, size int64) (hasDelete bool, err error) {
-	log.LogDebugf("punchDelete extent %v offset %v, size %v", e, offset, size)
+	if log.EnableDebug() {
+		log.LogDebugf("punchDelete extent %v offset %v, size %v", e, offset, size)
+	}
 	if int(offset)%util.PageSize != 0 {
 		return false, ParameterMismatchError
 	}
@@ -723,7 +780,7 @@ func (e *Extent) punchDelete(offset, size int64) (hasDelete bool, err error) {
 
 	newOffset, err := e.file.Seek(offset, SEEK_DATA)
 	if err != nil {
-		if strings.Contains(err.Error(), syscall.ENXIO.Error()) {
+		if errors.Is(err, syscall.ENXIO) {
 			return true, nil
 		}
 		return false, err
@@ -731,7 +788,9 @@ func (e *Extent) punchDelete(offset, size int64) (hasDelete bool, err error) {
 	if newOffset-offset >= size {
 		return true, nil
 	}
-	log.LogDebugf("punchDelete offset %v size %v", offset, size)
+	if log.EnableDebug() {
+		log.LogDebugf("punchDelete offset %v size %v", offset, size)
+	}
 	err = fallocate(int(e.file.Fd()), util.FallocFLPunchHole|util.FallocFLKeepSize, offset, size)
 	return
 }

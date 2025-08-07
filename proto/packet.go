@@ -27,6 +27,8 @@ import (
 	"syscall"
 	"time"
 
+	pb "github.com/gogo/protobuf/proto"
+
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/buf"
 	"github.com/cubefs/cubefs/util/log"
@@ -117,6 +119,10 @@ const (
 	OpAddMetaPartitionRaftMember    uint8 = 0x46
 	OpRemoveMetaPartitionRaftMember uint8 = 0x47
 	OpMetaPartitionTryToLeader      uint8 = 0x48
+	OpFreezeEmptyMetaPartition      uint8 = 0x49
+	OpBackupEmptyMetaPartition      uint8 = 0x4A
+	OpRemoveBackupMetaPartition     uint8 = 0x4B
+	OpIsRaftStatusOk                uint8 = 0x4C
 
 	// Quota
 	OpMetaBatchSetInodeQuota    uint8 = 0x50
@@ -187,8 +193,9 @@ const (
 	OpMetaTxGet          uint8 = 0xAB
 
 	// Operations: Client -> MetaNode.
-	OpMetaGetUniqID    uint8 = 0xAC
-	OpMetaGetAppliedID uint8 = 0xAD
+	OpMetaGetUniqID       uint8 = 0xAC
+	OpMetaGetAppliedID    uint8 = 0xAD
+	OpMetaUpdateInodeMeta uint8 = 0xAE
 
 	// Multi version snapshot
 	OpRandomWriteAppend     uint8 = 0xB1
@@ -278,6 +285,11 @@ const (
 	OpLeaseOccupiedByOthers             uint8 = 0x86
 	OpLeaseGenerationNotMatch           uint8 = 0x87
 	OpWriteOpOfProtoVerForbidden        uint8 = 0x88
+	OpMetaForbiddenMigration            uint8 = 0x89
+	// Distributed cache related OP codes.
+	OpFlashNodeHeartbeat    uint8 = 0xDA
+	OpFlashNodeCachePrepare uint8 = 0xDB
+	OpFlashNodeCacheRead    uint8 = 0xDC
 )
 
 const (
@@ -292,6 +304,8 @@ const (
 	MultiVersionFlag                          = 0x80
 	VersionListFlag                           = 0x40
 	PacketProtocolVersionFlag                 = 0x10
+
+	DefaultRemoteCacheTTL = 5 * 24 * 3600
 )
 
 // multi version operation
@@ -693,6 +707,12 @@ func (p *Packet) GetOpMsg() (m string) {
 		m = "OpMetaUpdateExtentKeyAfterMigration"
 	case OpDeleteMigrationExtentKey:
 		m = "OpDeleteMigrationExtentKey"
+	case OpFlashNodeHeartbeat:
+		m = "OpFlashNodeHeartbeat"
+	case OpFlashNodeCachePrepare:
+		m = "OpFlashNodeCachePrepare"
+	case OpFlashNodeCacheRead:
+		m = "OpFlashNodeCacheRead"
 	default:
 		m = fmt.Sprintf("op:%v not found", p.Opcode)
 	}
@@ -948,6 +968,20 @@ func (p *Packet) UnmarshalData(v interface{}) error {
 	return json.Unmarshal(p.Data, v)
 }
 
+func (p *Packet) MarshalDataPb(m pb.Message) error {
+	data, err := pb.Marshal(m)
+	if err == nil {
+		p.Data = data
+		p.Size = uint32(len(p.Data))
+		// p.CRC = crc32.ChecksumIEEE(p.Data[:p.Size])
+	}
+	return err
+}
+
+func (p *Packet) UnmarshalDataPb(m pb.Message) error {
+	return pb.Unmarshal(p.Data, m)
+}
+
 // WriteToNoDeadLineConn writes through the connection without deadline.
 func (p *Packet) WriteToNoDeadLineConn(c net.Conn) (err error) {
 	header, err := Buffers.Get(util.PacketHeaderSize)
@@ -1030,7 +1064,7 @@ func (p *Packet) IsReadOperation() bool {
 	return p.Opcode == OpStreamRead || p.Opcode == OpRead ||
 		p.Opcode == OpExtentRepairRead || p.Opcode == OpReadTinyDeleteRecord ||
 		p.Opcode == OpTinyExtentRepairRead || p.Opcode == OpStreamFollowerRead ||
-		p.Opcode == OpSnapshotExtentRepairRead
+		p.Opcode == OpSnapshotExtentRepairRead || p.Opcode == OpBackupRead
 }
 
 func (p *Packet) IsReadMetaPkt() bool {

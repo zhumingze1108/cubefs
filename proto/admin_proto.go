@@ -189,11 +189,20 @@ const (
 	DeleteBackupDirectories            = "/disk/deleteBackupDirectories"
 	QueryBackupDirectories             = "/disk/queryBackupDirectories"
 	GetDataNode                        = "/dataNode/get"
+	SetDpCntLimit                      = "/dataNode/setDpCntLimit"
 	AddMetaNode                        = "/metaNode/add"
+	SetMpCntLimit                      = "/metaNode/setMpCntLimit"
 	DecommissionMetaNode               = "/metaNode/decommission"
 	MigrateMetaNode                    = "/metaNode/migrate"
+	MigrateMetaPartition               = "/metaNode/migratePartition"
+	MigrateResult                      = "/metaNode/migrateResult"
 	GetMetaNode                        = "/metaNode/get"
 	AdminUpdateMetaNode                = "/metaNode/update"
+	CreateBalanceTask                  = "/metaNode/createBalanceTask"
+	GetBalanceTask                     = "/metaNode/getBalanceTask"
+	RunBalanceTask                     = "/metaNode/runBalanceTask"
+	StopBalanceTask                    = "/metaNode/stopBalanceTask"
+	DeleteBalanceTask                  = "/metaNode/deleteBalanceTask"
 	AdminUpdateDataNode                = "/dataNode/update"
 	AdminGetInvalidNodes               = "/invalid/nodes"
 	AdminLoadMetaPartition             = "/metaPartition/load"
@@ -201,6 +210,11 @@ const (
 	AdminDecommissionMetaPartition     = "/metaPartition/decommission"
 	AdminChangeMetaPartitionLeader     = "/metaPartition/changeleader"
 	AdminBalanceMetaPartitionLeader    = "/metaPartition/balanceLeader"
+	AdminMetaPartitionEmptyStatus      = "/metaPartition/emptyStatus"
+	AdminMetaPartitionFreezeEmpty      = "/metaPartition/freezeEmpty"
+	AdminMetaPartitionCleanEmpty       = "/metaPartition/cleanEmpty"
+	AdminMetaPartitionRemoveBackup     = "/metaPartition/removeBackup"
+	AdminMetaPartitionGetCleanTask     = "/metaPartition/getCleanTask"
 	AdminAddMetaReplica                = "/metaReplica/add"
 	AdminDeleteMetaReplica             = "/metaReplica/delete"
 	AdminPutDataPartitions             = "/dataPartitions/set"
@@ -273,6 +287,23 @@ const (
 	AdminEnablePersistAccessTime = "/vol/enablePersistAccessTime"
 
 	AdminVolAddAllowedStorageClass = "/vol/addAllowedStorageClass"
+	// FlashNode API
+	FlashNodeAdd    = "/flashNode/add"
+	FlashNodeSet    = "/flashNode/set"
+	FlashNodeRemove = "/flashNode/remove"
+	FlashNodeGet    = "/flashNode/get"
+	FlashNodeList   = "/flashNode/list"
+
+	// FlashGroup API
+	AdminFlashGroupTurn       = "/flashGroup/turn"
+	AdminFlashGroupCreate     = "/flashGroup/create"
+	AdminFlashGroupSet        = "/flashGroup/set"
+	AdminFlashGroupRemove     = "/flashGroup/remove"
+	AdminFlashGroupNodeAdd    = "/flashGroup/addFlashNode"
+	AdminFlashGroupNodeRemove = "/flashGroup/removeFlashNode"
+	AdminFlashGroupGet        = "/flashGroup/get"
+	AdminFlashGroupList       = "/flashGroup/list"
+	ClientFlashGroups         = "/client/flashGroups"
 )
 
 var GApiInfo map[string]string = map[string]string{
@@ -348,7 +379,7 @@ var GApiInfo map[string]string = map[string]string{
 	"adddatanode":                     AddDataNode,
 	"decommissiondatanode":            DecommissionDataNode,
 	"migratedatanode":                 MigrateDataNode,
-	"canceldecommissiondatanode":      PauseDecommissionDataNode,
+	"canceldecommissiondatanode":      CancelDecommissionDataNode,
 	"decommissiondisk":                DecommissionDisk,
 	"getdatanode":                     GetDataNode,
 	"addmetanode":                     AddMetaNode,
@@ -385,12 +416,14 @@ var GApiInfo map[string]string = map[string]string{
 
 const (
 	MetaFollowerReadKey    = "metaFollowerRead"
+	MaximallyReadKey       = "maximallyRead"
 	LeaderRetryTimeoutKey  = "leaderRetryTimeout"
 	VolEnableDirectRead    = "directRead"
 	HostKey                = "host"
 	ClientVerKey           = "clientVer"
 	RoleKey                = "role"
 	BcacheOnlyForNotSSDKey = "enableBcacheNotSSD"
+	EnableRemoteCache      = "enableRemoteCache"
 )
 
 // const TimeFormat = "2006-01-02 15:04:05"
@@ -761,6 +794,11 @@ type TxInfos struct {
 	TxInfo []*TxInfo
 }
 
+type FlashNodeHeartBeatInfos struct {
+	FlashNodeHandleReadTimeout   int
+	FlashNodeReadDataNodeTimeout int
+}
+
 // HeartBeatRequest define the heartbeat request.
 type HeartBeatRequest struct {
 	CurrTime   int64
@@ -781,6 +819,7 @@ type HeartBeatRequest struct {
 	NotifyForbidWriteOpOfProtoVer0 bool     // whether forbid by node granularity, will notify to nodes
 	VolsForbidWriteOpOfProtoVer0   []string // whether forbid by volume granularity, will notify to partitions of volume in nodes
 	DirectReadVols                 []string
+	FlashNodeHeartBeatInfos
 }
 
 // DataPartitionReport defines the partition report.
@@ -890,6 +929,8 @@ type MetaNodeHeartbeatResponse struct {
 	ZoneName                         string
 	Total                            uint64
 	Used                             uint64
+	NodeMemTotal                     uint64
+	NodeMemUsed                      uint64
 	MetaPartitionReports             []*MetaPartitionReport
 	Status                           uint8
 	Result                           string
@@ -904,6 +945,29 @@ type LcNodeHeartbeatResponse struct {
 	LcTaskCountLimit      int
 	LcScanningTasks       map[string]*LcNodeRuleTaskResponse
 	SnapshotScanningTasks map[string]*SnapshotVerDelTaskResponse
+}
+
+type FlashNodeDiskCacheStat struct {
+	DataPath  string
+	Medium    string
+	Total     int64
+	MaxAlloc  int64
+	HasAlloc  int64
+	FreeSpace int64
+	HitRate   float64
+	Evicts    int
+	ReadRps   int
+	KeyNum    int
+	Status    int
+}
+
+// FlashNodeHeartbeatResponse defines the response to the flash node heartbeat.
+type FlashNodeHeartbeatResponse struct {
+	Status   uint8
+	Result   string
+	Version  string
+	ZoneName string
+	Stat     []*FlashNodeDiskCacheStat
 }
 
 // DeleteFileRequest defines the request to delete a file.
@@ -1031,6 +1095,7 @@ type MetaPartitionView struct {
 	Members     []string
 	LeaderAddr  string
 	Status      int8
+	IsFreeze    bool
 }
 
 type DataNodeDisksRequest struct{}
@@ -1187,6 +1252,7 @@ type SimpleVolView struct {
 	InodeCount              uint64
 	DentryCount             uint64
 	MaxMetaPartitionID      uint64
+	MaxDataPartitionID      uint64
 	Status                  uint8
 	Capacity                uint64 // GB
 	RwDpCnt                 int
@@ -1195,6 +1261,7 @@ type SimpleVolView struct {
 	FollowerRead            bool
 	MetaFollowerRead        bool
 	DirectRead              bool
+	MaximallyRead           bool
 	NeedToLowerReplica      bool
 	Authenticate            bool
 	CrossZone               bool
@@ -1249,6 +1316,17 @@ type SimpleVolView struct {
 	CacheDpStorageClass      uint32
 	ForbidWriteOpOfProtoVer0 bool
 	QuotaOfStorageClass      []*StatOfStorageClass
+
+	RemoteCacheEnable         bool
+	RemoteCachePath           string
+	RemoteCacheAutoPrepare    bool
+	RemoteCacheTTL            int64
+	RemoteCacheReadTimeoutSec int64
+	RemoteCacheMaxFileSizeGB  int64
+	RemoteCacheOnlyForNotSSD  bool
+	RemoteCacheMultiRead      bool
+
+	RemoteCacheRemoveDupReq bool // TODO: using it in metanode, origin was named EnableRemoveDupReq
 }
 
 type NodeSetInfo struct {
@@ -1562,3 +1640,26 @@ const (
 )
 
 // const ForbiddenMigrationRenewalPeriod = 10 * time.Second // for debug
+
+type VolEmptyMpStats struct {
+	Name           string               `json:"name"`
+	Total          int                  `json:"total"`
+	EmptyCount     int                  `json:"emptyCount"`
+	MetaPartitions []*MetaPartitionView `json:"metaPartitions"`
+}
+
+// FreezeMetaPartitionRequest defines the request of freezing a meta partition.
+type FreezeMetaPartitionRequest struct {
+	PartitionID uint64
+	Freeze      bool
+}
+
+type BackupMetaPartitionRequest struct {
+	PartitionID uint64
+}
+
+type IsRaftStatusOKRequest struct {
+	PartitionID uint64
+	Ready       bool
+	ReplicaNum  int
+}

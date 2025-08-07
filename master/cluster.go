@@ -43,6 +43,11 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
+var (
+	clusterDpCntLimit uint64
+	clusterMpCntLimit uint64
+)
+
 // nolint: structcheck
 type ClusterVolSubItem struct {
 	vols                map[string]*Vol
@@ -61,6 +66,7 @@ type ClusterTopoSubItem struct {
 	idAlloc            *IDAllocator
 	t                  *topology
 	dataNodeStatInfo   *nodeStatInfo
+	dataStatsByMedia   map[string]*nodeStatInfo
 	metaNodeStatInfo   *nodeStatInfo
 	zoneStatInfos      map[string]*proto.ZoneStat
 	volStatInfo        sync.Map
@@ -98,6 +104,16 @@ type ClusterDecommission struct {
 	AutoDecommissionInterval    atomicutil.Int64
 	AutoDpMetaRepairParallelCnt atomicutil.Uint32
 	server                      *Server
+}
+
+type CleanTask struct {
+	Name      string    `json:"name"`
+	Status    string    `json:"status"`
+	TaskCnt   int       `json:"taskCount"`
+	FreezeCnt int       `json:"freezeCount"`
+	CleanCnt  int       `json:"cleanCount"`
+	ResetCnt  int       `json:"resetCount"`
+	Timeout   time.Time `json:"-"`
 }
 
 // Cluster stores all the cluster-level information.
@@ -139,6 +155,13 @@ type Cluster struct {
 
 	ac           *authSDK.AuthClient
 	masterClient *masterSDK.MasterClient
+
+	flashNodeTopo *flashNodeTopology
+
+	cleanTask map[string]*CleanTask
+	Cleaning  bool
+	mu        sync.Mutex
+	PlanRun   bool
 }
 
 type cTask struct {
@@ -213,7 +236,7 @@ func (mgr *followerReadManager) getVolumeDpView() {
 	}
 	mgr.rwMutex.Unlock()
 
-	if mgr.c.masterClient.Leader() == "" {
+	if mgr.c.leaderInfo.id == 0 {
 		log.LogErrorf("followerReadManager.getVolumeDpView but master leader not ready")
 		return
 	}
@@ -229,6 +252,7 @@ func (mgr *followerReadManager) getVolumeDpView() {
 			continue
 		}
 
+		mgr.c.masterClient.SetLeader(mgr.c.leaderInfo.addr)
 		log.LogDebugf("followerReadManager.getVolumeDpView %v leader(%v)", vv.Name, mgr.c.masterClient.Leader())
 		if view, err = mgr.c.masterClient.ClientAPI().GetDataPartitionsFromLeader(vv.Name); err != nil {
 			log.LogErrorf("followerReadManager.getVolumeDpView %v GetDataPartitions err %v leader(%v)", vv.Name, err, mgr.c.masterClient.Leader())
@@ -248,7 +272,7 @@ func (mgr *followerReadManager) sendFollowerVolumeDpView() {
 	}
 	avgSleepTime := time.Second * 5 / time.Duration(len(vols))
 	for _, vol := range vols {
-		log.LogDebugf("followerReadManager.getVolumeDpView %v", vol.Name)
+		log.LogDebugf("followerReadManager.sendFollowerVolumeDpView %v", vol.Name)
 		if (vol.Status == proto.VolStatusMarkDelete && !vol.Forbidden) || (vol.Status == proto.VolStatusMarkDelete && vol.Forbidden && time.Until(vol.DeleteExecTime) <= 0) {
 			continue
 		}
@@ -263,6 +287,7 @@ func (mgr *followerReadManager) sendFollowerVolumeDpView() {
 			if addr == mgr.c.leaderInfo.addr {
 				continue
 			}
+
 			mgr.c.masterClient.SetLeader(addr)
 			if err = mgr.c.masterClient.AdminAPI().PutDataPartitions(vol.Name, body); err != nil {
 				mgr.c.masterClient.SetLeader("")
@@ -392,16 +417,17 @@ func newCluster(name string, leaderInfo *LeaderInfo, fsm *MetadataFsm, partition
 	c.delayDeleteVolsInfo = make([]*delayDeleteVolInfo, 0)
 	c.stopc = make(chan bool)
 	c.cfg = cfg
-	if c.cfg.MaxDpCntLimit == 0 {
-		c.cfg.MaxDpCntLimit = defaultMaxDpCntLimit
+	if clusterDpCntLimit == 0 {
+		atomic.StoreUint64(&clusterDpCntLimit, defaultMaxDpCntLimit)
 	}
-	if c.cfg.MaxMpCntLimit == 0 {
-		c.cfg.MaxMpCntLimit = defaultMaxMpCntLimit
+	if clusterMpCntLimit == 0 {
+		atomic.StoreUint64(&clusterMpCntLimit, defaultMaxMpCntLimit)
 	}
 	c.t = newTopology()
 	c.BadDataPartitionIds = new(sync.Map)
 	c.BadMetaPartitionIds = new(sync.Map)
 	c.dataNodeStatInfo = new(nodeStatInfo)
+	c.dataStatsByMedia = make(map[string]*proto.NodeStatInfo)
 	c.metaNodeStatInfo = new(nodeStatInfo)
 	c.FaultDomain = cfg.faultDomain
 	c.zoneStatInfos = make(map[string]*proto.ZoneStat)
@@ -430,6 +456,9 @@ func newCluster(name string, leaderInfo *LeaderInfo, fsm *MetadataFsm, partition
 	c.EnableAutoDpMetaRepair.Store(defaultEnableDpMetaRepair)
 	c.AutoDecommissionInterval.Store(int64(defaultAutoDecommissionDiskInterval))
 	c.server = server
+	c.flashNodeTopo = newFlashNodeTopology()
+	c.cleanTask = make(map[string]*CleanTask)
+	c.PlanRun = false
 	return
 }
 
@@ -456,6 +485,9 @@ func (c *Cluster) scheduleTask() {
 	c.scheduleToBadDisk()
 	c.scheduleToCheckVolUid()
 	c.scheduleToCheckDataReplicaMeta()
+	c.scheduleToUpdateFlashGroupRespCache()
+	c.scheduleStartBalanceTask()
+	c.scheduleToUpdateFlashGroupSlots()
 }
 
 func (c *Cluster) masterAddr() (addr string) {
@@ -809,7 +841,6 @@ func (c *Cluster) scheduleToCheckHeartbeat() {
 			name:     "scheduleToCheckHeartbeat_checkDataNodeHeartbeat",
 			function: func() (fin bool) {
 				if c.partition != nil && c.partition.IsRaftLeader() {
-					c.checkLeaderAddr()
 					c.checkDataNodeHeartbeat()
 					// update load factor
 					setOverSoldFactor(c.cfg.ClusterLoadFactor)
@@ -841,11 +872,17 @@ func (c *Cluster) scheduleToCheckHeartbeat() {
 				return
 			},
 		})
-}
 
-func (c *Cluster) checkLeaderAddr() {
-	leaderID, _ := c.partition.LeaderTerm()
-	c.leaderInfo.addr = AddrDatabase[leaderID]
+	go func() {
+		ticker := time.NewTicker(time.Second * defaultIntervalToCheckHeartbeat)
+		defer ticker.Stop()
+		for {
+			if c.partition != nil && c.partition.IsRaftLeader() {
+				c.checkFlashNodeHeartbeat()
+			}
+			<-ticker.C
+		}
+	}()
 }
 
 func (c *Cluster) checkDataNodeHeartbeat() {
@@ -1213,7 +1250,6 @@ func (c *Cluster) addMetaNode(nodeAddr, heartbeatPort, replicaPort, zoneName str
 	}
 
 	metaNode = newMetaNode(nodeAddr, heartbeatPort, replicaPort, zoneName, c.Name)
-	metaNode.MpCntLimit = newLimitCounter(&c.cfg.MaxMpCntLimit, defaultMaxMpCntLimit)
 	zone, err := c.t.getZone(zoneName)
 	if err != nil {
 		log.LogInfof("[addMetaNode] create zone(%v) by metanode(%v)", zoneName, nodeAddr)
@@ -1379,7 +1415,6 @@ func (c *Cluster) addDataNode(nodeAddr, raftHeartbeatPort, raftReplicaPort, zone
 
 	needPersistZone := false
 	dataNode = newDataNode(nodeAddr, raftHeartbeatPort, raftReplicaPort, zoneName, c.Name, mediaType)
-	dataNode.DpCntLimit = newLimitCounter(&c.cfg.MaxDpCntLimit, defaultMaxDpCntLimit)
 	if zone, _ = c.t.getZone(zoneName); zone == nil {
 		log.LogInfof("[addDataNode] create zone(%v) by datanode(%v), mediaType(%v)",
 			zoneName, nodeAddr, proto.MediaTypeString(mediaType))
@@ -2395,23 +2430,23 @@ func (c *Cluster) getAllMetaPartitionIDByMetaNode(addr string) (partitionIDs []u
 	return
 }
 
-// func (c *Cluster) getAllMetaPartitionsByMetaNode(addr string) (partitions []*MetaPartition) {
-// 	partitions = make([]*MetaPartition, 0)
-// 	safeVols := c.allVols()
-// 	for _, vol := range safeVols {
-// 		for _, mp := range vol.MetaPartitions {
-// 			vol.mpsLock.RLock()
-// 			for _, host := range mp.Hosts {
-// 				if host == addr {
-// 					partitions = append(partitions, mp)
-// 					break
-// 				}
-// 			}
-// 			vol.mpsLock.RUnlock()
-// 		}
-// 	}
-// 	return
-// }
+func (c *Cluster) getAllMetaPartitionsByMetaNode(addr string) (partitions []*MetaPartition) {
+	partitions = make([]*MetaPartition, 0)
+	safeVols := c.allVols()
+	for _, vol := range safeVols {
+		for _, mp := range vol.MetaPartitions {
+			vol.mpsLock.RLock()
+			for _, host := range mp.Hosts {
+				if host == addr {
+					partitions = append(partitions, mp)
+					break
+				}
+			}
+			vol.mpsLock.RUnlock()
+		}
+	}
+	return
+}
 
 func (c *Cluster) decommissionDataNodePause(dataNode *DataNode) (err error, failed []uint64) {
 	if !dataNode.CanBePaused() {
@@ -3951,6 +3986,7 @@ func (c *Cluster) doCreateVol(req *createVolReq) (vol *Vol, err error) {
 		ReplicaNum:              defaultReplicaNum,
 		FollowerRead:            req.followerRead,
 		MetaFollowerRead:        req.metaFollowerRead,
+		MaximallyRead:           req.maximallyRead,
 		Authenticate:            req.authenticate,
 		CrossZone:               req.crossZone,
 		DefaultPriority:         req.normalZonesFirst,
@@ -3991,6 +4027,15 @@ func (c *Cluster) doCreateVol(req *createVolReq) (vol *Vol, err error) {
 		VolStorageClass:     req.volStorageClass,
 		AllowedStorageClass: req.allowedStorageClass,
 		CacheDpStorageClass: req.cacheDpStorageClass,
+
+		RemoteCacheEnable:         req.remoteCacheEnable,
+		RemoteCacheAutoPrepare:    req.remoteCacheAutoPrepare,
+		RemoteCacheTTL:            req.remoteCacheTTL,
+		RemoteCachePath:           req.remoteCachePath,
+		RemoteCacheReadTimeoutSec: req.remoteCacheReadTimeout,
+		RemoteCacheMaxFileSizeGB:  req.remoteCacheMaxFileSizeGB,
+		RemoteCacheOnlyForNotSSD:  req.remoteCacheOnlyForNotSSD,
+		RemoteCacheMultiRead:      req.remoteCacheMultiRead,
 	}
 
 	vv.QuotaOfClass = make([]*proto.StatOfStorageClass, 0)
@@ -4097,6 +4142,24 @@ func (c *Cluster) allMetaNodes() (metaNodes []proto.NodeView) {
 			Status: metaNode.IsActive, IsWritable: metaNode.IsWriteAble(), MediaType: proto.MediaType_Unspecified,
 			ForbidWriteOpOfProtoVer0: metaNode.ReceivedForbidWriteOpOfProtoVer0,
 		})
+		return true
+	})
+	return
+}
+
+func (c *Cluster) allFlashNodes() (flashNodes []proto.NodeView) {
+	flashNodes = make([]proto.NodeView, 0)
+	c.flashNodeTopo.flashNodeMap.Range(func(addr, node interface{}) bool {
+		flashNode := node.(*FlashNode)
+		isWritable := flashNode.isWriteable()
+		flashNode.RLock()
+		flashNodes = append(flashNodes, proto.NodeView{
+			ID:         flashNode.ID,
+			Addr:       flashNode.Addr,
+			Status:     flashNode.IsActive,
+			IsWritable: isWritable,
+		})
+		flashNode.RUnlock()
 		return true
 	})
 	return
@@ -4407,7 +4470,7 @@ func (c *Cluster) setMetaNodeDeleteWorkerSleepMs(val uint64) (err error) {
 }
 
 func (c *Cluster) getMaxDpCntLimit() (dpCntInLimit uint64) {
-	dpCntInLimit = atomic.LoadUint64(&c.cfg.MaxDpCntLimit)
+	dpCntInLimit = atomic.LoadUint64(&clusterDpCntLimit)
 	return
 }
 
@@ -4416,10 +4479,11 @@ func (c *Cluster) setMaxDpCntLimit(val uint64) (err error) {
 		val = defaultMaxDpCntLimit
 	}
 	oldVal := c.getMaxDpCntLimit()
-	atomic.StoreUint64(&c.cfg.MaxDpCntLimit, val)
+	// atomic.StoreUint64(&c.cfg.MaxDpCntLimit, val)
+	atomic.StoreUint64(&clusterDpCntLimit, val)
 	if err = c.syncPutCluster(); err != nil {
 		log.LogErrorf("action[MaxDpCntLimit] err[%v]", err)
-		atomic.StoreUint64(&c.cfg.MaxDpCntLimit, oldVal)
+		atomic.StoreUint64(&clusterDpCntLimit, oldVal)
 		err = proto.ErrPersistenceByRaft
 		return
 	}
@@ -4427,7 +4491,7 @@ func (c *Cluster) setMaxDpCntLimit(val uint64) (err error) {
 }
 
 func (c *Cluster) getMaxMpCntLimit() (mpCntLimit uint64) {
-	mpCntLimit = atomic.LoadUint64(&c.cfg.MaxMpCntLimit)
+	mpCntLimit = atomic.LoadUint64(&clusterMpCntLimit)
 	return
 }
 
@@ -4436,10 +4500,11 @@ func (c *Cluster) setMaxMpCntLimit(val uint64) (err error) {
 		val = defaultMaxMpCntLimit
 	}
 	oldVal := c.getMaxMpCntLimit()
-	atomic.StoreUint64(&c.cfg.MaxMpCntLimit, val)
+	// atomic.StoreUint64(&c.cfg.MaxMpCntLimit, val)
+	atomic.StoreUint64(&clusterMpCntLimit, val)
 	if err = c.syncPutCluster(); err != nil {
 		log.LogErrorf("[setMaxMpCntLimit] failed to set mp limit to value(%v), err(%v)", val, err)
-		atomic.StoreUint64(&c.cfg.MaxMpCntLimit, oldVal)
+		atomic.StoreUint64(&clusterMpCntLimit, oldVal)
 		err = proto.ErrPersistenceByRaft
 		return
 	}
@@ -4825,8 +4890,8 @@ func (c *Cluster) TryDecommissionDataNode(dataNode *DataNode) {
 	//	c.syncUpdateDataPartition(dp)
 	//	ns.AddToDecommissionDataPartitionList(dp)
 	//	toBeOffLinePartitionIds = append(toBeOffLinePartitionIds, dp.PartitionID)
-	//}
-	//disk wait for decommission
+	// }
+	// disk wait for decommission
 	dataNode.SetDecommissionStatus(DecommissionRunning)
 	// avoid alloc dp on this node
 	dataNode.ToBeOffline = true

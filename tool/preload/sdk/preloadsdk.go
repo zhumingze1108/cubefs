@@ -159,6 +159,7 @@ func NewClient(config PreloadConfig) *PreLoadClient {
 		VolCacheDpStorageClass:      view.CacheDpStorageClass,
 		OnRenewalForbiddenMigration: mw.RenewalForbiddenMigration,
 		OnForbiddenMigration:        mw.ForbiddenMigration,
+		MetaWrapper:                 mw,
 	}); err != nil {
 		log.LogErrorf("newClient NewExtentClient failed(%v)", err)
 		return nil
@@ -457,7 +458,7 @@ func (c *PreLoadClient) preloadFileWorker(id int64, jobs <-chan fileInfo, wg *sy
 		log.LogDebugf("worker %v ready to preload(%v)", id, job.name)
 		ino := job.ino
 		//#1 open
-		c.ec.OpenStream(ino, true, true)
+		c.ec.OpenStream(ino, true, true, "")
 		//#2 write
 		var (
 			objExtents []proto.ObjExtentKey

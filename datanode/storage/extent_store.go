@@ -58,6 +58,7 @@ const (
 	RandomWriteType          = 2
 	AppendWriteType          = 1
 	AppendRandomWriteType    = 4
+	MaxExtentID              = 1 << 30
 
 	NormalExtentDeleteRetainTime = 3600 * 4
 	CacheFlushMinInterval        = 5 * time.Minute
@@ -151,6 +152,8 @@ type ExtentStore struct {
 	stopC                             chan interface{}
 	ApplyId                           uint64
 	DirectRead                        bool
+	IsEnableSnapshot                  bool
+	extIDLock                         sync.Mutex
 }
 
 func MkdirAll(name string) (err error) {
@@ -575,11 +578,9 @@ func (s *ExtentStore) initBaseFileID() error {
 	defer func() {
 		log.LogInfof("[initBaseFileID] store(%v) init base file id using time(%v), count(%v)", s.dataPath, time.Since(begin), extNum)
 	}()
-	var baseFileID uint64
-	baseFileID, _ = s.GetPersistenceBaseExtentID()
-	log.LogInfof("[initBaseFileID] store(%v) init base file to persistence base extent id using time(%v)", s.dataPath, time.Since(begin))
 
 	// NOTE: try to read hint
+	var baseFileID uint64
 	var err error
 	var extMap map[uint64]*ExtentInfo
 	extMap, err = s.readReadDirHint()
@@ -632,6 +633,20 @@ func (s *ExtentStore) initBaseFileID() error {
 	log.LogInfof("[initBaseFileID] store(%v) init base file to load loop using time(%v)", s.dataPath, time.Since(begin))
 	if baseFileID < MinExtentID {
 		baseFileID = MinExtentID
+	}
+
+	diskBaseFileID, _ := s.GetPersistenceBaseExtentID()
+	log.LogInfof("[initBaseFileID] store(%v) init base file to persistence base extent id using time(%v)", s.dataPath, time.Since(begin))
+
+	if errTmp := s.CheckBaseExtentCrc(); errTmp != nil && errTmp != io.EOF {
+		log.LogErrorf("[initBaseFileID] store(%v) init base file but not consistent baseFileID %v diskBaseFileID %v err %v", s.dataPath, baseFileID, diskBaseFileID, errTmp)
+		return errTmp
+	}
+	if baseFileID != diskBaseFileID {
+		log.LogWarnf("[initBaseFileID] store(%v) init base file but not consistent baseFileID %v diskBaseFileID %v", s.dataPath, baseFileID, diskBaseFileID)
+		if diskBaseFileID > baseFileID {
+			baseFileID = diskBaseFileID
+		}
 	}
 	atomic.StoreUint64(&s.baseExtentID, baseFileID)
 	log.LogInfof("datadir(%v) maxBaseId(%v)", s.dataPath, baseFileID)
@@ -1399,7 +1414,6 @@ func (s *ExtentStore) UpdateBaseExtentID(id uint64) (err error) {
 		err = s.PersistenceBaseExtentID(atomic.LoadUint64(&s.baseExtentID))
 	}
 	s.PreAllocSpaceOnVerfiyFile(atomic.LoadUint64(&s.baseExtentID))
-
 	return
 }
 
@@ -1461,9 +1475,11 @@ func (s *ExtentStore) LoadExtentFromDisk(extentID uint64, putCache bool) (e *Ext
 
 	if !IsTinyExtent(extentID) && proto.IsNormalDp(s.partitionType) {
 		e.header = make([]byte, util.BlockHeaderSize)
-		if _, err = s.verifyExtentFp.ReadAt(e.header, int64(extentID*util.BlockHeaderSize)); err != nil && err != io.EOF {
-			return
+
+		if _, err1 := s.verifyExtentFp.ReadAt(e.header, int64(extentID*util.BlockHeaderSize)); err1 != nil && err1 != io.EOF {
+			log.LogWarnf("LoadExtentFromDisk. partition id %v extent %v err %v", s.partitionID, e, err1)
 		}
+
 		emptyHeader := make([]byte, util.BlockHeaderSize)
 		log.LogDebugf("LoadExtentFromDisk. partition id %v extentId %v, snapshotOff %v, append fp cnt %v",
 			s.partitionID, extentID, e.snapshotDataOff, len(s.verifyExtentFpAppend))

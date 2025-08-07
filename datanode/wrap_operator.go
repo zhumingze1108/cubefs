@@ -258,7 +258,7 @@ func (s *DataNode) handlePacketToCreateExtent(p *repl.Packet) {
 	}
 
 	partition.disk.allocCheckLimit(proto.IopsWriteType, 1)
-	partition.disk.limitWrite.Run(0, func() {
+	partition.disk.limitWrite.Run(0, true, func() {
 		err = partition.ExtentStore().Create(p.ExtentID)
 	})
 }
@@ -759,7 +759,7 @@ func (s *DataNode) handleMarkDeletePacket(p *repl.Packet, c net.Conn) {
 			log.LogInfof("handleMarkDeletePacket Delete PartitionID(%v)_Extent(%v)_Offset(%v)_Size(%v)",
 				p.PartitionID, p.ExtentID, ext.ExtentOffset, ext.Size)
 			partition.disk.allocCheckLimit(proto.IopsWriteType, 1)
-			partition.disk.limitWrite.Run(0, func() {
+			partition.disk.limitWrite.Run(0, true, func() {
 				log.LogInfof("[handleBatchMarkDeletePacket] vol(%v) dp(%v) mark delete extent(%v)", partition.config.VolName, partition.partitionID, p.ExtentID)
 				err = partition.ExtentStore().MarkDelete(p.ExtentID, int64(ext.ExtentOffset), int64(ext.Size))
 				if err != nil {
@@ -771,13 +771,15 @@ func (s *DataNode) handleMarkDeletePacket(p *repl.Packet, c net.Conn) {
 		log.LogInfof("handleMarkDeletePacket Delete PartitionID(%v)_Extent(%v)",
 			p.PartitionID, p.ExtentID)
 		partition.disk.allocCheckLimit(proto.IopsWriteType, 1)
-		partition.disk.limitWrite.Run(0, func() {
+		if rs := partition.disk.limitWrite.Run(0, true, func() {
 			log.LogInfof("[handleBatchMarkDeletePacket] vol(%v) dp(%v) mark delete extent(%v)", partition.config.VolName, partition.partitionID, p.ExtentID)
 			err = partition.ExtentStore().MarkDelete(p.ExtentID, 0, 0)
 			if err != nil {
 				log.LogErrorf("action[handleMarkDeletePacket]: failed to mark delete extent(%v), %v", p.ExtentID, err)
 			}
-		})
+		}); err == nil && rs != nil {
+			err = rs
+		}
 	}
 }
 
@@ -936,7 +938,7 @@ func (s *DataNode) handleWritePacket(p *repl.Packet) {
 				IsSync:        p.IsSyncWrite(),
 				IsHole:        false,
 				IsRepair:      false,
-				IsBackupWrite: false,
+				IsBackupWrite: p.GetOpcode() == proto.OpBackupWrite,
 			}
 			_, err = store.Write(param)
 		}); !writable {
@@ -970,7 +972,7 @@ func (s *DataNode) handleWritePacket(p *repl.Packet) {
 				IsSync:        p.IsSyncWrite(),
 				IsHole:        false,
 				IsRepair:      false,
-				IsBackupWrite: false,
+				IsBackupWrite: p.GetOpcode() == proto.OpBackupWrite,
 			}
 			_, err = store.Write(param)
 		}); !writable {
@@ -1010,7 +1012,7 @@ func (s *DataNode) handleWritePacket(p *repl.Packet) {
 					IsSync:        p.IsSyncWrite(),
 					IsHole:        false,
 					IsRepair:      false,
-					IsBackupWrite: false,
+					IsBackupWrite: p.GetOpcode() == proto.OpBackupWrite,
 				}
 				_, err = store.Write(param)
 			}); !writable {
@@ -1200,6 +1202,7 @@ func (s *DataNode) handlePacketToGetAllWatermarks(p *repl.Packet) {
 		fInfoList []*storage.ExtentInfo
 		err       error
 	)
+	data := p.GetData()
 	partition := p.Object.(*DataPartition)
 	store := partition.ExtentStore()
 	if proto.IsNormalExtentType(p.ExtentType) {
@@ -1214,7 +1217,12 @@ func (s *DataNode) handlePacketToGetAllWatermarks(p *repl.Packet) {
 	if err != nil {
 		p.PackErrorBody(ActionGetAllExtentWatermarks, err.Error())
 	} else {
-		buf, err = json.Marshal(fInfoList)
+		if len(data) == 0 || data[0] != repl.ByteMarker {
+			buf, err = json.Marshal(fInfoList)
+		} else {
+			buf, err = storage.MarshalBinarySlice(fInfoList)
+		}
+
 		if err != nil {
 			p.PackErrorBody(ActionGetAllExtentWatermarks, err.Error())
 		} else {

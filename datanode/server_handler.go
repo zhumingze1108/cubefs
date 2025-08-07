@@ -29,6 +29,7 @@ import (
 	"github.com/cubefs/cubefs/datanode/storage"
 	"github.com/cubefs/cubefs/depends/tiglabs/raft"
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/config"
 	"github.com/cubefs/cubefs/util/log"
 )
@@ -354,9 +355,9 @@ func (s *DataNode) getDiskQos(w http.ResponseWriter, r *http.Request) {
 	disks := make([]interface{}, 0)
 	for _, diskItem := range s.space.GetDisks() {
 		disk := &struct {
-			Path  string        `json:"path"`
-			Read  LimiterStatus `json:"read"`
-			Write LimiterStatus `json:"write"`
+			Path  string             `json:"path"`
+			Read  util.LimiterStatus `json:"read"`
+			Write util.LimiterStatus `json:"write"`
 		}{
 			Path:  diskItem.Path,
 			Read:  diskItem.limitRead.Status(),
@@ -797,4 +798,23 @@ func (s *DataNode) loadDataPartition(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.buildSuccessResp(w, "success")
 	}
+}
+
+func (s *DataNode) getRaftPeers(w http.ResponseWriter, r *http.Request) {
+	const (
+		paramRaftID = "id"
+	)
+	if err := r.ParseForm(); err != nil {
+		err = fmt.Errorf("parse form fail: %v", err)
+		s.buildFailureResp(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	raftID, err := strconv.ParseUint(r.FormValue(paramRaftID), 10, 64)
+	if err != nil {
+		err = fmt.Errorf("parse param %v fail: %v", paramRaftID, err)
+		s.buildFailureResp(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	raftPeers := s.raftStore.GetPeers(raftID)
+	s.buildSuccessResp(w, raftPeers)
 }
