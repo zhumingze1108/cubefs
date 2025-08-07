@@ -165,9 +165,6 @@ func newRaft(config *Config, raftConfig *RaftConfig) (*raft, error) {
 	}
 	raft.curApplied.Set(r.raftLog.applied)
 	raft.peerState.replace(raftConfig.Peers)
-	if logger.IsEnableDebug() {
-		logger.Debug("newRaft:%d, peers: %v", raft.config.NodeID, raftConfig.Peers)
-	}
 
 	util.RunWorker(raft.runApply, raft.handlePanic)
 	util.RunWorker(raft.run, raft.handlePanic)
@@ -693,8 +690,8 @@ func (s *raft) apply() {
 			}
 
 			s.peerState.change(cc)
-			if logger.IsEnableDebug() {
-				logger.Debug("raft[%v] applying configuration change %v.", s.raftFsm.id, cc)
+			if logger.IsEnableWarn() {
+				logger.Warn("raft[%v] applying configuration change %v.", s.raftFsm.id, cc)
 			}
 		}
 		select {

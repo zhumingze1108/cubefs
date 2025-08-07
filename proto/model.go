@@ -48,7 +48,7 @@ type MetaNodeInfo struct {
 	PersistenceMetaPartitions []uint64
 	RdOnly                    bool
 	CanAllowPartition         bool
-	MaxMpCntLimit             uint64  `json:"maxMpCntLimit"`
+	MaxMpCntLimit             uint32
 	CpuUtil                   float64 `json:"cpuUtil"`
 }
 
@@ -77,7 +77,7 @@ type DataNodeInfo struct {
 	BadDisks                              []string
 	RdOnly                                bool
 	CanAllocPartition                     bool
-	MaxDpCntLimit                         uint64             `json:"maxDpCntLimit"`
+	MaxDpCntLimit                         uint32             `json:"maxDpCntLimit"`
 	CpuUtil                               float64            `json:"cpuUtil"`
 	IoUtils                               map[string]float64 `json:"ioUtil"`
 	DecommissionedDisk                    []string
@@ -162,7 +162,6 @@ type ClusterView struct {
 	ForbidWriteOpOfProtoVer0                  bool
 	LegacyDataMediaType                       uint32
 	RaftPartitionCanUsingDifferentPortEnabled bool
-	FlashNodes                                []NodeView
 }
 
 // ClusterNode defines the structure of a cluster node
@@ -299,7 +298,6 @@ type VolStatInfo struct {
 	DefaultStorageClass     uint32
 	CacheDpStorageClass     uint32
 	MetaFollowerRead        bool
-	MaximallyRead           bool
 	LeaderRetryTimeOut      int
 	StatByStorageClass      []*StatOfStorageClass
 	StatMigrateStorageClass []*StatOfStorageClass

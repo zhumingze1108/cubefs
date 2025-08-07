@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -89,19 +88,13 @@ func NewOpLogger(dir, filename string, maxOps int, duration time.Duration, leftS
 
 	logLeftSpace := int64(float64((fs.Blocks * uint64(fs.Bsize))) * leftSpaceRatio)
 
-	filePath := path.Join(dir, filename)
-	filePath, err = filepath.Abs(filePath)
-	if err != nil {
-		return nil, errors.New("get absolute file path failed, " + err.Error())
-	}
-
 	_ = os.Chmod(dir, 0o755)
 	logger := &OpLogger{
 		opCounts:       map[string]*int32{},
 		opCountsMaster: map[string]*int32{},
 		opCountsPrev:   map[string]*int32{},
 		maxOps:         maxOps,
-		logFile:        filePath,
+		logFile:        path.Join(dir, filename),
 		ticker:         time.NewTicker(duration),
 		done:           make(chan bool),
 		fileSize:       DefaultStatLogSize,

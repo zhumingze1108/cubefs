@@ -15,7 +15,6 @@
 package stream
 
 import (
-	"context"
 	"fmt"
 	"math"
 	"math/rand"
@@ -610,16 +609,6 @@ func (eh *ExtentHandler) appendExtentKey() (err error) {
 			 */
 			_ = eh.stream.extents.Append(eh.key, false)
 		}
-
-		if eh.key.PartitionId > 0 && eh.stream.enableRemoteCacheAutoPrepare() {
-			prepareReq := &PrepareRemoteCacheRequest{
-				ctx:   context.Background(),
-				ek:    eh.key,
-				inode: eh.stream.inode,
-			}
-			eh.stream.sendToPrepareRomoteCacheChan(prepareReq)
-			// eh.stream.prepareRemoteCache(ctx, ek)
-		}
 	}
 	if err == nil {
 		eh.dirty = false
@@ -716,8 +705,7 @@ func (eh *ExtentHandler) allocateExtent() (err error) {
 	for i := 0; i < MaxSelectDataPartitionForWrite; i++ {
 		if eh.key == nil {
 			if dp, err = eh.stream.client.dataWrapper.GetDataPartitionForWrite(exclude, eh.storageClass, eh.id); err != nil {
-				log.LogWarnf("allocateExtent: failed to get write data partition, eh(%v) exclude(%v), "+
-					"clear exclude and try again!", eh, exclude)
+				log.LogWarnf("allocateExtent: failed to get write data partition, eh(%v) exclude(%v), clear exclude and try again!", eh, exclude)
 				exclude = make(map[string]struct{})
 				continue
 			}

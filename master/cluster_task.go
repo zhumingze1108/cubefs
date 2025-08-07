@@ -1146,7 +1146,7 @@ func (c *Cluster) updateInodeIDUpperBound(mp *MetaPartition, mr *proto.MetaParti
 		return
 	}
 
-	maxPartitionID := vol.maxMetaPartitionID()
+	maxPartitionID := vol.maxPartitionID()
 	if mr.PartitionID < maxPartitionID {
 		return
 	}

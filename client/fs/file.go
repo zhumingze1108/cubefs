@@ -41,12 +41,10 @@ type File struct {
 	idle      int32
 	parentIno uint64
 	name      string
-	fullPath  string
 	sync.RWMutex
 	fReader *blobstore.Reader
 	fWriter *blobstore.Writer
 	flag    uint32
-	pinos   []uint64
 }
 
 // Functions that File needs to implement
@@ -109,32 +107,31 @@ func NewFile(s *Super, i *proto.InodeInfo, flag uint32, pino uint64, filename st
 			// no thing
 		}
 		log.LogDebugf("Trace NewFile:fReader(%v) fWriter(%v) ", fReader, fWriter)
-		return &File{
-			super: s, info: i, fWriter: fWriter, fReader: fReader, parentIno: pino, name: filename,
-			flag: flag, fullPath: "Invalid",
-		}
+		return &File{super: s, info: i, fWriter: fWriter, fReader: fReader, parentIno: pino, name: filename, flag: flag}
 	}
 	log.LogDebugf("Trace NewFile:ino(%v) flag(%v) ", i, flag)
-	return &File{
-		super: s, info: i, parentIno: pino, name: filename,
-		flag: flag, fullPath: "Invalid",
-	}
+	return &File{super: s, info: i, parentIno: pino, name: filename, flag: flag}
 }
 
 // get file parentPath
 func (f *File) getParentPath() string {
-	return path.Dir(f.fullPath)
-}
-
-func (f *File) setFullPath(fullPath string) {
-	f.fullPath = fixUnixPath(fullPath)
-}
-
-func (f *File) addParentInode(inos []uint64) {
-	if f.pinos == nil {
-		f.pinos = make([]uint64, 0)
+	if f.parentIno == f.super.rootIno {
+		return "/"
 	}
-	f.pinos = append(f.pinos, inos...)
+
+	f.super.fslock.Lock()
+	node, ok := f.super.nodeCache[f.parentIno]
+	f.super.fslock.Unlock()
+	if !ok {
+		log.LogWarnf("Get node cache failed: ino(%v)", f.parentIno)
+		return "unknown"
+	}
+	parentDir, ok := node.(*Dir)
+	if !ok {
+		log.LogErrorf("Type error: Can not convert node -> *Dir, ino(%v)", f.parentIno)
+		return "unknown"
+	}
+	return parentDir.getCwd()
 }
 
 // Attr sets the attributes of a file.
@@ -177,8 +174,8 @@ func (f *File) Forget() {
 
 	ino := f.info.Inode
 	defer func() {
-		stat.EndStat("Forget:file", err, bgTime, 1)
-		log.LogDebugf("TRACE Forget: ino(%v) %v", ino, f.name)
+		stat.EndStat("Forget", err, bgTime, 1)
+		log.LogDebugf("TRACE Forget: ino(%v)", ino)
 	}()
 
 	//TODO:why cannot close fwriter
@@ -217,12 +214,11 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	}()
 
 	ino := f.info.Inode
-	log.LogDebugf("TRACE open ino(%v) info(%v) fullPath(%v)", ino, f.info, f.fullPath)
+	log.LogDebugf("TRACE open ino(%v) info(%v)", ino, f.info)
 	start := time.Now()
 
 	if f.super.bcacheDir != "" && !f.filterFilesSuffix(f.super.bcacheFilterFiles) {
 		parentPath := f.getParentPath()
-		log.LogDebugf("TRACE open ino(%v) fullpath(%v)", ino, f.fullPath)
 		if parentPath != "" && !strings.HasSuffix(parentPath, "/") {
 			parentPath = parentPath + "/"
 		}
@@ -240,9 +236,9 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		isCache = true
 	}
 	if needBCache {
-		f.super.ec.OpenStreamWithCache(ino, needBCache, openForWrite, isCache, f.fullPath)
+		f.super.ec.OpenStreamWithCache(ino, needBCache, openForWrite, isCache)
 	} else {
-		f.super.ec.OpenStream(ino, openForWrite, isCache, f.fullPath)
+		f.super.ec.OpenStream(ino, openForWrite, isCache)
 	}
 	log.LogDebugf("TRACE open ino(%v) f.super.bcacheDir(%v) needBCache(%v)", ino, f.super.bcacheDir, needBCache)
 
@@ -303,7 +299,7 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 	bgTime := stat.BeginStat()
 
 	defer func() {
-		stat.EndStat("Release:file", err, bgTime, 1)
+		stat.EndStat("Release", err, bgTime, 1)
 		log.LogInfof("action[Release] %v", f.fWriter)
 		f.fWriter.FreeCache()
 		// keep nodeCache hold the latest inode info
@@ -313,18 +309,6 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 		if DisableMetaCache {
 			f.super.ic.Delete(ino)
 		}
-		f.super.fslock.Lock()
-		delete(f.super.nodeCache, ino)
-		node, ok := f.super.nodeCache[f.parentIno]
-		if ok {
-			parent, ok := node.(*Dir)
-			if ok {
-				parent.dcache.Delete(f.name)
-				log.LogDebugf("TRACE Release exit: ino(%v) name(%v) decache(%v)",
-					parent.info.Inode, parent.name, parent.dcache.Len())
-			}
-		}
-		f.super.fslock.Unlock()
 	}()
 
 	log.LogDebugf("TRACE Release enter: ino(%v) req(%v)", ino, req)
@@ -335,18 +319,14 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 	//if f.fWriter != nil {
 	//	f.fWriter.Close()
 	//}
-	// if proto.IsCold(f.super.volType) {
-	//	err = f.fWriter.Flush(ino, ctx)
-	// } else {
-	//	err = f.super.ec.CloseStream(ino)
-	// }
-	f.super.ec.CloseStream(ino)
+
+	err = f.super.ec.CloseStream(ino)
 	if err != nil {
 		log.LogErrorf("Release: close writer failed, ino(%v) req(%v) err(%v)", ino, req, err)
 		return ParseError(err)
 	}
 	elapsed := time.Since(start)
-	log.LogDebugf("TRACE Release: ino(%v) req(%v) name(%v)(%v)ns", ino, req, f.fullPath, elapsed.Nanoseconds())
+	log.LogDebugf("TRACE Release: ino(%v) req(%v) (%v)ns", ino, req, elapsed.Nanoseconds())
 
 	return nil
 }
@@ -386,7 +366,6 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 
 	var size int
 	if f.shouldAccessReplicaStorageClass() {
-		f.super.ec.GetStreamer(f.info.Inode).SetParentInode(f.parentIno)
 		size, err = f.super.ec.Read(f.info.Inode, resp.Data[fuse.OutHeaderSize:], int(req.Offset),
 			req.Size, f.info.StorageClass, false)
 	} else {
@@ -633,7 +612,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	if req.Valid.Size() && (proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(f.info.StorageClass)) {
 		// when use trunc param in open request through nfs client and mount on cfs mountPoint, cfs client may not recv open message but only setAttr,
 		// the streamer may not open and cause io error finally,so do a open no matter the stream be opened or not
-		if err := f.super.ec.OpenStream(ino, openForWrite, isCache, f.fullPath); err != nil {
+		if err := f.super.ec.OpenStream(ino, openForWrite, isCache); err != nil {
 			log.LogErrorf("Setattr: OpenStream ino(%v) size(%v) err(%v)", ino, req.Size, err)
 			return ParseError(err)
 		}

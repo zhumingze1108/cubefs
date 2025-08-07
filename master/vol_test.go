@@ -99,7 +99,7 @@ func TestCreateColdVol(t *testing.T) {
 	checkCreateVolParam(volCapacityKey, req, "", 100, t)
 	// zoneName must equal to testZone if no default zone
 	checkCreateVolParam(zoneNameKey, req, "default", testZone2, t)
-	req[remoteCacheReadTimeout] = proto.ReadDeadlineTime
+
 	processWithFatalV2(proto.AdminCreateVol, true, req, t)
 
 	// check default val of normal vol
@@ -304,7 +304,7 @@ func checkMetaPartitionsWritableTest(vol *Vol, t *testing.T) {
 		}
 	}
 
-	maxPartitionID := vol.maxMetaPartitionID()
+	maxPartitionID := vol.maxPartitionID()
 	maxMp := vol.MetaPartitions[maxPartitionID]
 	// after check meta partitions ,the status must be writable
 	maxMp.checkStatus(server.cluster.Name, false, int(vol.mpReplicaNum), maxPartitionID, 4194304, vol.Forbidden)

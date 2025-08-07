@@ -37,8 +37,6 @@ type MetaNode struct {
 	Total                            uint64            `json:"TotalWeight"`
 	Used                             uint64            `json:"UsedWeight"`
 	Ratio                            float64
-	NodeMemTotal                     uint64
-	NodeMemUsed                      uint64
 	SelectCount                      uint64
 	Threshold                        float32
 	ReportTime                       time.Time
@@ -50,7 +48,7 @@ type MetaNode struct {
 	PersistenceMetaPartitions        []uint64
 	RdOnly                           bool
 	MigrateLock                      sync.RWMutex
-	MpCntLimit                       uint64             `json:"-"` // max count of meta partition in a meta node
+	MpCntLimit                       LimitCounter       `json:"-"` // max count of meta partition in a meta node
 	CpuUtil                          atomicutil.Float64 `json:"-"`
 	HeartbeatPort                    string             `json:"HeartbeatPort"`
 	ReplicaPort                      string             `json:"ReplicaPort"`
@@ -176,8 +174,6 @@ func (metaNode *MetaNode) updateMetric(resp *proto.MetaNodeHeartbeatResponse, th
 	}
 	metaNode.ZoneName = resp.ZoneName
 	metaNode.Threshold = threshold
-	metaNode.NodeMemTotal = resp.NodeMemTotal
-	metaNode.NodeMemUsed = resp.NodeMemUsed
 }
 
 func (metaNode *MetaNode) reachesThreshold() bool {
@@ -221,18 +217,13 @@ func (metaNode *MetaNode) checkHeartbeat() {
 	}
 }
 
-func (metaNode *MetaNode) GetPartitionLimitCnt() uint64 {
-	if metaNode.MpCntLimit != 0 {
-		return metaNode.MpCntLimit
-	}
-	if clusterMpCntLimit != 0 {
-		return clusterMpCntLimit
-	}
-	return defaultMaxMpCntLimit
+func (metaNode *MetaNode) GetPartitionLimitCnt() (limit uint32) {
+	limit = uint32(metaNode.MpCntLimit.GetCntLimit())
+	return
 }
 
 func (metaNode *MetaNode) PartitionCntLimited() bool {
-	return uint64(metaNode.MetaPartitionCount) <= metaNode.GetPartitionLimitCnt()
+	return uint32(metaNode.MetaPartitionCount) <= metaNode.GetPartitionLimitCnt()
 }
 
 func (metaNode *MetaNode) IsOffline() bool {

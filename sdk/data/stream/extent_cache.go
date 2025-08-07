@@ -47,19 +47,6 @@ func NewExtentRequest(offset, size int, data []byte, ek *proto.ExtentKey) *Exten
 	}
 }
 
-// NewExtentRequest returns a new extent request.
-func NewExtentRequestV2(offset, size int, data []byte, start, end uint64, ek *proto.ExtentKey) *ExtentRequest {
-	req := &ExtentRequest{
-		FileOffset: offset,
-		Size:       size,
-		ExtentKey:  ek,
-	}
-	if data != nil {
-		req.Data = data[start:end]
-	}
-	return req
-}
-
 // ExtentCache defines the struct of the extent cache.
 type ExtentCache struct {
 	sync.RWMutex
@@ -256,12 +243,12 @@ func (cache *ExtentCache) Append(ek *proto.ExtentKey, sync bool) (discardExtents
 	cache.Lock()
 	defer cache.Unlock()
 
-	// cache.root.Descend(func(i btree.Item) bool {
+	//cache.root.Descend(func(i btree.Item) bool {
 	//	ek := i.(*proto.ExtentKey)
 	//	// skip if the start offset matches with the given offset
 	//	log.LogDebugf("action[Append.LoopPrint.Enter] inode %v ek [%v]", cache.inode, ek.String())
 	//	return true
-	// })
+	//})
 
 	// When doing the append, we do not care about the data after the file offset.
 	// Those data will be overwritten by the current extent anyway.
@@ -413,7 +400,7 @@ func (cache *ExtentCache) GetEndForAppendWrite(offset uint64, verSeq uint64, nee
 					ret = nil
 					return false
 				}
-				// ?? should not have the neighbor extent in the next
+				//?? should not have the neighbor extent in the next
 				if lastExistEk != nil && ek.IsFileInSequence(lastExistEk) {
 					log.LogErrorf("action[ExtentCache.GetEndForAppendWrite] ek %v is InSequence exist sequence extent %v", ek, lastExistEk)
 					ret = nil
@@ -465,20 +452,20 @@ func (cache *ExtentCache) PrepareReadRequests(offset, size int, data []byte) []*
 				return false
 			} else if end < ekEnd {
 				// add hole (start, ekStart)
-				req := NewExtentRequestV2(start, ekStart-start, data, uint64(start-offset), uint64(ekStart-offset), nil)
+				req := NewExtentRequest(start, ekStart-start, data[start-offset:ekStart-offset], nil)
 				requests = append(requests, req)
 				// add non-hole (ekStart, end)
-				req = NewExtentRequestV2(ekStart, end-ekStart, data, uint64(ekStart-offset), uint64(end-offset), ek)
+				req = NewExtentRequest(ekStart, end-ekStart, data[ekStart-offset:end-offset], ek)
 				requests = append(requests, req)
 				start = end
 				return false
 			} else {
 				// add hole (start, ekStart)
-				req := NewExtentRequestV2(start, ekStart-start, data, uint64(start-offset), uint64(ekStart-offset), nil)
+				req := NewExtentRequest(start, ekStart-start, data[start-offset:ekStart-offset], nil)
 				requests = append(requests, req)
 
 				// add non-hole (ekStart, ekEnd)
-				req = NewExtentRequestV2(ekStart, ekEnd-ekStart, data, uint64(ekStart-offset), uint64(ekEnd-offset), ek)
+				req = NewExtentRequest(ekStart, ekEnd-ekStart, data[ekStart-offset:ekEnd-offset], ek)
 				requests = append(requests, req)
 
 				start = ekEnd
@@ -487,13 +474,13 @@ func (cache *ExtentCache) PrepareReadRequests(offset, size int, data []byte) []*
 		} else if start < ekEnd {
 			if end <= ekEnd {
 				// add non-hole (start, end)
-				req := NewExtentRequestV2(start, end-start, data, uint64(start-offset), uint64(end-offset), ek)
+				req := NewExtentRequest(start, end-start, data[start-offset:end-offset], ek)
 				requests = append(requests, req)
 				start = end
 				return false
 			} else {
 				// add non-hole (start, ekEnd), start = ekEnd
-				req := NewExtentRequestV2(start, ekEnd-start, data, uint64(start-offset), uint64(ekEnd-offset), ek)
+				req := NewExtentRequest(start, ekEnd-start, data[start-offset:ekEnd-offset], ek)
 				requests = append(requests, req)
 				start = ekEnd
 				return true
@@ -506,7 +493,7 @@ func (cache *ExtentCache) PrepareReadRequests(offset, size int, data []byte) []*
 	log.LogDebugf("PrepareReadRequests: ino(%v) start(%v) end(%v)", cache.inode, start, end)
 	if start < end {
 		// add hole (start, end)
-		req := NewExtentRequestV2(start, end-start, data, uint64(start-offset), uint64(end-offset), nil)
+		req := NewExtentRequest(start, end-start, data[start-offset:end-offset], nil)
 		requests = append(requests, req)
 	}
 

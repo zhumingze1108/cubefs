@@ -32,10 +32,7 @@ const (
 	FinishLoadDataPartitionExtentHeader = 1
 )
 
-const (
-	statusStopped = 0
-	statusStarted = 1
-)
+const statusStarted = 1
 
 // cmd response
 const (

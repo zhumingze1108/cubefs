@@ -224,14 +224,12 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		Masters:           masters,
 		FollowerRead:      opt.FollowerRead,
 		NearRead:          opt.NearRead,
-		MaximallyRead:     opt.MaximallyRead,
 		ReadRate:          opt.ReadRate,
 		WriteRate:         opt.WriteRate,
 		BcacheEnable:      opt.EnableBcache,
 		BcacheDir:         opt.BcacheDir,
 		MaxStreamerLimit:  opt.MaxStreamerLimit,
 		VerReadSeq:        opt.VerReadSeq,
-		MetaWrapper:       s.mw,
 		OnAppendExtentKey: s.mw.AppendExtentKey,
 		OnSplitExtentKey:  s.mw.SplitExtentKey,
 		OnGetExtents:      s.mw.GetExtents,
@@ -257,7 +255,6 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		AheadReadTotalMem:     opt.AheadReadTotalMem,
 		AheadReadBlockTimeOut: opt.AheadReadBlockTimeOut,
 		AheadReadWindowCnt:    opt.AheadReadWindowCnt,
-		NeedRemoteCache:       true,
 	}
 
 	s.ec, err = stream.NewExtentClient(extentConfig)
@@ -333,7 +330,6 @@ func (s *Super) scheduleFlush() {
 		{
 			ctx := context.Background()
 			s.fslock.Lock()
-			// var flushedInos []uint64
 			for ino, node := range s.nodeCache {
 				if _, ok := node.(*File); !ok {
 					continue
@@ -342,16 +338,12 @@ func (s *Super) scheduleFlush() {
 				if atomic.LoadInt32(&file.idle) >= BlobWriterIdleTimeoutPeriod {
 					if file.fWriter != nil {
 						atomic.StoreInt32(&file.idle, 0)
-						// flushedInos = append(flushedInos, ino)
 						go file.fWriter.Flush(ino, ctx)
 					}
 				} else {
 					atomic.AddInt32(&file.idle, 1)
 				}
 			}
-			// for _, ino := range flushedInos {
-			//	delete(s.nodeCache, ino)
-			// }
 			s.fslock.Unlock()
 		}
 	}
@@ -364,9 +356,6 @@ func (s *Super) Root() (fs.Node, error) {
 		return nil, err
 	}
 	root := NewDir(s, inode, inode.Inode, "")
-	root.(*Dir).setFullPath(s.subDir)
-	root.(*Dir).addParentInode([]uint64{inode.Inode})
-	log.LogInfof("Super:root path is(%v)", s.subDir)
 	return root, nil
 }
 

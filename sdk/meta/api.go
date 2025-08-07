@@ -238,14 +238,7 @@ func (mw *MetaWrapper) create_ll(parentID uint64, name string, mode, uid, gid ui
 		mp           *MetaPartition
 		rwPartitions []*MetaPartition
 	)
-	defer func() {
-		//if info != nil && mw.RemoteCacheBloom != nil {
-		//	cacheBloom := mw.RemoteCacheBloom()
-		//	if cacheBloom.TestUint64(parentID) {
-		//		cacheBloom.AddUint64(info.Inode)
-		//	}
-		//}
-	}()
+
 	parentMP := mw.getPartitionByInode(parentID)
 	if parentMP == nil {
 		log.LogErrorf("Create_ll: No parent partition, parentID(%v)", parentID)
@@ -367,16 +360,6 @@ create_dentry:
 }
 
 func (mw *MetaWrapper) Lookup_ll(parentID uint64, name string) (inode uint64, mode uint32, err error) {
-	defer func() {
-		log.LogDebugf("Lookup_ll parent id %v, name %v ,inode %v", parentID, name, inode)
-		//if err == nil && mw.RemoteCacheBloom != nil {
-		//	cacheBloom := mw.RemoteCacheBloom()
-		//	if cacheBloom.TestUint64(parentID) {
-		//		cacheBloom.AddUint64(inode)
-		//	}
-		//}
-	}()
-
 	parentMP := mw.getPartitionByInode(parentID)
 	if parentMP == nil {
 		log.LogErrorf("Lookup_ll: No parent partition, parentID(%v) name(%v)", parentID, name)
@@ -1959,8 +1942,6 @@ func (mw *MetaWrapper) Evict(inode uint64, fullPath string) error {
 		return syscall.EINVAL
 	}
 
-	log.LogDebugf("Evict: ino(%v) mp(%v)", inode, mp.PartitionID)
-
 	status, err := mw.ievict(mp, inode, fullPath)
 	if err != nil || status != statusOK {
 		log.LogWarnf("Evict: ino(%v) err(%v) status(%v)", inode, err, status)
@@ -2744,8 +2725,6 @@ func updateLocalSummary(inodeInfos []*proto.InodeInfo, splits []string, timeUnit
 				thresholdHours = float64(7 * 24 * num)
 			case "month":
 				thresholdHours = float64(30 * 24 * num)
-			default:
-				log.LogWarnf("invalid timeUnit %s", timeUnit)
 			}
 
 			if duration.Hours() < thresholdHours {

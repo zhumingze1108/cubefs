@@ -6,9 +6,6 @@ import com.sun.jna.Pointer;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 
-import java.util.HashMap;
-import java.util.Map;
-
 public class CfsMount {
     // Open flags
     public static final int O_RDONLY = 0;
@@ -45,36 +42,16 @@ public class CfsMount {
     private CfsLibrary libcfs;
     private long cid; // client id allocated by libcfs library
 
-    private Map<String, String> keyValueMap;
-
     public CfsMount() {
-        // libcfs = (CfsLibrary) Native.load("/libcfs.so", CfsLibrary.class);
-        // cid = libcfs.cfs_new_client();
-        keyValueMap = new HashMap<>();
+        libcfs = (CfsLibrary) Native.load("/libcfs.so", CfsLibrary.class);
+        cid = libcfs.cfs_new_client();
     }
 
     public int setClient(String key, String val) {
-        keyValueMap.put(key, val);
-        return 0;
-        // return libcfs.cfs_set_client(this.cid, key, val);
+        return libcfs.cfs_set_client(this.cid, key, val);
     }
 
     public int startClient() {
-        String masterAddr;
-        int ret;
-        masterAddr = keyValueMap.get("masterAddr");
-        System.out.println("masterAddr:" + masterAddr);
-        libcfs = (CfsLibrary) Native.load("/libcfs.so", CfsLibrary.class);
-        System.out.println("load libcfs.so" );
-        cid = libcfs.cfs_new_client();
-         for (Map.Entry<String, String> entry : keyValueMap.entrySet()) {
-              String key = entry.getKey();
-              String val = entry.getValue();
-              ret = libcfs.cfs_set_client(cid, key, val);
-              if (ret != 0) {
-                  return ret;
-              }
-          }
         return libcfs.cfs_start_client(this.cid);
     }
 

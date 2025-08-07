@@ -12,35 +12,30 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-package repl
+package master
 
-const (
-	RequestChanSize = 2048
-)
+import "sync/atomic"
 
-const (
-	ReplProtocolError = 1
-)
+type LimitCounter struct {
+	cntLimit     *uint64
+	defaultValue uint64
+}
 
-const (
-	ActionSendToFollowers     = "ActionSendToFollowers"
-	ActionReceiveFromFollower = "ActionReceiveFromFollower"
-	ActionWriteToClient       = "ActionWriteToClient"
-	ActionCheckReply          = "ActionCheckReply"
+func newLimitCounter(cntLimit *uint64, defaultValue uint64) LimitCounter {
+	limiter := LimitCounter{
+		cntLimit:     cntLimit,
+		defaultValue: defaultValue,
+	}
+	return limiter
+}
 
-	ActionPreparePkt = "ActionPreparePkt"
-)
-
-const (
-	ConnIsNullErr = "ConnIsNullErr"
-)
-
-const (
-	ReplRuning    = 2
-	ReplExiting   = 1
-	ReplHasExited = -3
-
-	FollowerTransportRuning  = 2
-	FollowerTransportExiting = 1
-	FollowerTransportExited  = -1
-)
+func (cntLimiter *LimitCounter) GetCntLimit() uint64 {
+	limit := uint64(0)
+	if cntLimiter.cntLimit != nil {
+		limit = atomic.LoadUint64(cntLimiter.cntLimit)
+	}
+	if limit == 0 {
+		limit = cntLimiter.defaultValue
+	}
+	return limit
+}

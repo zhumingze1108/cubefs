@@ -277,7 +277,7 @@ func TestUpdateInodeIDUpperBound(t *testing.T) {
 		t.Error(err)
 		return
 	}
-	maxPartitionID := vol.maxMetaPartitionID()
+	maxPartitionID := vol.maxPartitionID()
 	vol.volLock.RLock()
 	mp := vol.MetaPartitions[maxPartitionID]
 	mpLen := len(vol.MetaPartitions)
@@ -362,29 +362,25 @@ func TestBalanceMetaPartition(t *testing.T) {
 }
 
 func TestMasterClientLeaderChange(t *testing.T) {
+	cluster := &Cluster{
+		masterClient: masterSDK.NewMasterClient(nil, false),
+	}
+	cluster.t = newTopology()
+	cluster.BadDataPartitionIds = new(sync.Map)
 	server := &Server{
+		cluster: cluster,
 		leaderInfo: &LeaderInfo{
 			addr: "",
 		},
 		user: &User{},
 	}
-
-	cluster := &Cluster{
-		masterClient:  masterSDK.NewMasterClient(nil, false),
-		flashNodeTopo: newFlashNodeTopology(),
-		leaderInfo:    server.leaderInfo,
-	}
-	server.cluster = cluster
-
-	cluster.t = newTopology()
-	cluster.BadDataPartitionIds = new(sync.Map)
-
 	// NOTE: avoid conflict
 	AddrDatabase[5] = "192.168.0.11:17010"
 	AddrDatabase[6] = "192.168.0.12:17010"
 	server.handleLeaderChange(5)
 	server.handleLeaderChange(6)
-	require.True(t, cluster.leaderInfo.addr == AddrDatabase[6])
+	masters := cluster.masterClient.GetMasterAddresses()
+	require.EqualValues(t, 2, len(masters))
 }
 
 func TestCreateVolWithDpCount(t *testing.T) {
@@ -446,14 +442,4 @@ func TestCreateVolWithDpCount(t *testing.T) {
 		err := server.checkCreateVolReq(req)
 		require.Error(t, err)
 	})
-}
-
-func TestStartCleanEmptyMetaPartition(t *testing.T) {
-	err := server.cluster.StartCleanEmptyMetaPartition(commonVolName)
-	require.NoError(t, err)
-}
-
-func TestDoCleanEmptyMetaPartition(t *testing.T) {
-	err := server.cluster.DoCleanEmptyMetaPartition(commonVolName)
-	require.NoError(t, err)
 }

@@ -66,7 +66,6 @@ type MetaPartition struct {
 	ReplicaNum                uint8
 	Status                    int8
 	IsRecover                 bool
-	IsFreeze                  bool
 	volID                     uint64
 	volName                   string
 	Hosts                     []string
@@ -229,7 +228,7 @@ func (mp *MetaPartition) checkEnd(c *Cluster, maxPartitionID uint64) {
 	vol.createMpMutex.Lock()
 	defer vol.createMpMutex.Unlock()
 
-	curMaxPartitionID := vol.maxMetaPartitionID()
+	curMaxPartitionID := vol.maxPartitionID()
 	if mp.PartitionID != curMaxPartitionID {
 		log.LogWarnf("action[checkEnd] partition[%v] not max partition[%v]", mp.PartitionID, curMaxPartitionID)
 		return
@@ -299,10 +298,6 @@ func (mp *MetaPartition) checkLeader(clusterID string) {
 }
 
 func (mp *MetaPartition) checkStatus(clusterID string, writeLog bool, replicaNum int, maxPartitionID uint64, metaPartitionInodeIdStep uint64, forbiddenVol bool) (doSplit bool) {
-	if mp.IsFreeze {
-		return
-	}
-
 	mp.Lock()
 	defer mp.Unlock()
 
@@ -808,25 +803,6 @@ func (mr *MetaReplica) updateMetric(mgr *proto.MetaPartitionReport) {
 	}
 }
 
-func (mr *MetaReplica) createTaskToFreezeReplica(partitionID uint64, freeze bool) (t *proto.AdminTask) {
-	req := &proto.FreezeMetaPartitionRequest{
-		PartitionID: partitionID,
-		Freeze:      freeze,
-	}
-	t = proto.NewAdminTask(proto.OpFreezeEmptyMetaPartition, mr.Addr, req)
-	resetMetaPartitionTaskID(t, partitionID)
-	return
-}
-
-func (mr *MetaReplica) createTaskToBackupReplica(partitionID uint64) (t *proto.AdminTask) {
-	req := &proto.BackupMetaPartitionRequest{
-		PartitionID: partitionID,
-	}
-	t = proto.NewAdminTask(proto.OpBackupEmptyMetaPartition, mr.Addr, req)
-	resetMetaPartitionTaskID(t, partitionID)
-	return
-}
-
 func (mp *MetaPartition) afterCreation(nodeAddr string, c *Cluster) (err error) {
 	metaNode, err := c.metaNode(nodeAddr)
 	if err != nil {
@@ -1041,23 +1017,5 @@ func (mp *MetaPartition) getLiveZones(offlineAddr string) (zones []string) {
 		}
 		zones = append(zones, mr.metaNode.ZoneName)
 	}
-	return
-}
-
-func (mp *MetaPartition) IsEmptyToBeClean() bool {
-	if mp.InodeCount != 0 || mp.DentryCount != 0 || mp.End == defaultMaxMetaPartitionInodeID {
-		return false
-	}
-
-	return true
-}
-
-func (mr *MetaReplica) createTaskToGetRaftStatus(partitionID uint64, replicaNum int) (t *proto.AdminTask) {
-	req := &proto.IsRaftStatusOKRequest{
-		PartitionID: partitionID,
-		ReplicaNum:  replicaNum,
-	}
-	t = proto.NewAdminTask(proto.OpIsRaftStatusOk, mr.Addr, req)
-	resetMetaPartitionTaskID(t, partitionID)
 	return
 }

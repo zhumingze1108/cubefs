@@ -15,7 +15,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -35,11 +34,6 @@ func formatAddr(ipAddr string, domainAddr string) (addr string) {
 		addr = ipAddr
 	}
 	return
-}
-
-func formatIndent(v interface{}) string {
-	b, _ := json.MarshalIndent(v, "", "  ")
-	return string(b)
 }
 
 func formatClusterView(cv *proto.ClusterView, cn *proto.ClusterNodeInfo, cp *proto.ClusterIP) string {
@@ -241,10 +235,8 @@ func formatSimpleVolView(svv *proto.SimpleVolView) string {
 	sb.WriteString(fmt.Sprintf("  Follower read                   : %v\n", formatEnabledDisabled(svv.FollowerRead)))
 	sb.WriteString(fmt.Sprintf("  Meta Follower read              : %v\n", formatEnabledDisabled(svv.MetaFollowerRead)))
 	sb.WriteString(fmt.Sprintf("  Direct Read                     : %v\n", formatEnabledDisabled(svv.DirectRead)))
-	sb.WriteString(fmt.Sprintf("  Maximally Read                  : %v\n", formatEnabledDisabled(svv.MaximallyRead)))
 	sb.WriteString(fmt.Sprintf("  Inode count                     : %v\n", svv.InodeCount))
 	sb.WriteString(fmt.Sprintf("  Max metaPartition ID            : %v\n", svv.MaxMetaPartitionID))
-	sb.WriteString(fmt.Sprintf("  Max DataPartition ID            : %v\n", svv.MaxDataPartitionID))
 	sb.WriteString(fmt.Sprintf("  MpCnt                           : %v\n", svv.MpCnt))
 	sb.WriteString(fmt.Sprintf("  MpReplicaNum                    : %v\n", svv.MpReplicaNum))
 	sb.WriteString(fmt.Sprintf("  NeedToLowerReplica              : %v\n", formatEnabledDisabled(svv.NeedToLowerReplica)))
@@ -297,14 +289,6 @@ func formatSimpleVolView(svv *proto.SimpleVolView) string {
 		}
 		sb.WriteString(fmt.Sprintf("  QuotaOfClass(%s)       : %v\n", proto.StorageClassString(c.StorageClass), quotaLimitStr(c.QuotaGB)))
 	}
-	sb.WriteString(fmt.Sprintf("  remoteCacheEnable               : %v\n", svv.RemoteCacheEnable))
-	sb.WriteString(fmt.Sprintf("  remoteCachePath                 : %v\n", svv.RemoteCachePath))
-	sb.WriteString(fmt.Sprintf("  remoteCacheAutoPrepare          : %v\n", svv.RemoteCacheAutoPrepare))
-	sb.WriteString(fmt.Sprintf("  remoteCacheTTL                  : %v\n", svv.RemoteCacheTTL))
-	sb.WriteString(fmt.Sprintf("  remoteCacheReadTimeoutSec       : %v\n", svv.RemoteCacheReadTimeoutSec))
-	sb.WriteString(fmt.Sprintf("  remoteCacheMaxFileSizeGB        : %v G\n", svv.RemoteCacheMaxFileSizeGB))
-	sb.WriteString(fmt.Sprintf("  remoteCacheOnlyForNotSSD        : %v\n", svv.RemoteCacheOnlyForNotSSD))
-	sb.WriteString(fmt.Sprintf("  remoteCacheMultiRead            : %v\n", svv.RemoteCacheMultiRead))
 	return sb.String()
 }
 
@@ -1289,37 +1273,9 @@ var (
 	hybridCloudStorageTablePattern = "%-12v    %-12v    %-12v    %-12v"
 	hybridCloudStorageTableHeader  = fmt.Sprintf(hybridCloudStorageTablePattern,
 		"STORAGE CLASS", "INODE COUNT", "USED SIZE", "QUOTA")
-	formatFlashNodeSimpleViewTableTitle = arow("Zone", "ID", "Address", "Active", "Enable", "FlashGroupID", "ReportTime")
-	formatFlashNodeViewTableTitle       = append(formatFlashNodeSimpleViewTableTitle[:], "DataPath", "HitRate", "Evicts", "Limit", "MaxAlloc", "HasAlloc", "Num", "Status")
-	formatFlashGroupViewTile            = arow("ID", "Weight", "Slots", "Status", "SlotStatus", "PendingSlots", "Step", "FlashNodeCount")
 )
 
 func formatHybridCloudStorageTableRow(view *proto.StatOfStorageClass) (row string) {
 	row = fmt.Sprintf(hybridCloudStorageTablePattern, proto.StorageClassString(view.StorageClass), view.InodeCount, strutil.FormatSize(view.UsedSizeBytes), quotaLimitStr(view.QuotaGB))
 	return
-}
-
-func formatFlashNodeView(fn *proto.FlashNodeViewInfo) string {
-	return "[FlashNode]\n" + alignColumn(
-		arow("  ID", fn.ID),
-		arow("  Address", fn.Addr),
-		arow("  Version", fn.Version),
-		arow("  ZoneName", fn.ZoneName),
-		arow("  FlashGroupID", fn.FlashGroupID),
-		arow("  ReportTime", formatTimeToString(fn.ReportTime)),
-		arow("  IsActive", fn.IsActive),
-		arow("  IsEnable", fn.IsEnable),
-	)
-}
-
-func formatFlashGroupView(fg *proto.FlashGroupAdminView) string {
-	return "[FlashGroup]\n" +
-		fmt.Sprintf("  ID:%v\n", fg.ID) +
-		fmt.Sprintf("  Weight:%v\n", fg.Weight) +
-		fmt.Sprintf("  Slots:%v\n", fg.Slots) +
-		fmt.Sprintf("  Status:%v\n", fg.Status) +
-		fmt.Sprintf("  SlotStatus:%v\n", fg.SlotStatus) +
-		fmt.Sprintf("  PedningSlots:%v\n", fg.PendingSlots) +
-		fmt.Sprintf("  Step:%v\n", fg.Step) +
-		fmt.Sprintf("  FlashNodeCount:%v\n", fg.FlashNodeCount)
 }

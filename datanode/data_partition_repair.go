@@ -242,22 +242,12 @@ func (dp *DataPartition) getRemoteExtentInfo(extentType uint8, tinyExtents []uin
 		err = errors.Trace(err, "getRemoteExtentInfo DataPartition(%v) read from host(%v)", dp.partitionID, target)
 		return
 	}
-	data := reply.Data[:reply.Size]
-	extentFiles, err = storage.UnmarshalBinarySlice(data)
-	if err != nil && err == storage.ErrNonBytecodeEncode {
-		extentFiles = make([]*storage.ExtentInfo, 0)
-		err = json.Unmarshal(data, &extentFiles)
-		if err != nil {
-			err = errors.Trace(err, "getRemoteExtentInfo DataPartition(%v) unmarshal json(%v) from host(%v)",
-				dp.partitionID, string(data), target)
-			return
-		}
-	} else if err != nil {
-		err = errors.Trace(err, "getRemoteExtentInfo DataPartition(%v) unmarshal bytes from host(%v)",
-			dp.partitionID, target)
+	err = json.Unmarshal(reply.Data[:reply.Size], &extentFiles)
+	if err != nil {
+		err = errors.Trace(err, "getRemoteExtentInfo DataPartition(%v) unmarshal json(%v) from host(%v)",
+			dp.partitionID, string(reply.Data[:reply.Size]), target)
 		return
 	}
-
 	return
 }
 
@@ -622,13 +612,11 @@ func (dp *DataPartition) NormalExtentRepairRead(p repl.PacketInterface, connect 
 		dp.Disk().allocCheckLimit(proto.IopsReadType, 1)
 		dp.Disk().allocCheckLimit(proto.FlowReadType, currReadSize)
 
-		if rs := dp.disk.limitRead.Run(int(currReadSize), false, func() {
+		dp.disk.limitRead.Run(int(currReadSize), func() {
 			var crc uint32
 			crc, err = store.Read(reply.GetExtentID(), offset, int64(currReadSize), reply.GetData(), isRepairRead, p.GetOpcode() == proto.OpBackupRead)
 			reply.SetCRC(crc)
-		}); err == nil && rs != nil {
-			err = rs
-		}
+		})
 		if !shallDegrade && metrics != nil {
 			metrics.MetricIOBytes.AddWithLabels(int64(p.GetSize()), metricPartitionIOLabels)
 			partitionIOMetric.SetWithLabels(err, metricPartitionIOLabels)

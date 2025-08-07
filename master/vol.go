@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"math"
 	"runtime/debug"
-	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -41,7 +40,6 @@ type VolVarargs struct {
 	followerRead             bool
 	metaFollowerRead         bool
 	directRead               bool
-	maximallyRead            bool
 	authenticate             bool
 	dpSelectorName           string
 	dpSelectorParm           string
@@ -66,15 +64,6 @@ type VolVarargs struct {
 	allowedStorageClass      []uint32
 	forbidWriteOpOfProtoVer0 bool
 	quotaByClass             map[uint32]uint64
-
-	remoteCacheEnable         bool
-	remoteCachePath           string
-	remoteCacheAutoPrepare    bool
-	remoteCacheTTL            int64
-	remoteCacheReadTimeoutSec int64
-	remoteCacheMaxFileSizeGB  int64
-	remoteCacheOnlyForNotSSD  bool
-	remoteCacheMultiRead      bool
 }
 
 // nolint: structcheck
@@ -94,18 +83,6 @@ type CacheSubItem struct {
 
 // nolint: structcheck
 type TxSubItem struct {
-	remoteCacheEnable         bool
-	remoteCachePath           string
-	remoteCacheAutoPrepare    bool
-	remoteCacheTTL            int64
-	remoteCacheReadTimeoutSec int64
-	remoteCacheMaxFileSizeGB  int64
-	remoteCacheOnlyForNotSSD  bool
-	remoteCacheMultiRead      bool
-
-	PreloadCacheOn          bool
-	NeedToLowerReplica      bool
-	FollowerRead            bool
 	txTimeout               int64
 	txConflictRetryNum      int64
 	txConflictRetryInterval int64
@@ -170,7 +147,6 @@ type Vol struct {
 	FollowerRead             bool
 	MetaFollowerRead         bool
 	DirectRead               bool
-	MaximallyRead            bool
 	enableQuota              bool
 	DisableAuditLog          bool
 	DpReadOnlyWhenVolFull    bool // only if this switch is on, all dp becomes readonly when vol is full
@@ -221,7 +197,6 @@ func newVol(vv volValue) (vol *Vol) {
 	vol.FollowerRead = vv.FollowerRead
 	vol.MetaFollowerRead = vv.MetaFollowerRead
 	vol.DirectRead = vv.DirectRead
-	vol.MaximallyRead = vv.MaximallyRead
 	vol.LeaderRetryTimeout = vv.LeaderRetryTimeOut
 	vol.authenticate = vv.Authenticate
 	vol.crossZone = vv.CrossZone
@@ -252,14 +227,6 @@ func newVol(vv volValue) (vol *Vol) {
 	vol.CacheLRUInterval = vv.CacheLRUInterval
 	vol.CacheRule = vv.CacheRule
 	vol.Status = vv.Status
-	vol.remoteCachePath = vv.RemoteCachePath
-	vol.remoteCacheAutoPrepare = vv.RemoteCacheAutoPrepare
-	vol.remoteCacheTTL = vv.RemoteCacheTTL
-	vol.remoteCacheReadTimeoutSec = vv.RemoteCacheReadTimeoutSec
-	vol.remoteCacheEnable = vv.RemoteCacheEnable
-	vol.remoteCacheMaxFileSizeGB = vv.RemoteCacheMaxFileSizeGB
-	vol.remoteCacheOnlyForNotSSD = vv.RemoteCacheOnlyForNotSSD
-	vol.remoteCacheMultiRead = vv.RemoteCacheMultiRead
 
 	limitQosVal := &qosArgs{
 		qosEnable:     vv.VolQosEnable,
@@ -340,10 +307,6 @@ func newVolFromVolValue(vv *volValue) (vol *Vol) {
 		vol.AccessTimeValidInterval = proto.DefaultAccessTimeValidInterval
 	}
 	vol.ForbidWriteOpOfProtoVer0.Store(vv.ForbidWriteOpOfProtoVer0)
-
-	if vol.remoteCacheReadTimeoutSec < proto.ReadDeadlineTime {
-		vol.remoteCacheReadTimeoutSec = proto.ReadDeadlineTime
-	}
 	return vol
 }
 
@@ -566,7 +529,7 @@ func (vol *Vol) metaPartition(partitionID uint64) (mp *MetaPartition, err error)
 	return
 }
 
-func (vol *Vol) maxMetaPartitionID() (maxPartitionID uint64) {
+func (vol *Vol) maxPartitionID() (maxPartitionID uint64) {
 	vol.mpsLock.RLock()
 	defer vol.mpsLock.RUnlock()
 	for id := range vol.MetaPartitions {
@@ -621,7 +584,7 @@ func (vol *Vol) addMetaPartitions(c *Cluster, count int) (err error) {
 	defer vol.createMpMutex.Unlock()
 
 	// update End of the maxMetaPartition range
-	maxPartitionId := vol.maxMetaPartitionID()
+	maxPartitionId := vol.maxPartitionID()
 	rearMetaPartition := vol.MetaPartitions[maxPartitionId]
 	oldEnd := rearMetaPartition.End
 	end = rearMetaPartition.MaxInodeID + gConfig.MetaPartitionInodeIdStep
@@ -925,7 +888,7 @@ func (vol *Vol) getStorageStatWithClass() map[uint32]*proto.StatOfStorageClass {
 func (vol *Vol) checkMetaPartitions(c *Cluster) {
 	var tasks []*proto.AdminTask
 	metaPartitionInodeIdStep := gConfig.MetaPartitionInodeIdStep
-	maxPartitionID := vol.maxMetaPartitionID()
+	maxPartitionID := vol.maxPartitionID()
 	mps := vol.cloneMetaPartitionMap()
 
 	var (
@@ -997,7 +960,7 @@ func (vol *Vol) checkMetaPartitions(c *Cluster) {
 }
 
 func (vol *Vol) checkSplitMetaPartition(c *Cluster, metaPartitionInodeStep uint64) {
-	maxPartitionID := vol.maxMetaPartitionID()
+	maxPartitionID := vol.maxPartitionID()
 	maxMP, err := vol.metaPartition(maxPartitionID)
 	if err != nil {
 		return
@@ -1779,7 +1742,7 @@ func (vol *Vol) splitMetaPartition(c *Cluster, mp *MetaPartition, end uint64, me
 	vol.createMpMutex.Lock()
 	defer vol.createMpMutex.Unlock()
 
-	maxPartitionID := vol.maxMetaPartitionID()
+	maxPartitionID := vol.maxPartitionID()
 	if maxPartitionID != mp.PartitionID {
 		err = fmt.Errorf("mp[%v] is not the last meta partition[%v]", mp.PartitionID, maxPartitionID)
 		return
@@ -1900,7 +1863,6 @@ func setVolFromArgs(args *VolVarargs, vol *Vol) {
 	vol.FollowerRead = args.followerRead
 	vol.MetaFollowerRead = args.metaFollowerRead
 	vol.DirectRead = args.directRead
-	vol.MaximallyRead = args.maximallyRead
 	vol.authenticate = args.authenticate
 	vol.enablePosixAcl = args.enablePosixAcl
 	vol.DpReadOnlyWhenVolFull = args.dpReadOnlyWhenVolFull
@@ -1949,15 +1911,6 @@ func setVolFromArgs(args *VolVarargs, vol *Vol) {
 		quotaClass = append(quotaClass, proto.NewStatOfStorageClassEx(t, c))
 	}
 	vol.QuotaByClass = quotaClass
-
-	vol.remoteCacheEnable = args.remoteCacheEnable
-	vol.remoteCachePath = args.remoteCachePath
-	vol.remoteCacheAutoPrepare = args.remoteCacheAutoPrepare
-	vol.remoteCacheTTL = args.remoteCacheTTL
-	vol.remoteCacheReadTimeoutSec = args.remoteCacheReadTimeoutSec
-	vol.remoteCacheMaxFileSizeGB = args.remoteCacheMaxFileSizeGB
-	vol.remoteCacheOnlyForNotSSD = args.remoteCacheOnlyForNotSSD
-	vol.remoteCacheMultiRead = args.remoteCacheMultiRead
 }
 
 func getVolVarargs(vol *Vol) *VolVarargs {
@@ -1990,7 +1943,6 @@ func getVolVarargs(vol *Vol) *VolVarargs {
 		followerRead:             vol.FollowerRead,
 		metaFollowerRead:         vol.MetaFollowerRead,
 		directRead:               vol.DirectRead,
-		maximallyRead:            vol.MaximallyRead,
 		leaderRetryTimeout:       vol.LeaderRetryTimeout,
 		authenticate:             vol.authenticate,
 		dpSelectorName:           vol.dpSelectorName,
@@ -2013,15 +1965,6 @@ func getVolVarargs(vol *Vol) *VolVarargs {
 		allowedStorageClass:      append([]uint32{}, vol.allowedStorageClass...),
 		forbidWriteOpOfProtoVer0: vol.ForbidWriteOpOfProtoVer0.Load(),
 		quotaByClass:             quotaByClass,
-
-		remoteCacheEnable:         vol.remoteCacheEnable,
-		remoteCachePath:           vol.remoteCachePath,
-		remoteCacheAutoPrepare:    vol.remoteCacheAutoPrepare,
-		remoteCacheTTL:            vol.remoteCacheTTL,
-		remoteCacheReadTimeoutSec: vol.remoteCacheReadTimeoutSec,
-		remoteCacheMaxFileSizeGB:  vol.remoteCacheMaxFileSizeGB,
-		remoteCacheOnlyForNotSSD:  vol.remoteCacheOnlyForNotSSD,
-		remoteCacheMultiRead:      vol.remoteCacheMultiRead,
 	}
 }
 
@@ -2104,17 +2047,4 @@ func (vol *Vol) isStorageClassInAllowed(storageClass uint32) (in bool) {
 	}
 
 	return in
-}
-
-func (vol *Vol) getSortMetaPartitions() (mps []*MetaPartition) {
-	vol.mpsLock.RLock()
-	mps = make([]*MetaPartition, 0, len(vol.MetaPartitions))
-	for _, mp := range vol.MetaPartitions {
-		mps = append(mps, mp)
-	}
-	vol.mpsLock.RUnlock()
-
-	sort.Slice(mps, func(i, j int) bool { return mps[i].Start < mps[j].Start })
-
-	return
 }

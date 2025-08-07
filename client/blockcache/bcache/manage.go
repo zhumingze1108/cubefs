@@ -34,7 +34,6 @@ import (
 	"time"
 
 	"github.com/cubefs/cubefs/util/errors"
-	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/stat"
 )
@@ -55,7 +54,7 @@ type ReadCloser interface {
 }
 
 type BcacheManager interface {
-	cache(vol, key string, data []byte, direct bool)
+	cache(key string, data []byte, direct bool)
 	read(key string, offset uint64, len uint32) (io.ReadCloser, error)
 	queryCachePath(key string, offset uint64, len uint32) (string, error)
 	load(key string) (ReadCloser, error)
@@ -90,13 +89,11 @@ func newBcacheManager(conf *bcacheConfig) BcacheManager {
 	}
 
 	bm := &bcacheManager{
-		bstore:         make([]*DiskStore, len(cacheDirs)),
-		bcacheKeys:     make(map[string]*list.Element),
-		lrulist:        list.New(),
-		blockSize:      conf.BlockSize,
-		pending:        make(chan waitFlush, 1024),
-		cacheMetaCount: exporter.NewGaugeVec("bcache_meta_count", "", []string{"volName", "disk", "type"}),
-		vol:            conf.Vol,
+		bstore:     make([]*DiskStore, len(cacheDirs)),
+		bcacheKeys: make(map[string]*list.Element),
+		lrulist:    list.New(),
+		blockSize:  conf.BlockSize,
+		pending:    make(chan waitFlush, 1024),
 	}
 	index := 0
 	for cacheDir, cacheSize := range dirSizeMap {
@@ -129,13 +126,11 @@ type waitFlush struct {
 
 type bcacheManager struct {
 	sync.RWMutex
-	bcacheKeys     map[string]*list.Element
-	lrulist        *list.List
-	bstore         []*DiskStore
-	blockSize      uint32
-	pending        chan waitFlush
-	cacheMetaCount *exporter.GaugeVec
-	vol            string
+	bcacheKeys map[string]*list.Element
+	lrulist    *list.List
+	bstore     []*DiskStore
+	blockSize  uint32
+	pending    chan waitFlush
 }
 
 func encryptXOR(data []byte) {
@@ -177,7 +172,7 @@ func (bm *bcacheManager) getCachePath(key string) (string, error) {
 	return cachePath, nil
 }
 
-func (bm *bcacheManager) cache(vol, key string, data []byte, direct bool) {
+func (bm *bcacheManager) cache(key string, data []byte, direct bool) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("Cache:Write", nil, bgTime, 1)
@@ -185,20 +180,20 @@ func (bm *bcacheManager) cache(vol, key string, data []byte, direct bool) {
 	}()
 	log.LogDebugf("TRACE cache. key(%v)  len(%v) direct(%v)", key, len(data), direct)
 	if direct {
-		bm.cacheDirect(vol, key, data)
+		bm.cacheDirect(key, data)
 		return
 	}
 	select {
 	case bm.pending <- waitFlush{Key: key, Data: data}:
 	default:
 		log.LogDebugf("pending chan is full,skip memory. key =%v,len=%v bytes", key, len(data))
-		bm.cacheDirect(vol, key, data)
+		bm.cacheDirect(key, data)
 	}
 }
 
-func (bm *bcacheManager) cacheDirect(vol, key string, data []byte) {
+func (bm *bcacheManager) cacheDirect(key string, data []byte) {
 	diskKv := bm.selectDiskKv(key)
-	if diskKv.flushKey(vol, key, data) == nil {
+	if diskKv.flushKey(key, data) == nil {
 		bm.Lock()
 		item := &cacheItem{
 			key:  key,
@@ -324,8 +319,6 @@ func (bm *bcacheManager) spaceManager() {
 				if 1-useRatio < store.freeLimit || files > int64(store.limit) {
 					bm.freeSpace(store, 1-useRatio, files)
 				}
-				bm.cacheMetaCount.SetWithLabelValues(float64(useRatio), bm.vol, store.dir, "useRatio")
-				bm.cacheMetaCount.SetWithLabelValues(float64(files), bm.vol, store.dir, "files")
 			}
 		case <-tmpTicker.C:
 			for _, store := range bm.bstore {
@@ -476,7 +469,7 @@ func (bm *bcacheManager) flush() {
 		pending := <-bm.pending
 		diskKv := bm.selectDiskKv(pending.Key)
 		log.LogDebugf("flush data,key(%v), dir(%v)", pending.Key, diskKv.dir)
-		if diskKv.flushKey(bm.vol, pending.Key, pending.Data) == nil {
+		if diskKv.flushKey(pending.Key, pending.Data) == nil {
 			bm.Lock()
 			item := &cacheItem{
 				key:  pending.Key,
@@ -591,13 +584,11 @@ func (d *DiskStore) checkBuildCacheDir(dir string) {
 //
 //}
 
-func (d *DiskStore) flushKey(vol, key string, data []byte) error {
+func (d *DiskStore) flushKey(key string, data []byte) error {
 	var err error
 	bgTime := stat.BeginStat()
-	metric := exporter.NewTPCnt("cacheToDisk")
 	defer func() {
 		stat.EndStat("Cache:Write:FlushData", err, bgTime, 1)
-		metric.SetWithLabels(err, map[string]string{exporter.Vol: vol})
 	}()
 	cachePath := d.buildCachePath(key, d.dir)
 	info, err := os.Stat(cachePath)

@@ -58,6 +58,5 @@ func NewRootCmd() *cobra.Command {
 	c.PersistentFlags().Uint64VarP(&InodeID, "inode", "", 0, "inode id of a file")
 	c.Flags().BoolVarP(&optShowVersion, "version", "v", false, "Show version information")
 	c.PersistentFlags().StringVarP(&CleanFlag, "clean", "", "false", "whether clean gc data.")
-	c.PersistentFlags().BoolVarP(&forceClean, "force", "f", false, "force clean dirty inode")
 	return c
 }

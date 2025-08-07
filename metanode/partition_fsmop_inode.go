@@ -594,7 +594,7 @@ func (mp *metaPartition) fsmAppendExtentsWithCheck(ino *Inode, isSplit bool) (st
 		}
 		// conflict need delete eks[0], to clear garbage data
 		if status == proto.OpConflictExtentsErr {
-			log.LogWarnf("action[fsmAppendExtentsWithCheck] mp[%v] OpConflictExtentsErr [%v]", mp.config.PartitionId, eks[:1])
+			log.LogInfof("action[fsmAppendExtentsWithCheck] mp[%v] OpConflictExtentsErr [%v]", mp.config.PartitionId, eks[:1])
 			if !storage.IsTinyExtent(eks[0].ExtentId) && eks[0].ExtentOffset >= util.ExtentSize && clusterEnableSnapshot {
 				eks[0].SetSplit(true)
 			}
@@ -620,7 +620,7 @@ func (mp *metaPartition) fsmAppendExtentsWithCheck(ino *Inode, isSplit bool) (st
 	if status == proto.OpConflictExtentsErr {
 		mp.extDelCh <- eks[:1]
 		mp.uidManager.minusUidSpace(fsmIno.Uid, fsmIno.Inode, eks[:1])
-		log.LogWarnf("fsmAppendExtentsWithCheck mp[%v] delExtents inode[%v] ek(%v)", mp.config.PartitionId, fsmIno.Inode, delExtents)
+		log.LogDebugf("fsmAppendExtentsWithCheck mp[%v] delExtents inode[%v] ek(%v)", mp.config.PartitionId, fsmIno.Inode, delExtents)
 	}
 
 	mp.updateUsedInfo(int64(fsmIno.Size)-oldSize, 0, fsmIno.Inode)
@@ -1130,7 +1130,7 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigration(inoParam *Inode) (resp
 
 	// for empty file, HybridCloudExtents.sortedEks is nil and StorageClass_Unspecified
 	// but HybridCloudExtentsMigration.sortedEks for inoParam is always not nil
-	if i.EmptyHybridExtents() && i.StorageClass != proto.StorageClass_Unspecified && !inoParam.HybridCloudExtentsMigration.Empty() {
+	if i.HybridCloudExtents.sortedEks == nil && i.StorageClass != proto.StorageClass_Unspecified && inoParam.HybridCloudExtentsMigration.sortedEks != nil {
 		log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) extent key is empty, but extent key "+
 			"for migration storageClass(%v) is not empty",
 			mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass)
@@ -1138,7 +1138,7 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigration(inoParam *Inode) (resp
 		return
 	}
 
-	if !i.EmptyHybridExtents() && inoParam.HybridCloudExtentsMigration.Empty() {
+	if i.HybridCloudExtents.sortedEks != nil && inoParam.HybridCloudExtentsMigration.sortedEks == nil {
 		log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) migrate extent key for migration "+
 			"storageClass(%v) is empty ",
 			mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass)
@@ -1146,10 +1146,10 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigration(inoParam *Inode) (resp
 		return
 	}
 
-	if (!i.EmptyHybridExtents() && i.HybridCloudExtentsMigration.Empty()) || (i.EmptyHybridExtents() && !i.HybridCloudExtentsMigration.Empty()) {
+	if (!i.HybridCloudExtents.Empty() && i.HybridCloudExtentsMigration.Empty()) || (i.HybridCloudExtents.Empty() && !i.HybridCloudExtentsMigration.Empty()) {
 		log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) migrate extent key for migration "+
 			"storageClass(%v) is empty, eks(%v), migrateEks(%v) ",
-			mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass, i.EmptyHybridExtents(), i.HybridCloudExtentsMigration.Empty())
+			mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass, i.HybridCloudExtents.Empty(), i.HybridCloudExtentsMigration.Empty())
 		resp.Status = proto.OpNotPerm
 		return
 	}
@@ -1326,26 +1326,5 @@ func (mp *metaPartition) fsmSetMigrationExtentKeyDeleteImmediately(inoParam *Ino
 		return
 	}
 	mp.internalDeleteInodeMigrationExtentKey(i)
-	return
-}
-
-func (mp *metaPartition) fsmUpdateInodeMeta(req *UpdateInodeMetaRequest) (err error) {
-	log.LogDebugf("action[fsmUpdateInodeMeta] req %v", req)
-	ino := NewInode(req.Inode, 0)
-	item := mp.inodeTree.CopyGet(ino)
-	if item == nil {
-		err = fmt.Errorf("ino %v not exist", ino.Inode)
-		return
-	}
-	i := item.(*Inode)
-	if i.ShouldDelete() {
-		err = fmt.Errorf("ino %v marked delete", ino.Inode)
-		return
-	}
-
-	i.Lock()
-	defer i.Unlock()
-	i.Generation++
-	i.ModifyTime = ino.ModifyTime
 	return
 }

@@ -57,19 +57,16 @@ func NewConnectPool() (cp *ConnectPool) {
 }
 
 func NewConnectPoolWithTimeout(idleConnTimeout time.Duration, connectTimeout int64) (cp *ConnectPool) {
-	return NewConnectPoolWithTimeoutAndCap(5, 80, idleConnTimeout, connectTimeout)
-}
-
-func NewConnectPoolWithTimeoutAndCap(minCap, maxCap int, idleConnTimeout time.Duration, connectTimeout int64) (cp *ConnectPool) {
 	cp = &ConnectPool{
 		pools:          make(map[string]*Pool),
-		mincap:         minCap,
-		maxcap:         maxCap,
+		mincap:         5,
+		maxcap:         80,
 		timeout:        int64(idleConnTimeout * time.Second),
 		connectTimeout: connectTimeout,
 		closeCh:        make(chan struct{}),
 	}
 	go cp.autoRelease()
+
 	return cp
 }
 

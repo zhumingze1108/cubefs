@@ -21,7 +21,6 @@ func createDataNodeForTopo(addr, zoneName string, ns *nodeSet) (dn *DataNode) {
 	dn.isActive = true
 	dn.NodeSetID = ns.ID
 	dn.AllDisks = []string{"/cfs/disk"}
-	dn.DpCntLimit = defaultMaxDpCntLimit
 	return
 }
 

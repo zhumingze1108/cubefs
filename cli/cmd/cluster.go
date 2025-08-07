@@ -266,7 +266,7 @@ func newClusterSetVolDeletionDelayTimeCmd(client *master.MasterClient) *cobra.Co
 
 func newClusterSetParasCmd(client *master.MasterClient) *cobra.Command {
 	var clientIDKey string
-	var optAutoRepairRate, optMarkDeleteRate, optDelBatchCount, optDelWorkerSleepMs, optLoadFactor string
+	var optAutoRepairRate, optMarkDeleteRate, optDelBatchCount, optDelWorkerSleepMs, optLoadFactor, opMaxDpCntLimit string
 	// dataNodesetSelector := ""
 	// metaNodesetSelector := ""
 	// dataNodeSelector := ""
@@ -276,7 +276,6 @@ func newClusterSetParasCmd(client *master.MasterClient) *cobra.Command {
 	autoDecommissionDiskInterval := ""
 	autoDpMetaRepair := ""
 	autoDpMetaRepairParallelCnt := ""
-	opMaxDpCntLimit := ""
 	opMaxMpCntLimit := ""
 	dpRepairTimeout := ""
 	dpTimeout := ""

@@ -66,9 +66,6 @@ const (
 
 	cfgRaftPartitionCanUseDifferentPort   = "raftPartitionCanUseDifferentPort"
 	cfgAllowMultipleReplicasOnSameMachine = "allowMultipleReplicasOnSameMachine"
-	cfgMetaNodeMemoryHighPer              = "metaNodeMemoryHighPer"
-	cfgMetaNodeMemoryLowPer               = "metaNodeMemoryLowPer"
-	cfgAutoMpMigrate                      = "autoMetaPartitionMigrate"
 )
 
 // default value
@@ -113,9 +110,6 @@ const (
 	metaPartitionInodeUsageThreshold           float64 = 0.75 // inode usage threshold on a meta partition
 	lowerLimitRWMetaPartition                          = 3    // lower limit of RW meta partition, equal defaultReplicaNum
 	defaultHttpReversePoolSize                         = 1024
-
-	defaultFlashNodeHandleReadTimeout   = 3
-	defaultFlashNodeReadDataNodeTimeout = 3
 )
 
 // AddrDatabase is a map that stores the address of a given host (e.g., the leader)
@@ -143,32 +137,32 @@ type clusterConfig struct {
 	MetaNodeDeleteBatchCount            uint64 // metanode delete batch count
 	DataNodeDeleteLimitRate             uint64 // datanode delete limit rate
 	MetaNodeDeleteWorkerSleepMs         uint64 // metaNode delete worker sleep time with millisecond. if 0 for no sleep
-	// MaxDpCntLimit                       uint64 // datanode data partition limit
-	// MaxMpCntLimit                       uint64 // metanode meta partition limit
-	DataNodeAutoRepairLimitRate uint64 // datanode autorepair limit rate
-	DpMaxRepairErrCnt           uint64
-	DpRepairTimeOut             uint64
-	DpBackupTimeOut             uint64
-	peers                       []raftstore.PeerAddress
-	peerAddrs                   []string
-	heartbeatPort               int64
-	replicaPort                 int64
-	diffReplicaSpaceUsage       uint64
-	diffReplicaFileCount        uint32
-	faultDomain                 bool
-	DefaultNormalZoneCnt        int
-	DomainBuildAsPossible       bool
-	DataPartitionUsageThreshold float64
-	QosMasterAcceptLimit        uint64
-	DirChildrenNumLimit         uint32
-	MetaPartitionInodeIdStep    uint64
-	MaxQuotaNumPerVol           int
-	DisableAutoCreate           bool
-	EnableFollowerCache         bool
-	EnableSnapshot              bool
-	MonitorPushAddr             string
-	StartLcScanTime             int
-	MaxConcurrentLcNodes        uint64
+	MaxDpCntLimit                       uint64 // datanode data partition limit
+	MaxMpCntLimit                       uint64 // metanode meta partition limit
+	DataNodeAutoRepairLimitRate         uint64 // datanode autorepair limit rate
+	DpMaxRepairErrCnt                   uint64
+	DpRepairTimeOut                     uint64
+	DpBackupTimeOut                     uint64
+	peers                               []raftstore.PeerAddress
+	peerAddrs                           []string
+	heartbeatPort                       int64
+	replicaPort                         int64
+	diffReplicaSpaceUsage               uint64
+	diffReplicaFileCount                uint32
+	faultDomain                         bool
+	DefaultNormalZoneCnt                int
+	DomainBuildAsPossible               bool
+	DataPartitionUsageThreshold         float64
+	QosMasterAcceptLimit                uint64
+	DirChildrenNumLimit                 uint32
+	MetaPartitionInodeIdStep            uint64
+	MaxQuotaNumPerVol                   int
+	DisableAutoCreate                   bool
+	EnableFollowerCache                 bool
+	EnableSnapshot                      bool
+	MonitorPushAddr                     string
+	StartLcScanTime                     int
+	MaxConcurrentLcNodes                uint64
 
 	volForceDeletion           bool   // when delete a volume, ignore it's dentry count or not
 	volDeletionDentryThreshold uint64 // in case of volForceDeletion is set to false, define the dentry count threshold to allow volume deletion
@@ -187,14 +181,6 @@ type clusterConfig struct {
 	raftPartitionAlreadyUseDifferentPort atomicutil.Bool
 
 	AllowMultipleReplicasOnSameMachine bool // whether dp/mp replicas can locate on same machine, default true
-
-	flashNodeHandleReadTimeout   int
-	flashNodeReadDataNodeTimeout int
-
-	metaNodeMemHighPer float64
-	metaNodeMemLowPer  float64
-	metaNodeMemMidPer  float64
-	AutoMpMigrate      bool
 }
 
 func newClusterConfig() (cfg *clusterConfig) {
@@ -213,8 +199,8 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.PeriodToLoadALLDataPartitions = defaultPeriodToLoadAllDataPartitions
 	cfg.MetaNodeThreshold = defaultMetaPartitionMemUsageThreshold
 	cfg.ClusterLoadFactor = defaultOverSoldFactor
-	// cfg.MaxDpCntLimit = defaultMaxDpCntLimit
-	// cfg.MaxMpCntLimit = defaultMaxMpCntLimit
+	cfg.MaxDpCntLimit = defaultMaxDpCntLimit
+	cfg.MaxMpCntLimit = defaultMaxMpCntLimit
 	cfg.metaNodeReservedMem = defaultMetaNodeReservedMem
 	cfg.diffReplicaSpaceUsage = defaultDiffSpaceUsage
 	cfg.diffReplicaFileCount = defaultDiffReplicaFileCount
@@ -225,11 +211,6 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.StartLcScanTime = defaultStartLcScanTime
 	cfg.MaxConcurrentLcNodes = defaultMaxConcurrentLcNodes
 	cfg.volDelayDeleteTimeHour = defaultVolDelayDeleteTimeHour
-	cfg.flashNodeHandleReadTimeout = defaultFlashNodeHandleReadTimeout
-	cfg.flashNodeReadDataNodeTimeout = defaultFlashNodeReadDataNodeTimeout
-	cfg.metaNodeMemHighPer = defaultMetaNodeMemHighPer
-	cfg.metaNodeMemLowPer = defaultMetaNodeMemLowPer
-	cfg.metaNodeMemMidPer = defaultMetaNodeMemHighPer
 	return
 }
 

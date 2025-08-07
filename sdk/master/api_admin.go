@@ -296,7 +296,6 @@ func (api *AdminAPI) UpdateVolume(
 	request.addParam("followerRead", strconv.FormatBool(vv.FollowerRead))
 	request.addParam(proto.MetaFollowerReadKey, strconv.FormatBool(vv.MetaFollowerRead))
 	request.addParam(proto.VolEnableDirectRead, strconv.FormatBool(vv.DirectRead))
-	request.addParam(proto.MaximallyReadKey, strconv.FormatBool(vv.MaximallyRead))
 	request.addParam("ebsBlkSize", strconv.Itoa(vv.ObjBlockSize))
 	request.addParam("cacheCap", strconv.FormatUint(vv.CacheCapacity, 10))
 	request.addParam("cacheAction", strconv.Itoa(vv.CacheAction))
@@ -319,14 +318,6 @@ func (api *AdminAPI) UpdateVolume(
 	request.addParam("volStorageClass", strconv.FormatUint(uint64(vv.VolStorageClass), 10))
 	request.addParam("forbidWriteOpOfProtoVersion0", strconv.FormatBool(vv.ForbidWriteOpOfProtoVer0))
 	request.addParam(proto.LeaderRetryTimeoutKey, strconv.FormatUint(uint64(vv.LeaderRetryTimeOut), 10))
-	request.addParamAny("remoteCacheEnable", vv.RemoteCacheEnable)
-	request.addParamAny("remoteCachePath", vv.RemoteCachePath)
-	request.addParamAny("remoteCacheAutoPrepare", vv.RemoteCacheAutoPrepare)
-	request.addParamAny("remoteCacheTTL", vv.RemoteCacheTTL)
-	request.addParamAny("remoteCacheReadTimeoutSec", vv.RemoteCacheReadTimeoutSec)
-	request.addParam("remoteCacheMaxFileSizeGB", strconv.FormatInt(vv.RemoteCacheMaxFileSizeGB, 10))
-	request.addParamAny("remoteCacheOnlyForNotSSD", vv.RemoteCacheOnlyForNotSSD)
-	request.addParamAny("remoteCacheMultiRead", vv.RemoteCacheMultiRead)
 
 	if txMask != "" {
 		request.addParam("enableTxMask", txMask)
@@ -395,9 +386,7 @@ func (api *AdminAPI) CreateVolName(volName, owner string, capacity uint64, delet
 	business string, mpCount, dpCount, replicaNum, dpSize int, followerRead bool, zoneName, cacheRuleKey string, ebsBlkSize,
 	cacheCapacity, cacheAction, cacheThreshold, cacheTTL, cacheHighWater, cacheLowWater, cacheLRUInterval int,
 	dpReadOnlyWhenVolFull bool, txMask string, txTimeout uint32, txConflictRetryNum int64, txConflictRetryInterval int64, optEnableQuota string,
-	clientIDKey string, volStorageClass uint32, allowedStorageClass string, optMetaFollowerRead string, optMaximallyRead string,
-	remoteCacheEnable string, remoteCacheAutoPrepare string, remoteCachePath string, remoteCacheTTL int64, remoteCacheReadTimeout int64,
-	remoteCacheMaxFileSizeGB int64, remoteCacheOnlyForNotSSD string, remoteCacheMultiRead string,
+	clientIDKey string, volStorageClass uint32, allowedStorageClass string, optMetaFollowerRead string,
 ) (err error) {
 	request := newRequest(get, proto.AdminCreateVol).Header(api.h)
 	request.addParam("name", volName)
@@ -413,7 +402,6 @@ func (api *AdminAPI) CreateVolName(volName, owner string, capacity uint64, delet
 	request.addParam("dpSize", strconv.Itoa(dpSize))
 	request.addParam("followerRead", strconv.FormatBool(followerRead))
 	request.addParam(proto.MetaFollowerReadKey, optMetaFollowerRead)
-	request.addParam(proto.MaximallyReadKey, optMaximallyRead)
 	request.addParam("zoneName", zoneName)
 	request.addParam("cacheRuleKey", cacheRuleKey)
 	request.addParam("ebsBlkSize", strconv.Itoa(ebsBlkSize))
@@ -429,14 +417,6 @@ func (api *AdminAPI) CreateVolName(volName, owner string, capacity uint64, delet
 	request.addParam("clientIDKey", clientIDKey)
 	request.addParam("volStorageClass", strconv.FormatUint(uint64(volStorageClass), 10))
 	request.addParam("allowedStorageClass", allowedStorageClass)
-	request.addParam("remoteCacheEnable", remoteCacheEnable)
-	request.addParam("remoteCacheAutoPrepare", remoteCacheAutoPrepare)
-	request.addParam("remoteCachePath", remoteCachePath)
-	request.addParam("remoteCacheTTL", strconv.FormatInt(remoteCacheTTL, 10))
-	request.addParam("remoteCacheReadTimeout", strconv.FormatInt(remoteCacheReadTimeout, 10))
-	request.addParam("remoteCacheMaxFileSizeGB", strconv.FormatInt(remoteCacheMaxFileSizeGB, 10))
-	request.addParam("remoteCacheOnlyForNotSSD", remoteCacheOnlyForNotSSD)
-	request.addParam("remoteCacheMultiRead", remoteCacheMultiRead)
 
 	if txMask != "" {
 		request.addParam("enableTxMask", txMask)
@@ -937,103 +917,5 @@ func (api *AdminAPI) GetUpgradeCompatibleSettings() (upgradeCompatibleSettings *
 func (api *AdminAPI) ChangeMasterLeader(leaderAddr string) (err error) {
 	req := newRequest(get, proto.AdminChangeMasterLeader).Header(api.h)
 	_, err = api.mc.requestOnce(req, leaderAddr)
-	return
-}
-
-func (api *AdminAPI) TurnFlashGroup(enable bool) (result string, err error) {
-	request := newRequest(post, proto.AdminFlashGroupTurn).Header(api.h).addParamAny("enable", enable)
-	data, err := api.mc.serveRequest(request)
-	return string(data), err
-}
-
-func (api *AdminAPI) CreateFlashGroup(slots string, weight int, gradualFlag bool, step uint32) (fgView proto.FlashGroupAdminView, err error) {
-	err = api.mc.requestWith(&fgView, newRequest(post, proto.AdminFlashGroupCreate).
-		Header(api.h).Param(anyParam{"slots", slots}, anyParam{"weight", weight}, anyParam{"gradualFlag", gradualFlag},
-		anyParam{"step", step}))
-	return
-}
-
-func (api *AdminAPI) SetFlashGroup(flashGroupID uint64, isActive bool) (fgView proto.FlashGroupAdminView, err error) {
-	err = api.mc.requestWith(&fgView, newRequest(post, proto.AdminFlashGroupSet).
-		Header(api.h).Param(anyParam{"id", flashGroupID}, anyParam{"enable", isActive}))
-	return
-}
-
-func (api *AdminAPI) RemoveFlashGroup(flashGroupID uint64, gradualFlag bool, step uint32) (result string, err error) {
-	request := newRequest(post, proto.AdminFlashGroupRemove).Header(api.h).Param(anyParam{"id", flashGroupID}, anyParam{"gradualFlag", gradualFlag},
-		anyParam{"step", step})
-	data, err := api.mc.serveRequest(request)
-	return string(data), err
-}
-
-func (api *AdminAPI) flashGroupFlashNodes(uri string, flashGroupID uint64, count int, zoneName, addr string,
-) (fgView proto.FlashGroupAdminView, err error) {
-	err = api.mc.requestWith(&fgView, newRequest(post, uri).Header(api.h).Param(
-		anyParam{"id", flashGroupID}, anyParam{"count", count}, anyParam{"zoneName", zoneName}, anyParam{"addr", addr}))
-	return
-}
-
-func (api *AdminAPI) FlashGroupAddFlashNode(flashGroupID uint64, count int, zoneName, addr string,
-) (fgView proto.FlashGroupAdminView, err error) {
-	return api.flashGroupFlashNodes(proto.AdminFlashGroupNodeAdd, flashGroupID, count, zoneName, addr)
-}
-
-func (api *AdminAPI) FlashGroupRemoveFlashNode(flashGroupID uint64, count int, zoneName, addr string,
-) (fgView proto.FlashGroupAdminView, err error) {
-	return api.flashGroupFlashNodes(proto.AdminFlashGroupNodeRemove, flashGroupID, count, zoneName, addr)
-}
-
-func (api *AdminAPI) GetFlashGroup(flashGroupID uint64) (fgView proto.FlashGroupAdminView, err error) {
-	err = api.mc.requestWith(&fgView, newRequest(get, proto.AdminFlashGroupGet).
-		Header(api.h).addParamAny("id", flashGroupID))
-	return
-}
-
-func (api *AdminAPI) ListFlashGroup(isActive bool) (fgView proto.FlashGroupsAdminView, err error) {
-	err = api.mc.requestWith(&fgView, newRequest(get, proto.AdminFlashGroupList).
-		Header(api.h).Param(anyParam{"enable", isActive}))
-	return
-}
-
-func (api *AdminAPI) ListFlashGroups() (fgView proto.FlashGroupsAdminView, err error) {
-	err = api.mc.requestWith(&fgView, newRequest(get, proto.AdminFlashGroupList).Header(api.h))
-	return
-}
-
-func (api *AdminAPI) ClientFlashGroups() (fgView proto.FlashGroupView, err error) {
-	err = api.mc.requestWith(&fgView, newRequest(get, proto.ClientFlashGroups).Header(api.h))
-	return
-}
-
-func (api *AdminAPI) CreateBalanceTask() (task *proto.ClusterPlan, err error) {
-	task = &proto.ClusterPlan{
-		Low:  make(map[string]*proto.ZonePressureView),
-		Plan: make([]*proto.MetaBalancePlan, 0),
-	}
-	err = api.mc.requestWith(task, newRequest(get, proto.CreateBalanceTask).Header(api.h))
-	return
-}
-
-func (api *AdminAPI) GetBalanceTask() (task *proto.ClusterPlan, err error) {
-	task = &proto.ClusterPlan{
-		Low:  make(map[string]*proto.ZonePressureView),
-		Plan: make([]*proto.MetaBalancePlan, 0),
-	}
-	err = api.mc.requestWith(task, newRequest(get, proto.GetBalanceTask).Header(api.h))
-	return
-}
-
-func (api *AdminAPI) RunBalanceTask() (result string, err error) {
-	err = api.mc.requestWith(&result, newRequest(get, proto.RunBalanceTask).Header(api.h))
-	return
-}
-
-func (api *AdminAPI) StopBalanceTask() (result string, err error) {
-	err = api.mc.requestWith(&result, newRequest(get, proto.StopBalanceTask).Header(api.h))
-	return
-}
-
-func (api *AdminAPI) DeleteBalanceTask() (result string, err error) {
-	err = api.mc.requestWith(&result, newRequest(get, proto.DeleteBalanceTask).Header(api.h))
 	return
 }

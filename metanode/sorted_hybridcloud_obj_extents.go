@@ -65,7 +65,7 @@ func (sem *SortedHybridCloudExtentsMigration) HasReplicaMigrationExts() bool {
 }
 
 func (sem *SortedHybridCloudExtentsMigration) Empty() bool {
-	return sortEksEmpty(sem.sortedEks, sem.storageClass)
+	return sem.sortedEks == nil
 }
 
 func NewSortedHybridCloudExtentsMigration() *SortedHybridCloudExtentsMigration {
@@ -94,22 +94,4 @@ func (sem *SortedHybridCloudExtentsMigration) String() string {
 	}
 	buff.WriteString("}")
 	return buff.String()
-}
-
-func sortEksEmpty(sortEks interface{}, storageClass uint32) bool {
-	if sortEks == nil {
-		return true
-	}
-
-	if proto.IsStorageClassReplica(storageClass) {
-		eks := sortEks.(*SortedExtents)
-		return eks.IsEmpty()
-	}
-
-	if proto.IsStorageClassBlobStore(storageClass) {
-		eks := sortEks.(*SortedObjExtents)
-		return eks.IsEmpty()
-	}
-
-	return true
 }

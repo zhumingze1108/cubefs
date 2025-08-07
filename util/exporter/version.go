@@ -53,8 +53,5 @@ func (m *VersionMetrics) doStat() {
 }
 
 func (m *VersionMetrics) setVersionMetrics() {
-	labels := proto.GetVersion(m.moduleName).ToMap()
-	delete(labels, "commit")
-	delete(labels, "role")
-	m.Metric.AddWithLabels(1, labels)
+	m.Metric.AddWithLabels(1, proto.GetVersion(m.moduleName).ToMap())
 }

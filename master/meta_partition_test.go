@@ -20,7 +20,7 @@ func TestMetaPartition(t *testing.T) {
 		return
 	}
 	createMetaPartition(commonVol, t)
-	maxPartitionID := commonVol.maxMetaPartitionID()
+	maxPartitionID := commonVol.maxPartitionID()
 	getMetaPartition(commonVol.Name, maxPartitionID, t)
 	loadMetaPartitionTest(commonVol, maxPartitionID, t)
 	server.cluster.checkMetaNodeHeartbeat()
@@ -46,7 +46,7 @@ func createMetaPartition(vol *Vol, t *testing.T) {
 
 	vol.mpsLock.RLock()
 	newPartitionCount := len(vol.MetaPartitions)
-	newMaxPartitionID := vol.maxMetaPartitionID()
+	newMaxPartitionID := vol.maxPartitionID()
 	newMaxMetaPartition, err := vol.metaPartition(newMaxPartitionID)
 	if err != nil {
 		vol.mpsLock.RUnlock()

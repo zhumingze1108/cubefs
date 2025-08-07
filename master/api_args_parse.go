@@ -26,17 +26,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cubefs/cubefs/cmd/common"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/compressor"
 	"github.com/cubefs/cubefs/util/cryptoutil"
 	"github.com/cubefs/cubefs/util/log"
-)
-
-var (
-	parseArgs = common.ParseArguments
-	newArg    = common.NewArgument
 )
 
 // Parse the request that adds/deletes a raft node.
@@ -411,7 +405,6 @@ type updateVolReq struct {
 	followerRead             bool
 	metaFollowerRead         bool
 	directRead               bool
-	maximallyRead            bool
 	leaderRetryTimeout       int64
 	authenticate             bool
 	enablePosixAcl           bool
@@ -587,10 +580,6 @@ func parseVolUpdateReq(r *http.Request, vol *Vol, req *updateVolReq) (err error)
 	}
 
 	if req.metaFollowerRead, err = extractBoolWithDefault(r, proto.MetaFollowerReadKey, vol.MetaFollowerRead); err != nil {
-		return
-	}
-
-	if req.maximallyRead, err = extractBoolWithDefault(r, proto.MaximallyReadKey, vol.MaximallyRead); err != nil {
 		return
 	}
 
@@ -794,7 +783,6 @@ type createVolReq struct {
 	deleteLockTime          int64
 	followerRead            bool
 	metaFollowerRead        bool
-	maximallyRead           bool
 	authenticate            bool
 	crossZone               bool
 	normalZonesFirst        bool
@@ -820,15 +808,6 @@ type createVolReq struct {
 	volStorageClass     uint32
 	allowedStorageClass []uint32
 	cacheDpStorageClass uint32
-	// remote cache
-	remoteCacheEnable        bool
-	remoteCacheAutoPrepare   bool
-	remoteCachePath          string
-	remoteCacheTTL           int64
-	remoteCacheReadTimeout   int64
-	remoteCacheMaxFileSizeGB int64
-	remoteCacheOnlyForNotSSD bool
-	remoteCacheMultiRead     bool
 }
 
 func checkCacheAction(action int) error {
@@ -1003,11 +982,6 @@ func parseRequestToCreateVol(r *http.Request, req *createVolReq) (err error) {
 		return
 	}
 
-	req.maximallyRead, err = extractBoolWithDefault(r, proto.MaximallyReadKey, false)
-	if err != nil {
-		return
-	}
-
 	if req.authenticate, err = extractBoolWithDefault(r, authenticateKey, false); err != nil {
 		return
 	}
@@ -1077,31 +1051,6 @@ func parseRequestToCreateVol(r *http.Request, req *createVolReq) (err error) {
 	}
 
 	if req.allowedStorageClass, err = parseAllowedStorageClass(r); err != nil {
-		return
-	}
-	if req.remoteCacheEnable, err = extractBoolWithDefault(r, remoteCacheEnable, false); err != nil {
-		return
-	}
-	if req.remoteCacheAutoPrepare, err = extractBoolWithDefault(r, remoteCacheAutoPrepare, false); err != nil {
-		return
-	}
-	if req.remoteCachePath = extractStrWithDefault(r, remoteCachePath, ""); err != nil {
-		return
-	}
-	if req.remoteCacheTTL, err = extractInt64WithDefault(r, remoteCacheTTL, proto.DefaultRemoteCacheTTL); err != nil {
-		return
-	}
-	if req.remoteCacheReadTimeout, err = extractInt64WithDefault(r, remoteCacheReadTimeout, proto.ReadDeadlineTime); err != nil {
-		return
-	}
-
-	if req.remoteCacheMaxFileSizeGB, err = extractInt64WithDefault(r, remoteCacheMaxFileSizeGB, DefaultRemoteCacheMaxFileSizeGB); err != nil {
-		return
-	}
-	if req.remoteCacheOnlyForNotSSD, err = extractBoolWithDefault(r, remoteCacheOnlyForNotSSD, false); err != nil {
-		return
-	}
-	if req.remoteCacheMultiRead, err = extractBoolWithDefault(r, remoteCacheMultiRead, false); err != nil {
 		return
 	}
 	return
@@ -2108,28 +2057,12 @@ func parseSetConfigParam(r *http.Request) (key string, value string, err error) 
 	if err = r.ParseForm(); err != nil {
 		return
 	}
-	value = r.FormValue(cfgmetaPartitionInodeIdStep)
-	if value != "" {
-		key = cfgmetaPartitionInodeIdStep
+	if value = r.FormValue(cfgmetaPartitionInodeIdStep); value == "" {
+		err = keyNotFound("config")
 		return
 	}
-	value = r.FormValue(cfgMetaNodeMemoryHighPer)
-	if value != "" {
-		key = cfgMetaNodeMemoryHighPer
-		return
-	}
-	value = r.FormValue(cfgMetaNodeMemoryLowPer)
-	if value != "" {
-		key = cfgMetaNodeMemoryLowPer
-		return
-	}
-	value = r.FormValue(cfgAutoMpMigrate)
-	if value != "" {
-		key = cfgAutoMpMigrate
-		return
-	}
-
-	err = keyNotFound("config")
+	key = cfgmetaPartitionInodeIdStep
+	log.LogInfo("parseSetConfigParam success.")
 	return
 }
 

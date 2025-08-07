@@ -166,7 +166,7 @@ func (dp *DataPartition) stopRaft() {
 			return
 		}
 		msg := fmt.Sprintf("stop raft partition(%v)", dp.info())
-		log.LogWarnf("%v", msg)
+		log.LogErrorf("[FATAL] %v", msg)
 		auditlog.LogDataNodeOp("DataPartitionStopRaft", msg, nil)
 		dp.raftPartition.Stop()
 	}

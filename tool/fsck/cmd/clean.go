@@ -29,6 +29,7 @@ import (
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util/log"
+	"github.com/cubefs/cubefs/util/ump"
 )
 
 const (
@@ -63,6 +64,7 @@ func newCleanInodeCmd() *cobra.Command {
 			}
 		},
 	}
+
 	return c
 }
 
@@ -95,18 +97,18 @@ func newEvictInodeCmd() *cobra.Command {
 }
 
 func Clean(opt string) error {
-	// defer log.LogFlush()
+	defer log.LogFlush()
 
 	if MasterAddr == "" || VolName == "" {
 		return fmt.Errorf("Lack of parameters: master(%v) vol(%v)", MasterAddr, VolName)
 	}
 
-	// ump.InitUmp("fsck", "")
+	ump.InitUmp("fsck", "")
 
-	// _, err := log.InitLog("fscklog", "fsck", log.InfoLevel, nil, log.DefaultLogLeftSpaceLimitRatio)
-	// if err != nil {
-	// 	return fmt.Errorf("Init log failed: %v", err)
-	// }
+	_, err := log.InitLog("fscklog", "fsck", log.InfoLevel, nil, log.DefaultLogLeftSpaceLimitRatio)
+	if err != nil {
+		return fmt.Errorf("Init log failed: %v", err)
+	}
 
 	masters := strings.Split(MasterAddr, meta.HostsSeparator)
 	metaConfig := &meta.MetaConfig{
@@ -114,7 +116,6 @@ func Clean(opt string) error {
 		Masters: masters,
 	}
 
-	var err error
 	gMetaWrapper, err = meta.NewMetaWrapper(metaConfig)
 	if err != nil {
 		return fmt.Errorf("NewMetaWrapper failed: %v", err)
@@ -209,33 +210,21 @@ func cleanInodes() error {
 		}
 		doEvictInode(inode)
 	}
-	fmt.Println("CleanInode completed!")
+
 	return nil
 }
 
 func doEvictInode(inode *Inode) error {
-	if forceClean {
-		_, err := gMetaWrapper.InodeUnlink_ll(inode.Inode, inode.Path)
-		if err != nil {
-			log.LogWarnf("doEvictInode: unlink inode err(%v)", err)
-			return err
-		}
-		inode.NLink = 0
-	}
-
 	if inode.NLink != 0 || time.Since(time.Unix(inode.ModifyTime, 0)) < 24*time.Hour || !proto.IsRegular(inode.Type) {
-		log.LogWarnf("doEvictInode: ino(%v) can't be deleted", inode.Inode)
 		return nil
 	}
-
 	err := gMetaWrapper.Evict(inode.Inode, inode.Path)
 	if err != nil {
-		log.LogWarnf("doEvictInode: evict inode err(%v)", err)
 		if err != syscall.ENOENT {
 			return err
 		}
 	}
-	log.LogWarnf("doEvictInode success: ino(%v)", inode)
+	log.LogWritef("%v", inode)
 	return nil
 }
 
