@@ -21,7 +21,6 @@ import (
 	"strconv"
 
 	"github.com/cubefs/cubefs/proto"
-	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -34,12 +33,16 @@ func (f *FlashNode) registerAPIHandler() {
 	http.HandleFunc("/setWriteDiskQos", f.handleSetWriteDiskQos)
 	http.HandleFunc("/setReadDiskQos", f.handleSetReadDiskQos)
 	http.HandleFunc("/getDiskQos", f.handleGetDiskQos)
+	http.HandleFunc("/scannerControl", f.handleScannerCommand)
+	http.HandleFunc("/setWaitForCacheBlock", f.handleSetWaitForCacheBlock)
+	http.HandleFunc("/slotStat", f.handleSlotStat)
 }
 
 func (f *FlashNode) handleStat(w http.ResponseWriter, r *http.Request) {
 	replyOK(w, r, proto.FlashNodeStat{
-		NodeLimit:   uint64(f.readLimiter.Limit()),
-		CacheStatus: f.cacheEngine.Status(),
+		NodeLimit:         uint64(f.readLimiter.Limit()),
+		CacheStatus:       f.cacheEngine.Status(),
+		WaitForCacheBlock: f.waitForCacheBlock,
 	})
 }
 
@@ -113,9 +116,9 @@ func (f *FlashNode) handleSetWriteDiskQos(w http.ResponseWriter, r *http.Request
 
 	updated := false
 	for key, pVal := range map[string]*int{
-		cfgDiskWriteFlow:     &f.diskWriteFlow,
-		cfgDiskWriteIocc:     &f.diskWriteIocc,
-		cfgDiskWriteIoFactor: &f.diskWriteIoFactorFlow,
+		paramFlow:   &f.diskWriteFlow,
+		paramIocc:   &f.diskWriteIocc,
+		paramFactor: &f.diskWriteIoFactorFlow,
 	} {
 		val, err, has := parser(key)
 		if err != nil {
@@ -131,7 +134,7 @@ func (f *FlashNode) handleSetWriteDiskQos(w http.ResponseWriter, r *http.Request
 		f.diskWriteIoFactorFlow = _defaultDiskWriteFactor
 	}
 	if updated {
-		f.limitWrite.ResetIO(f.diskWriteIocc*len(f.disks), f.diskWriteIoFactorFlow)
+		f.limitWrite.ResetIOEx(f.diskWriteIocc*len(f.disks), f.diskWriteIoFactorFlow, f.handleReadTimeout)
 		f.limitWrite.ResetFlow(f.diskWriteFlow)
 	}
 	replyOK(w, r, nil)
@@ -154,9 +157,9 @@ func (f *FlashNode) handleSetReadDiskQos(w http.ResponseWriter, r *http.Request)
 
 	updated := false
 	for key, pVal := range map[string]*int{
-		cfgDiskReadFlow:     &f.diskReadFlow,
-		cfgDiskReadIocc:     &f.diskReadIocc,
-		cfgDiskReadIoFactor: &f.diskReadIoFactorFlow,
+		paramFlow:   &f.diskReadFlow,
+		paramIocc:   &f.diskReadIocc,
+		paramFactor: &f.diskReadIoFactorFlow,
 	} {
 		val, err, has := parser(key)
 		if err != nil {
@@ -172,25 +175,72 @@ func (f *FlashNode) handleSetReadDiskQos(w http.ResponseWriter, r *http.Request)
 		f.diskReadIoFactorFlow = _defaultDiskReadFactor
 	}
 	if updated {
-		f.limitRead.ResetIO(f.diskReadIocc*len(f.disks), f.diskReadIoFactorFlow)
+		f.limitRead.ResetIOEx(f.diskReadIocc*len(f.disks), f.diskReadIoFactorFlow, f.handleReadTimeout)
 		f.limitRead.ResetFlow(f.diskReadFlow)
 	}
 	replyOK(w, r, nil)
 }
 
 func (f *FlashNode) handleGetDiskQos(w http.ResponseWriter, r *http.Request) {
-	writeStatus := LimiterStatus{Status: f.limitWrite.Status(), DiskNum: len(f.disks)}
-	readStatus := LimiterStatus{Status: f.limitRead.Status(), DiskNum: len(f.disks)}
-	info := LimiterStatusInfo{WriteStatus: writeStatus, ReadStatus: readStatus}
+	writeStatus := proto.FlashNodeLimiterStatus{Status: f.limitWrite.Status(true), DiskNum: len(f.disks), ReadTimeout: f.handleReadTimeout}
+	readStatus := proto.FlashNodeLimiterStatus{Status: f.limitRead.Status(true), DiskNum: len(f.disks), ReadTimeout: f.handleReadTimeout}
+	info := proto.FlashNodeLimiterStatusInfo{WriteStatus: writeStatus, ReadStatus: readStatus}
 	replyOK(w, r, info)
 }
 
-type LimiterStatus struct {
-	Status  util.LimiterStatus
-	DiskNum int
+func (f *FlashNode) handleScannerCommand(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		msg := fmt.Sprintf("httpServiceScanner ParseForm failed: %v", err)
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
+	id := r.FormValue("id")
+	if id == "" {
+		http.Error(w, "invalid task id", http.StatusBadRequest)
+		return
+	}
+	log.LogInfof("receive httpServiceScanner id: %v", id)
+	opCode := r.FormValue("opCode")
+	if opCode == "" {
+		http.Error(w, "invalid task opCode", http.StatusBadRequest)
+		return
+	}
+	log.LogInfof("receive httpServiceScanner opCode: %v", opCode)
+	mScanner, ok := f.manualScanners.Load(id)
+	if !ok {
+		msg := fmt.Sprintf("task id(%v) not exist", id)
+		http.Error(w, msg, http.StatusNotFound)
+		return
+	}
+	scanner := mScanner.(*ManualScanner)
+	scanner.processCommand(opCode)
+	w.WriteHeader(http.StatusOK)
 }
 
-type LimiterStatusInfo struct {
-	WriteStatus LimiterStatus
-	ReadStatus  LimiterStatus
+func (f *FlashNode) handleSetWaitForCacheBlock(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		replyErr(w, r, proto.ErrCodeParamError, err.Error(), nil)
+		return
+	}
+	valStr := r.FormValue("waitForCacheBlock")
+
+	if valStr == "" {
+		replyErr(w, r, proto.ErrCodeParamError, "invalid parameter", nil)
+		return
+	}
+	val, err := strconv.ParseBool(valStr)
+	if err != nil {
+		replyErr(w, r, proto.ErrCodeParamError, "parse  waitForCacheBlock failed", nil)
+		return
+	}
+	f.waitForCacheBlock = val
+	replyOK(w, r, nil)
+}
+
+func (f *FlashNode) handleSlotStat(w http.ResponseWriter, r *http.Request) {
+	replyOK(w, r, proto.FlashNodeSlotStat{
+		NodeId:   f.nodeID,
+		Addr:     f.localAddr,
+		SlotStat: f.GetFlashNodeSlotStat(),
+	})
 }

@@ -173,8 +173,8 @@ func (m *Server) Start(cfg *config.Config) (err error) {
 	}
 	WarnMetrics = newWarningMetrics(m.cluster)
 	m.cluster.scheduleTask()
-	exporter.RegistConsul(m.clusterName, ModuleName, cfg)
 	m.startHTTPService(ModuleName, cfg)
+	exporter.RegistConsul(m.clusterName, ModuleName, cfg)
 	metricsService := newMonitorMetrics(m.cluster)
 	metricsService.start()
 
@@ -351,6 +351,13 @@ func (m *Server) checkConfig(cfg *config.Config) (err error) {
 		}
 	}
 
+	metaPartitionTimeOutSec := cfg.GetString(metaPartitionTimeOutSec)
+	if metaPartitionTimeOutSec != "" {
+		if m.config.MetaPartitionTimeOutSec, err = strconv.ParseInt(metaPartitionTimeOutSec, 10, 0); err != nil {
+			return fmt.Errorf("%v,err:%v", proto.ErrInvalidCfg, err.Error())
+		}
+	}
+
 	numberOfDataPartitionsToLoad := cfg.GetString(NumberOfDataPartitionsToLoad)
 	if numberOfDataPartitionsToLoad != "" {
 		if m.config.numberOfDataPartitionsToLoad, err = strconv.Atoi(numberOfDataPartitionsToLoad); err != nil {
@@ -427,8 +434,9 @@ func (m *Server) checkConfig(cfg *config.Config) (err error) {
 	}
 	syslog.Printf("config mediaType %v", m.config.cfgDataMediaType)
 
-	m.config.flashNodeHandleReadTimeout = cfg.GetIntWithDefault(flashNodeHandleReadTimeout, defaultFlashNodeHandleReadTimeout)
-	m.config.flashNodeReadDataNodeTimeout = cfg.GetIntWithDefault(flashNodeReadDataNodeTimeout, defaultFlashNodeReadDataNodeTimeout)
+	m.config.SingleNodeMode = cfg.GetBoolWithDefault(cfgSingleNodeMode, false)
+
+	m.config.MaxWritableDataPartitionCnt = cfg.GetIntWithDefault(cfgMaxWritableDataPartitionCnt, 1000)
 	return
 }
 

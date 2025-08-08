@@ -29,11 +29,13 @@ import (
 	"github.com/cubefs/cubefs/sdk/master"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util"
+	"github.com/cubefs/cubefs/util/auditlog"
 	"github.com/cubefs/cubefs/util/bloom"
 	"github.com/cubefs/cubefs/util/btree"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/iputil"
 	"github.com/cubefs/cubefs/util/log"
+	"github.com/cubefs/cubefs/util/stat"
 )
 
 const (
@@ -43,16 +45,12 @@ const (
 	cachePathSeparator = ","
 
 	pingCount        = 3
-	pingTimeout      = 50 * time.Millisecond
 	_connIdelTimeout = 30 // 30 second
 
 	RefreshFlashNodesInterval  = time.Minute
 	RefreshHostLatencyInterval = 20 * time.Second
 
-	sameZoneTimeout   = 400 * time.Microsecond
-	SameRegionTimeout = 2 * time.Millisecond
-	sameZoneWeight    = 70
-	InvalidCachePath  = ""
+	sameZoneWeight = 70
 )
 
 type ZoneRankType int
@@ -92,7 +90,7 @@ type RemoteCache struct {
 	Path           string
 	AutoPrepare    bool
 	TTL            int64
-	ReadTimeoutSec int64
+	ReadTimeout    int64 // ms
 	PrepareCh      chan *PrepareRemoteCacheRequest
 
 	clusterEnable func(bool)
@@ -101,12 +99,53 @@ type RemoteCache struct {
 	remoteCacheMaxFileSizeGB int64
 	remoteCacheOnlyForNotSSD bool
 	remoteCacheMultiRead     bool
+	flashNodeTimeoutCount    int32
+	sameZoneTimeout          int64 // microsecond
+	sameRegionTimeout        int64 // ms
+
+	AddressPingMap sync.Map
+}
+
+type AddressPingStats struct {
+	sync.Mutex
+	durations []time.Duration
+	index     int
+}
+
+func (as *AddressPingStats) Add(duration time.Duration) {
+	as.Lock()
+	defer as.Unlock()
+	if as.index < 5 {
+		as.durations = append(as.durations, duration)
+	} else {
+		as.durations[as.index%5] = duration
+	}
+	as.index++
+}
+
+func (as *AddressPingStats) Average() time.Duration {
+	as.Lock()
+	defer as.Unlock()
+	if len(as.durations) == 0 {
+		return 0
+	}
+	var total time.Duration
+	for _, d := range as.durations {
+		total += d
+	}
+	return total / time.Duration(len(as.durations))
 }
 
 func (rc *RemoteCache) UpdateRemoteCacheConfig(client *ExtentClient, view *proto.SimpleVolView) {
 	// cannot set vol's RemoteCacheReadTimeoutSec <= 0
-	if view.RemoteCacheReadTimeoutSec < proto.ReadDeadlineTime {
-		view.RemoteCacheReadTimeoutSec = proto.ReadDeadlineTime
+	if view.RemoteCacheReadTimeout <= 0 {
+		view.RemoteCacheReadTimeout = proto.DefaultRemoteCacheClientReadTimeout
+	}
+	if view.RemoteCacheSameZoneTimeout <= 0 {
+		view.RemoteCacheSameZoneTimeout = proto.DefaultRemoteCacheSameZoneTimeout
+	}
+	if view.RemoteCacheSameRegionTimeout <= 0 {
+		view.RemoteCacheSameRegionTimeout = proto.DefaultRemoteCacheSameRegionTimeout
 	}
 	if rc.VolumeEnabled != view.RemoteCacheEnable {
 		log.LogInfof("RcVolumeEnabled: %v -> %v", rc.VolumeEnabled, view.RemoteCacheEnable)
@@ -114,12 +153,12 @@ func (rc *RemoteCache) UpdateRemoteCacheConfig(client *ExtentClient, view *proto
 	}
 
 	// check if RemoteCache.ClusterEnabled is set to true after it has been set to false last time
-	if !client.RemoteCache.ClusterEnabled {
+	if !client.RemoteCache.ClusterEnabled && rc.mc != nil {
 		if fgv, err := rc.mc.AdminAPI().ClientFlashGroups(); err != nil {
 			log.LogWarnf("updateFlashGroups: err(%v)", err)
 			return
 		} else {
-			rc.clusterEnable(fgv.Enable)
+			rc.clusterEnable(fgv.Enable && len(fgv.FlashGroups) != 0)
 		}
 	}
 
@@ -140,11 +179,6 @@ func (rc *RemoteCache) UpdateRemoteCacheConfig(client *ExtentClient, view *proto
 	if rc.Path != view.RemoteCachePath {
 		oldPath := client.RemoteCache.Path
 		rc.Path = view.RemoteCachePath
-		//if client.IsRemoteCacheEnabled() {
-		//	if !rc.ResetPathToBloom(view.RemoteCachePath) {
-		//		rc.Path = InvalidCachePath
-		//	}
-		//}
 		log.LogInfof("RcPath: %v -> %v, but(%v)", oldPath, view.RemoteCachePath, rc.Path)
 	}
 
@@ -156,9 +190,9 @@ func (rc *RemoteCache) UpdateRemoteCacheConfig(client *ExtentClient, view *proto
 		log.LogInfof("RcTTL: %d -> %d", rc.TTL, view.RemoteCacheTTL)
 		rc.TTL = view.RemoteCacheTTL
 	}
-	if rc.ReadTimeoutSec != view.RemoteCacheReadTimeoutSec {
-		log.LogInfof("RcReadTimeoutSec: %d -> %d", rc.ReadTimeoutSec, view.RemoteCacheReadTimeoutSec)
-		rc.ReadTimeoutSec = view.RemoteCacheReadTimeoutSec
+	if rc.ReadTimeout != view.RemoteCacheReadTimeout {
+		log.LogInfof("RcReadTimeoutSec: %d(ms) -> %d(ms)", rc.ReadTimeout, view.RemoteCacheReadTimeout)
+		rc.ReadTimeout = view.RemoteCacheReadTimeout
 	}
 
 	if rc.remoteCacheMaxFileSizeGB != view.RemoteCacheMaxFileSizeGB {
@@ -174,6 +208,19 @@ func (rc *RemoteCache) UpdateRemoteCacheConfig(client *ExtentClient, view *proto
 	if rc.remoteCacheMultiRead != view.RemoteCacheMultiRead {
 		log.LogInfof("RcFollowerRead: %v -> %v", rc.remoteCacheMultiRead, view.RemoteCacheMultiRead)
 		rc.remoteCacheMultiRead = view.RemoteCacheMultiRead
+	}
+
+	if rc.flashNodeTimeoutCount != int32(view.FlashNodeTimeoutCount) {
+		log.LogInfof("RcFlashNodeTimeoutCount: %d -> %d", rc.flashNodeTimeoutCount, int32(view.FlashNodeTimeoutCount))
+		rc.flashNodeTimeoutCount = int32(view.FlashNodeTimeoutCount)
+	}
+	if rc.sameZoneTimeout != view.RemoteCacheSameZoneTimeout {
+		log.LogInfof("RcSameZoneTimeout: %d -> %d", rc.sameZoneTimeout, view.RemoteCacheSameZoneTimeout)
+		rc.sameZoneTimeout = view.RemoteCacheSameZoneTimeout
+	}
+	if rc.sameRegionTimeout != view.RemoteCacheSameRegionTimeout {
+		log.LogInfof("RcSameRegionTimeout: %d -> %d", rc.sameRegionTimeout, view.RemoteCacheSameRegionTimeout)
+		rc.sameRegionTimeout = view.RemoteCacheSameRegionTimeout
 	}
 }
 
@@ -212,22 +259,22 @@ func (rc *RemoteCache) Init(client *ExtentClient) (err error) {
 	rc.volname = client.extentConfig.Volume
 	rc.metaWrapper = client.metaWrapper
 	rc.flashGroups = btree.New(32)
+	rc.ReadTimeout = proto.DefaultRemoteCacheClientReadTimeout
+	rc.sameZoneTimeout = proto.DefaultRemoteCacheSameZoneTimeout
+	rc.sameRegionTimeout = proto.DefaultRemoteCacheSameRegionTimeout
+	rc.clusterEnable = client.enableRemoteCacheCluster
 	rc.mc = master.NewMasterClient(client.extentConfig.Masters, false)
 
-	rc.clusterEnable = client.enableRemoteCacheCluster
 	err = rc.updateFlashGroups()
 	if err != nil {
 		log.LogDebugf("RemoteCache: Init err %v", err)
 		return
 	}
-	rc.conns = util.NewConnectPoolWithTimeoutAndCap(5, 500, _connIdelTimeout, rc.ReadTimeoutSec)
+	rc.conns = util.NewConnectPoolWithTimeoutAndCap(5, 500, _connIdelTimeout, 1)
 	rc.cacheBloom = bloom.New(BloomBits, BloomHashNum)
 	rc.wg.Add(1)
 	go rc.refresh()
 
-	//if !rc.ResetPathToBloom(client.RemoteCache.Path) {
-	//	rc.Path = InvalidCachePath
-	//}
 	rc.PrepareCh = make(chan *PrepareRemoteCacheRequest, 1024)
 	client.wg.Add(1)
 	go rc.DoRemoteCachePrepare(client)
@@ -244,11 +291,23 @@ func (rc *RemoteCache) Read(ctx context.Context, fg *FlashGroup, inode uint64, r
 		addr      string
 		reqPacket *Packet
 	)
-
+	bgTime := stat.BeginStat()
+	defer func() {
+		forceClose := err != nil && !proto.IsFlashNodeLimitError(err)
+		rc.conns.PutConnect(conn, forceClose)
+		if err != nil && strings.Contains(err.Error(), "timeout") {
+			err = fmt.Errorf("read timeout")
+		}
+		parts := strings.Split(addr, ":")
+		if len(parts) > 0 && addr != "" {
+			stat.EndStat(fmt.Sprintf("flashNode:%v", parts[0]), err, bgTime, 1)
+		}
+		stat.EndStat("flashNode", err, bgTime, 1)
+	}()
 	for {
 		addr = fg.getFlashHost()
 		if addr == "" {
-			err = fmt.Errorf("getFlashHost failed: cannot find any available host")
+			err = fmt.Errorf("no available host")
 			log.LogWarnf("FlashGroup Read failed: fg(%v) err(%v)", fg, err)
 			return
 		}
@@ -259,7 +318,7 @@ func (rc *RemoteCache) Read(ctx context.Context, fg *FlashGroup, inode uint64, r
 		}
 		if conn, err = rc.conns.GetConnect(addr); err != nil {
 			log.LogWarnf("FlashGroup Read: get connection failed, addr(%v) reqPacket(%v) err(%v) remoteCacheMultiRead(%v)", addr, req, err, rc.remoteCacheMultiRead)
-			moved = fg.moveToUnknownRank(addr, err)
+			moved = fg.moveToUnknownRank(addr, err, rc.flashNodeTimeoutCount)
 			if rc.remoteCacheMultiRead {
 				log.LogInfof("Retrying due to GetConnect of addr(%v) failure err(%v)", addr, err)
 				continue
@@ -270,7 +329,7 @@ func (rc *RemoteCache) Read(ctx context.Context, fg *FlashGroup, inode uint64, r
 		if err = reqPacket.WriteToConn(conn); err != nil {
 			log.LogWarnf("FlashGroup Read: failed to write to addr(%v) err(%v) remoteCacheMultiRead(%v)", addr, err, rc.remoteCacheMultiRead)
 			rc.conns.PutConnect(conn, err != nil)
-			moved = fg.moveToUnknownRank(addr, err)
+			moved = fg.moveToUnknownRank(addr, err, rc.flashNodeTimeoutCount)
 			if rc.remoteCacheMultiRead {
 				log.LogInfof("Retrying due to write to addr(%v) failure err(%v)", addr, err)
 				continue
@@ -278,9 +337,13 @@ func (rc *RemoteCache) Read(ctx context.Context, fg *FlashGroup, inode uint64, r
 			return
 		}
 		if read, err = rc.getReadReply(conn, reqPacket, req); err != nil {
+			// TODO: may try other replica in future
+			if proto.IsFlashNodeLimitError(err) {
+				break
+			}
 			log.LogWarnf("FlashGroup Read: getReadReply from addr(%v) err(%v) remoteCacheMultiRead(%v)", addr, err, rc.remoteCacheMultiRead)
 			rc.conns.PutConnect(conn, err != nil)
-			moved = fg.moveToUnknownRank(addr, err)
+			moved = fg.moveToUnknownRank(addr, err, rc.flashNodeTimeoutCount)
 			if rc.remoteCacheMultiRead {
 				log.LogInfof("Retrying due to getReadReply from addr(%v) failure  err(%v)", addr, err)
 				continue
@@ -288,7 +351,6 @@ func (rc *RemoteCache) Read(ctx context.Context, fg *FlashGroup, inode uint64, r
 		}
 		break
 	}
-	rc.conns.PutConnect(conn, err != nil)
 
 	log.LogDebugf("FlashGroup Read: flashGroup(%v) addr(%v) CacheReadRequest(%v) reqPacket(%v) err(%v) moved(%v) remoteCacheMultiRead(%v)", fg, addr, req, reqPacket, err, moved, rc.remoteCacheMultiRead)
 	return
@@ -298,17 +360,19 @@ func (rc *RemoteCache) getReadReply(conn *net.TCPConn, reqPacket *Packet, req *C
 	for readBytes < int(req.Size_) {
 		replyPacket := NewFlashCacheReply()
 		start := time.Now()
-		err = replyPacket.ReadFromConn(conn, int(rc.ReadTimeoutSec))
+		err = replyPacket.ReadFromConnExt(conn, int(rc.ReadTimeout))
 		if err != nil {
-			log.LogWarnf("getReadReply: failed to read from connect, req(%v) readBytes(%v) err(%v)", reqPacket, readBytes, err)
+			log.LogWarnf("getReadReply: failed to read from connect, req(%v) readBytes(%v) err(%v) cost %v ReadTimeout %v",
+				reqPacket, readBytes, err, time.Since(start).String(), rc.ReadTimeout)
 			return
 		}
 		if replyPacket.ResultCode != proto.OpOk {
-			err = fmt.Errorf("(%v)", string(replyPacket.Data))
-			log.LogWarnf("getReadReply: ResultCode NOK, req(%v) reply(%v) ResultCode(%v)", reqPacket, replyPacket, replyPacket.ResultCode)
+			err = fmt.Errorf("%v", string(replyPacket.Data))
+			if !proto.IsFlashNodeLimitError(err) {
+				log.LogWarnf("getReadReply: ResultCode NOK, req(%v) reply(%v) ResultCode(%v)", reqPacket, replyPacket, replyPacket.ResultCode)
+			}
 			return
 		}
-		log.LogDebugf("getReadReply: read from connect,req(%v) readBytes(%v) cost %v", reqPacket, replyPacket.Size, time.Since(start).String())
 		expectCrc := crc32.ChecksumIEEE(replyPacket.Data[:replyPacket.Size])
 		if replyPacket.CRC != expectCrc {
 			err = fmt.Errorf("inconsistent CRC, expect(%v) reply(%v)", expectCrc, replyPacket.CRC)
@@ -339,7 +403,7 @@ func (rc *RemoteCache) Prepare(ctx context.Context, fg *FlashGroup, inode uint64
 	}
 	defer func() {
 		if err != nil {
-			moved = fg.moveToUnknownRank(addr, err)
+			moved = fg.moveToUnknownRank(addr, err, rc.flashNodeTimeoutCount)
 		}
 	}()
 	if conn, err = rc.conns.GetConnect(addr); err != nil {
@@ -356,7 +420,7 @@ func (rc *RemoteCache) Prepare(ctx context.Context, fg *FlashGroup, inode uint64
 	}
 
 	replyPacket := NewFlashCacheReply()
-	if err = replyPacket.ReadFromConn(conn, int(rc.ReadTimeoutSec)); err != nil {
+	if err = replyPacket.ReadFromConnExt(conn, int(rc.ReadTimeout)); err != nil {
 		log.LogWarnf("FlashGroup Prepare: failed to ReadFromConn, replyPacket(%v), fg host(%v) moved(%v), err(%v)", replyPacket, addr, moved, err)
 		return
 	}
@@ -485,7 +549,7 @@ func (rc *RemoteCache) updateFlashGroups() (err error) {
 		return
 	}
 	log.LogDebugf("updateFlashGroups. get flashGroupView [%v]", fgv)
-	rc.clusterEnable(fgv.Enable)
+	rc.clusterEnable(fgv.Enable && len(fgv.FlashGroups) != 0)
 	if !fgv.Enable {
 		rc.flashGroups = newFlashGroups
 		return
@@ -519,7 +583,8 @@ func (rc *RemoteCache) updateFlashGroups() (err error) {
 
 func (rc *RemoteCache) ClassifyHostsByAvgDelay(fgID uint64, hosts []string) (sortedHosts map[ZoneRankType][]string) {
 	sortedHosts = make(map[ZoneRankType][]string)
-
+	sameZoneTimeout := time.Duration(rc.sameZoneTimeout) * time.Microsecond
+	sameRegionTimeout := time.Duration(rc.sameRegionTimeout) * time.Millisecond
 	for _, host := range hosts {
 		avgTime := time.Duration(0)
 		v, ok := rc.hostLatency.Load(host)
@@ -528,16 +593,61 @@ func (rc *RemoteCache) ClassifyHostsByAvgDelay(fgID uint64, hosts []string) (sor
 		}
 		if avgTime <= time.Duration(0) {
 			sortedHosts[UnknownZoneRank] = append(sortedHosts[UnknownZoneRank], host)
+			auditlog.LogOpMsg("ClassifyHostsByAvgDelay", fmt.Sprintf("add host %v to unknown region", host), nil)
 		} else if avgTime <= sameZoneTimeout {
 			sortedHosts[SameZoneRank] = append(sortedHosts[SameZoneRank], host)
-		} else if avgTime <= SameRegionTimeout {
+		} else if avgTime <= sameRegionTimeout {
 			sortedHosts[SameRegionRank] = append(sortedHosts[SameRegionRank], host)
 		} else {
 			sortedHosts[CrossRegionRank] = append(sortedHosts[CrossRegionRank], host)
+			auditlog.LogOpMsg("ClassifyHostsByAvgDelay", fmt.Sprintf("add host %v to cross region by time %v", host, avgTime.String()), nil)
 		}
 	}
 	log.LogInfof("ClassifyHostsByAvgDelay: fgID(%v) sortedHost:%v", fgID, sortedHosts)
 	return sortedHosts
+}
+
+func (rc *RemoteCache) resetFlashNodeTimeoutCount() {
+	fgSet := make([]uint64, 0)
+
+	isInSet := func(fg uint64, fgSet []uint64) bool {
+		for _, v := range fgSet {
+			if v == fg {
+				return true
+			}
+		}
+		return false
+	}
+
+	rangeFunc := func(i btree.Item) bool {
+		item := i.(*SlotItem)
+		fg := item.FlashGroup
+
+		if isInSet(fg.ID, fgSet) {
+			return true
+		}
+		fgSet = append(fgSet, fg.ID)
+		fg.hostLock.Lock()
+		for addr := range fg.hostTimeoutCount {
+			if fg.hostTimeoutCount[addr] == 0 {
+				continue
+			}
+			// Check if the timeout host ping was successful
+			// if it was successful and within the sameZone and sameRegion ranges, reset the host timeout count to 0
+			v, ok := rc.hostLatency.Load(addr)
+			if ok {
+				avgTime := v.(time.Duration)
+				if avgTime > 0 && avgTime < time.Millisecond*time.Duration(rc.sameRegionTimeout) {
+					log.LogDebugf("resetFlashNodeTimeoutCount fgId(%v) flashnode(%v) from %v to 0",
+						fg.ID, addr, fg.hostTimeoutCount[addr])
+					fg.hostTimeoutCount[addr] = 0
+				}
+			}
+		}
+		fg.hostLock.Unlock()
+		return true
+	}
+	rc.rangeFlashGroups(nil, rangeFunc)
 }
 
 func (rc *RemoteCache) refreshHostLatency() {
@@ -560,18 +670,38 @@ func (rc *RemoteCache) refreshHostLatency() {
 
 func (rc *RemoteCache) updateHostLatency(hosts []string) {
 	for _, host := range hosts {
-		avgRtt, err := iputil.PingWithTimeout(strings.Split(host, ":")[0], pingCount, pingTimeout*pingCount)
+		avgRtt, err := iputil.PingWithTimeout(strings.Split(host, ":")[0], pingCount, time.Millisecond*time.Duration(rc.ReadTimeout))
 		if err == nil {
-			rc.hostLatency.Store(host, avgRtt)
+			v, _ := rc.AddressPingMap.LoadOrStore(host, &AddressPingStats{})
+			aps := v.(*AddressPingStats)
+			aps.Add(avgRtt)
+			rc.hostLatency.Store(host, aps.Average())
 			log.LogInfof("updateHostLatency: host(%v) avgRtt(%v)", host, avgRtt.String())
 		} else {
-			rc.hostLatency.Delete(host)
+			rangeFunc := func(i btree.Item) bool {
+				item := i.(*SlotItem)
+				fg := item.FlashGroup
+				fg.hostLock.Lock()
+				defer fg.hostLock.Unlock()
+				for _, h := range fg.Hosts {
+					if h == host {
+						fg.hostTimeoutCount[host]++
+						if fg.hostTimeoutCount[host] >= rc.flashNodeTimeoutCount {
+							rc.hostLatency.Delete(host)
+						}
+						return false
+					}
+				}
+				return true
+			}
+			rc.rangeFlashGroups(nil, rangeFunc)
 			log.LogWarnf("updateHostLatency: host(%v) err(%v)", host, err)
 		}
 	}
+	rc.resetFlashNodeTimeoutCount()
 }
 
-func (rc *RemoteCache) GetFlashGroupBySlot(slot uint32) *FlashGroup {
+func (rc *RemoteCache) GetFlashGroupBySlot(slot uint32) (*FlashGroup, uint32) {
 	var item *SlotItem
 
 	pivot := &SlotItem{slot: slot}
@@ -584,7 +714,7 @@ func (rc *RemoteCache) GetFlashGroupBySlot(slot uint32) *FlashGroup {
 	if item == nil {
 		return rc.getMinFlashGroup()
 	}
-	return item.FlashGroup
+	return item.FlashGroup, item.slot
 }
 
 func (rc *RemoteCache) getFlashHostsMap() map[string]bool {
@@ -617,14 +747,14 @@ func (rc *RemoteCache) rangeFlashGroups(pivot *SlotItem, rangeFunc func(item btr
 	}
 }
 
-func (rc *RemoteCache) getMinFlashGroup() *FlashGroup {
+func (rc *RemoteCache) getMinFlashGroup() (*FlashGroup, uint32) {
 	flashGroups := rc.flashGroups
 
 	if flashGroups.Len() > 0 {
 		item := flashGroups.Min().(*SlotItem)
 		if item != nil {
-			return item.FlashGroup
+			return item.FlashGroup, item.slot
 		}
 	}
-	return nil
+	return nil, 0
 }

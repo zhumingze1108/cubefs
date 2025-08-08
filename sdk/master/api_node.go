@@ -113,12 +113,13 @@ func (api *NodeAPI) ResponseDataNodeTask(task *proto.AdminTask) (err error) {
 	return api.mc.request(newRequest(post, proto.GetDataNodeTaskResponse).Header(api.h).Body(task))
 }
 
-func (api *NodeAPI) DataNodeDecommission(nodeAddr string, count int, clientIDKey string, raftForce bool) (err error) {
+func (api *NodeAPI) DataNodeDecommission(nodeAddr string, count int, clientIDKey string, raftForce bool, weight int) (err error) {
 	request := newRequest(get, proto.DecommissionDataNode).Header(api.h).NoTimeout()
 	request.addParam("addr", nodeAddr)
 	request.addParam("count", strconv.Itoa(count))
 	request.addParam("clientIDKey", clientIDKey)
 	request.addParam("raftForceDel", strconv.FormatBool(raftForce))
+	request.addParam("weight", strconv.Itoa(weight))
 	if _, err = api.mc.serveRequest(request); err != nil {
 		return
 	}
@@ -148,11 +149,12 @@ func (api *NodeAPI) MetaNodeMigrate(srcAddr, targetAddr string, count int, clien
 	return
 }
 
-func (api *NodeAPI) DataNodeMigrate(srcAddr, targetAddr string, count int, clientIDKey string) (err error) {
+func (api *NodeAPI) DataNodeMigrate(srcAddr, targetAddr string, count int, weight int, clientIDKey string) (err error) {
 	request := newRequest(get, proto.MigrateDataNode).Header(api.h).NoTimeout()
 	request.addParam("srcAddr", srcAddr)
 	request.addParam("targetAddr", targetAddr)
 	request.addParam("count", strconv.Itoa(count))
+	request.addParam("weight", strconv.Itoa(weight))
 	request.addParam("clientIDKey", clientIDKey)
 	if _, err = api.mc.serveRequest(request); err != nil {
 		return
@@ -180,8 +182,20 @@ func (api *NodeAPI) QueryDecommissionedDisks(addr string) (disks *proto.Decommis
 	return
 }
 
+func (api *NodeAPI) QueryDecommissionSuccessDisks(addr string) (disks *proto.DecommissionedDisks, err error) {
+	disks = &proto.DecommissionedDisks{}
+	err = api.mc.requestWith(disks, newRequest(get, proto.QueryDecommissionSuccessDisk).Header(api.h).addParam("addr", addr))
+	return
+}
+
 func (api *NodeAPI) QueryCancelDecommissionedDataNode(addr string) (err error) {
 	err = api.mc.request(newRequest(get, proto.CancelDecommissionDataNode).Header(api.h).addParam("addr", addr))
+	return
+}
+
+func (api *NodeAPI) QueryDataNodeDecommissionProgress(addr string) (progress *proto.DataDecommissionProgress, err error) {
+	progress = &proto.DataDecommissionProgress{}
+	err = api.mc.requestWith(progress, newRequest(post, proto.QueryDataNodeDecoProgress).Header(api.h).addParam("addr", addr))
 	return
 }
 
@@ -207,13 +221,31 @@ func (api *NodeAPI) RemoveFlashNode(nodeAddr string) (result string, err error) 
 	return string(data), err
 }
 
+func (api *NodeAPI) RemoveAllInactiveFlashNodes() (rmNodes []string, err error) {
+	err = api.mc.requestWith(&rmNodes, newRequest(get, proto.FlashNodeRemoveAllInactive).Header(api.h))
+	return
+}
+
 func (api *NodeAPI) GetFlashNode(addr string) (node proto.FlashNodeViewInfo, err error) {
 	err = api.mc.requestWith(&node, newRequest(get, proto.FlashNodeGet).Header(api.h).addParam("addr", addr))
 	return
 }
 
-func (api *NodeAPI) ListFlashNodes(all bool) (zoneFlashNodes map[string][]*proto.FlashNodeViewInfo, err error) {
+func (api *NodeAPI) ListFlashNodes(active int) (zoneFlashNodes map[string][]*proto.FlashNodeViewInfo, err error) {
 	zoneFlashNodes = make(map[string][]*proto.FlashNodeViewInfo)
-	err = api.mc.requestWith(&zoneFlashNodes, newRequest(get, proto.FlashNodeList).Header(api.h).addParamAny("all", all))
+	err = api.mc.requestWith(&zoneFlashNodes, newRequest(get, proto.FlashNodeList).Header(api.h).addParamAny("active", active))
+	return
+}
+
+func (api *NodeAPI) ResponseFlashNodeTask(task *proto.AdminTask) (err error) {
+	return api.mc.request(newRequest(post, proto.GetFlashNodeTaskResponse).Header(api.h).Body(task))
+}
+
+func (api *NodeAPI) OfflineMetaNode(nodeAddr string) (err error) {
+	request := newRequest(get, proto.OfflineMetaNode).Header(api.h).NoTimeout()
+	request.addParam("addr", nodeAddr)
+	if _, err = api.mc.serveRequest(request); err != nil {
+		return
+	}
 	return
 }

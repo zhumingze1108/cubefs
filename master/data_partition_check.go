@@ -116,6 +116,7 @@ func (partition *DataPartition) checkReplicaStatus(timeOutSec int64) {
 	for _, replica := range partition.Replicas {
 		if !replica.isLive(partition.PartitionID, timeOutSec) {
 			log.LogInfof("action[checkReplicaStatus] partition %v replica %v be set status ReadOnly", partition.PartitionID, replica.Addr)
+			replica.ReadOnlyReasons |= proto.DpReplicaMissing
 			if replica.Status == proto.ReadWrite {
 				replica.Status = proto.ReadOnly
 			}
@@ -125,8 +126,18 @@ func (partition *DataPartition) checkReplicaStatus(timeOutSec int64) {
 			continue
 		}
 
-		if (replica.dataNode.RdOnly || partition.RdOnly) && replica.Status == proto.ReadWrite {
-			replica.Status = proto.ReadOnly
+		if replica.dataNode.RdOnly {
+			replica.ReadOnlyReasons |= proto.DataNodeRdOnly
+			if replica.Status == proto.ReadWrite {
+				replica.Status = proto.ReadOnly
+			}
+		}
+
+		if partition.RdOnly {
+			replica.ReadOnlyReasons |= proto.PartitionRdOnly
+			if replica.Status == proto.ReadWrite {
+				replica.Status = proto.ReadOnly
+			}
 		}
 	}
 }
@@ -170,7 +181,7 @@ func (partition *DataPartition) checkMissingReplicas(clusterID, leaderAddr strin
 	WarnMetrics.dpMissingReplicaMutex.Unlock()
 
 	for _, replica := range partition.Replicas {
-		if partition.hasHost(replica.Addr) && replica.isMissing(dataPartitionMissSec) && !partition.IsDiscard {
+		if partition.hasHost(replica.Addr) && replica.isMissing(dataPartitionMissSec) {
 			if partition.needToAlarmMissingDataPartition(replica.Addr, dataPartitionWarnInterval) {
 				dataNode := replica.getReplicaNode()
 				var lastReportTime time.Time
@@ -219,7 +230,7 @@ func (partition *DataPartition) checkMissingReplicas(clusterID, leaderAddr strin
 	}
 
 	for _, addr := range partition.Hosts {
-		if partition.hasMissingDataPartition(addr) && partition.needToAlarmMissingDataPartition(addr, dataPartitionWarnInterval) && !partition.IsDiscard {
+		if partition.hasMissingDataPartition(addr) && partition.needToAlarmMissingDataPartition(addr, dataPartitionWarnInterval) {
 			msg := fmt.Sprintf("action[checkMissErr],clusterID[%v] partitionID:%v  on node:%v  "+
 				"miss time  > :%v  but server not exsit So Migrate", clusterID, partition.PartitionID, addr, dataPartitionMissSec)
 			msg = msg + fmt.Sprintf(" decommissionDataPartitionURL is http://%v/dataPartition/decommission?id=%v&addr=%v", leaderAddr, partition.PartitionID, addr)

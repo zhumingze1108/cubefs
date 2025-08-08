@@ -39,6 +39,7 @@ const (
 	cfgDpNoLeaderReportIntervalSec      = "dpNoLeaderReportIntervalSec"
 	cfgMpNoLeaderReportIntervalSec      = "mpNoLeaderReportIntervalSec"
 	dataPartitionTimeOutSec             = "dataPartitionTimeOutSec"
+	metaPartitionTimeOutSec             = "metaPartitionTimeOutSec"
 	NumberOfDataPartitionsToLoad        = "numberOfDataPartitionsToLoad"
 	secondsToFreeDataPartitionAfterLoad = "secondsToFreeDataPartitionAfterLoad"
 	nodeSetCapacity                     = "nodeSetCap"
@@ -69,6 +70,11 @@ const (
 	cfgMetaNodeMemoryHighPer              = "metaNodeMemoryHighPer"
 	cfgMetaNodeMemoryLowPer               = "metaNodeMemoryLowPer"
 	cfgAutoMpMigrate                      = "autoMetaPartitionMigrate"
+	cfgSingleNodeMode                     = "singleNodeMode"
+	cfgMaxWritableDataPartitionCnt        = "maxWritableDataPartitionCnt"
+
+	flashNodeHandleReadTimeout   = "flashNodeHandleReadTimeout"
+	flashNodeReadDataNodeTimeout = "flashNodeReadDataNodeTimeout"
 )
 
 // default value
@@ -83,7 +89,7 @@ const (
 	defaultIntervalToCheckCrc                  = 20 * defaultIntervalToCheck // in terms of seconds
 	noHeartBeatTimes                           = 3                           // number of times that no heartbeat reported
 	defaultNodeTimeOutSec                      = noHeartBeatTimes * defaultIntervalToCheckHeartbeat
-	defaultDataPartitionTimeOutSec             = 200 * defaultIntervalToCheckHeartbeat // datanode with massive amount of dp may cost 10-min
+	defaultDataPartitionTimeOutSec             = 50 * defaultIntervalToCheckHeartbeat // datanode with massive amount of dp may cost 10-min
 	defaultMissingDataPartitionInterval        = 24 * 3600
 	// defaultDpNoLeaderReportIntervalSec         = 10 * 60
 	// TODO-chi: for test
@@ -114,8 +120,11 @@ const (
 	lowerLimitRWMetaPartition                          = 3    // lower limit of RW meta partition, equal defaultReplicaNum
 	defaultHttpReversePoolSize                         = 1024
 
-	defaultFlashNodeHandleReadTimeout   = 3
-	defaultFlashNodeReadDataNodeTimeout = 3
+	defaultFlashNodeHandleReadTimeout   = 1000
+	defaultFlashNodeReadDataNodeTimeout = 3000
+
+	defaultMetaNodeGOGC = 100
+	defaultDataNodeGOGC = 100
 )
 
 // AddrDatabase is a map that stores the address of a given host (e.g., the leader)
@@ -128,6 +137,7 @@ type clusterConfig struct {
 	DpNoLeaderReportIntervalSec         int64
 	MpNoLeaderReportIntervalSec         int64
 	DataPartitionTimeOutSec             int64
+	MetaPartitionTimeOutSec             int64
 	IntervalToAlarmMissingDataPartition int64
 	PeriodToLoadALLDataPartitions       int64
 	metaNodeReservedMem                 uint64
@@ -191,10 +201,16 @@ type clusterConfig struct {
 	flashNodeHandleReadTimeout   int
 	flashNodeReadDataNodeTimeout int
 
+	metaNodeGOGC int
+	dataNodeGOGC int
+
 	metaNodeMemHighPer float64
 	metaNodeMemLowPer  float64
 	metaNodeMemMidPer  float64
 	AutoMpMigrate      bool
+	SingleNodeMode     bool
+
+	MaxWritableDataPartitionCnt int
 }
 
 func newClusterConfig() (cfg *clusterConfig) {
@@ -206,6 +222,7 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.DpNoLeaderReportIntervalSec = defaultDpNoLeaderReportIntervalSec
 	cfg.MpNoLeaderReportIntervalSec = defaultMpNoLeaderReportIntervalSec
 	cfg.DataPartitionTimeOutSec = defaultDataPartitionTimeOutSec
+	cfg.MetaPartitionTimeOutSec = defaultMetaPartitionTimeOutSec
 	cfg.IntervalToCheckDataPartition = defaultIntervalToCheckDataPartition
 	cfg.IntervalToCheckQos = defaultIntervalToCheckQos
 	cfg.IntervalToAlarmMissingDataPartition = defaultIntervalToAlarmMissingDataPartition
@@ -227,6 +244,8 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.volDelayDeleteTimeHour = defaultVolDelayDeleteTimeHour
 	cfg.flashNodeHandleReadTimeout = defaultFlashNodeHandleReadTimeout
 	cfg.flashNodeReadDataNodeTimeout = defaultFlashNodeReadDataNodeTimeout
+	cfg.metaNodeGOGC = defaultMetaNodeGOGC
+	cfg.dataNodeGOGC = defaultDataNodeGOGC
 	cfg.metaNodeMemHighPer = defaultMetaNodeMemHighPer
 	cfg.metaNodeMemLowPer = defaultMetaNodeMemLowPer
 	cfg.metaNodeMemMidPer = defaultMetaNodeMemHighPer

@@ -420,6 +420,11 @@ func (eh *ExtentHandler) processReply(packet *Packet) {
 		time.Sleep(StreamSendSleepInterval)
 	}
 
+	if reply.ResultCode == proto.OpArgMismatchErr {
+		log.LogWarnf("processReply ArgUnmatchErr ino(%v) cacheGen(%v) size(%v) extents(%v)",
+			eh.inode, eh.stream.extents.gen, eh.stream.extents.size, eh.stream.extents.List())
+	}
+
 	if reply.ResultCode != proto.OpOk {
 		if reply.ResultCode != proto.ErrCodeVersionOpError {
 			errmsg := fmt.Sprintf("reply NOK: reply(%v)", reply)
@@ -612,13 +617,22 @@ func (eh *ExtentHandler) appendExtentKey() (err error) {
 		}
 
 		if eh.key.PartitionId > 0 && eh.stream.enableRemoteCacheAutoPrepare() {
-			prepareReq := &PrepareRemoteCacheRequest{
-				ctx:   context.Background(),
-				ek:    eh.key,
-				inode: eh.stream.inode,
+			inodeInfo, err := eh.stream.client.getInodeInfo(eh.inode)
+			if err != nil {
+				log.LogErrorf("appendExtentKey: getInodeInfo failed. ino(%v) eh(%v) err(%v)", eh.inode, eh, err)
+				return err
 			}
-			eh.stream.sendToPrepareRomoteCacheChan(prepareReq)
-			// eh.stream.prepareRemoteCache(ctx, ek)
+
+			enableRemoteCacheStorageClass := !eh.stream.client.RemoteCache.remoteCacheOnlyForNotSSD ||
+				(eh.stream.client.RemoteCache.remoteCacheOnlyForNotSSD && inodeInfo.StorageClass != proto.StorageClass_Replica_SSD)
+			if enableRemoteCacheStorageClass {
+				prepareReq := &PrepareRemoteCacheRequest{
+					ctx:   context.Background(),
+					ek:    eh.key,
+					inode: eh.stream.inode,
+				}
+				eh.stream.sendToPrepareRomoteCacheChan(prepareReq)
+			}
 		}
 	}
 	if err == nil {

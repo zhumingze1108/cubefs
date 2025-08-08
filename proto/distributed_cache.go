@@ -3,6 +3,8 @@ package proto
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/cubefs/cubefs/util/fastcrc32"
@@ -26,6 +28,12 @@ const (
 	SlotStatus_Completed SlotStatus = 0x0
 	SlotStatus_Creating  SlotStatus = 0x1
 	SlotStatus_Deleting  SlotStatus = 0x2
+
+	FlashNodeTaskWorker     = "task"
+	FlashNodeCacheWorker    = "cache"
+	FlashManualWarmupAction = "warmup"
+	FlashManualClearAction  = "clear"
+	FlashManualCheckAction  = "check"
 )
 
 type FlashGroupStatus int
@@ -47,6 +55,28 @@ func (status FlashGroupStatus) IsActive() bool {
 	return status == FlashGroupStatus_Active
 }
 
+type ManualTaskStatus int
+
+// 0 init,1 running,2 pause,3 success,4 failed
+const (
+	Flash_Task_Init ManualTaskStatus = iota
+	Flash_Task_Running
+	Flash_Task_Pause
+	Flash_Task_Success
+	Flash_Task_Failed
+	Flash_Task_Stop
+)
+
+func ManualTaskDone(status int) bool {
+	success, failed, stop := int(Flash_Task_Success), int(Flash_Task_Failed), int(Flash_Task_Stop)
+	return status == success || status == failed || status == stop
+}
+
+func ManualTaskIsRunning(status int) bool {
+	running := int(Flash_Task_Running)
+	return status == running
+}
+
 type FlashGroupInfo struct {
 	ID    uint64   `json:"i"`
 	Slot  []uint32 `json:"s"` // FlashGroup's position in hasher ring
@@ -56,6 +86,10 @@ type FlashGroupInfo struct {
 type FlashGroupView struct {
 	Enable      bool
 	FlashGroups []*FlashGroupInfo
+}
+
+func (f *FlashGroupInfo) String() string {
+	return fmt.Sprintf("{ID: %d, Hosts: %v}", f.ID, f.Hosts)
 }
 
 func (ds *DataSource) EncodeBinaryTo(b []byte) {
@@ -230,21 +264,23 @@ type FlashGroupAdminView struct {
 }
 
 type FlashNodeViewInfo struct {
-	ID           uint64
-	Addr         string
-	ReportTime   time.Time
-	IsActive     bool
-	Version      string
-	ZoneName     string
-	FlashGroupID uint64
-	IsEnable     bool
-	DiskStat     []*FlashNodeDiskCacheStat
+	ID            uint64
+	Addr          string
+	ReportTime    time.Time
+	IsActive      bool
+	Version       string
+	ZoneName      string
+	FlashGroupID  uint64
+	IsEnable      bool
+	DiskStat      []*FlashNodeDiskCacheStat
+	LimiterStatus *FlashNodeLimiterStatusInfo
 }
 
 type FlashNodeStat struct {
-	NodeLimit   uint64
-	VolLimit    map[string]uint64
-	CacheStatus []*CacheStatus
+	WaitForCacheBlock bool
+	NodeLimit         uint64
+	VolLimit          map[string]uint64
+	CacheStatus       []*CacheStatus
 }
 
 type CacheStatus struct {
@@ -260,6 +296,20 @@ type CacheStatus struct {
 	Capacity int      `json:"capacity"`
 	Keys     []string `json:"keys"`
 	Status   int      `json:"status"`
+}
+
+type SlotStat struct {
+	SlotId      uint32    `json:"slot_id"`
+	OwnerSlotId uint32    `json:"owner_slot_id"`
+	HitCount    uint32    `json:"hit_count"`
+	HitRate     float64   `json:"hit_rate"`
+	RecentTime  time.Time `json:"recent_time"`
+}
+
+type FlashNodeSlotStat struct {
+	NodeId   uint64
+	Addr     string
+	SlotStat []*SlotStat
 }
 
 func ComputeSourcesVersion(sources []*DataSource, gen uint64) (version uint32) {
@@ -284,4 +334,92 @@ func ComputeCacheBlockSlot(volume string, inode, fixedFileOffset uint64) uint32 
 	binary.BigEndian.PutUint64(buf[volLen:volLen+8], inode)
 	binary.BigEndian.PutUint64(buf[volLen+8:volLen+16], fixedFileOffset)
 	return fastcrc32.Checksum(buf)
+}
+
+type FlashManualTask struct {
+	Id                   string
+	Action               string
+	VolName              string
+	Status               int
+	ManualTaskConfig     ManualTaskConfig
+	ManualTaskStatistics *ManualTaskStatistics
+	StartTime            *time.Time
+	UpdateTime           *time.Time
+	EndTime              *time.Time
+	RcvStop              bool
+	Done                 bool
+	sync.Mutex
+}
+
+type ManualTaskConfig struct {
+	Prefix                  string
+	TraverseFileConcurrency int
+	HandlerFileConcurrency  int
+	TotalFileSizeLimit      int64
+}
+
+type ManualTaskStatistics struct {
+	TotalFileScannedNum int64
+	TotalFileCachedNum  int64
+	TotalDirScannedNum  int64
+	ErrorCacheNum       int64
+	ErrorReadDirNum     int64
+	TotalCacheSize      int64
+	LastCacheSize       int64
+	FlashNode           string
+}
+
+type FlashNodeManualTaskRequest struct {
+	MasterAddr string
+	FnNodeAddr string
+	Task       *FlashManualTask
+}
+
+type FlashNodeManualTaskResponse struct {
+	ID         string
+	FlashNode  string
+	StartTime  *time.Time
+	EndTime    *time.Time
+	UpdateTime *time.Time
+	Done       bool
+	Status     uint8
+	StartErr   string
+	Volume     string
+	RcvStop    bool
+	ManualTaskStatistics
+}
+
+type FlashNodeManualTaskCommand struct {
+	ID      string
+	Command string
+}
+
+type ScanItem struct {
+	ParentId     uint64 `json:"pid"`   // FileID value of the parent inode.
+	Inode        uint64 `json:"inode"` // FileID value of the current inode.
+	Name         string `json:"name"`  // Name of the current dentry.
+	Path         string `json:"path"`  // Path of the current dentry.
+	Type         uint32 `json:"type"`  // Type of the current dentry.
+	Op           string `json:"op"`    // to warmup or check
+	Size         uint64 `json:"size"`  // for warmup: size of the current dentry
+	StorageClass uint32 `json:"sc"`    // for warmup: storage class of the current dentry
+	WriteGen     uint64 `json:"gen"`   // for warmup: used to determine whether a file is modified
+}
+
+func (flt *FlashManualTask) GetPathPrefix() string {
+	return strings.TrimRight(flt.ManualTaskConfig.Prefix, "/")
+}
+
+func (flt *FlashManualTask) SetResponse(taskRsp *FlashNodeManualTaskResponse) {
+	t := time.Now()
+	flt.UpdateTime = &t
+	flt.ManualTaskStatistics.FlashNode = taskRsp.FlashNode
+	flt.ManualTaskStatistics.TotalFileScannedNum = taskRsp.TotalFileScannedNum
+	flt.ManualTaskStatistics.TotalFileCachedNum = taskRsp.TotalFileCachedNum
+	flt.ManualTaskStatistics.TotalDirScannedNum = taskRsp.TotalDirScannedNum
+	flt.ManualTaskStatistics.ErrorCacheNum = taskRsp.ErrorCacheNum
+	flt.ManualTaskStatistics.ErrorReadDirNum = taskRsp.ErrorReadDirNum
+	flt.ManualTaskStatistics.TotalCacheSize = taskRsp.TotalCacheSize
+	flt.ManualTaskStatistics.LastCacheSize = taskRsp.LastCacheSize
+	flt.Done = taskRsp.Done
 }

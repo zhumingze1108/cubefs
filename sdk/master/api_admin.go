@@ -184,11 +184,12 @@ func (api *AdminAPI) CreateDataPartition(volName string, count int, clientIDKey 
 	))
 }
 
-func (api *AdminAPI) DecommissionDataPartition(dataPartitionID uint64, nodeAddr string, raftForce bool, clientIDKey, decommissionType string) (err error) {
+func (api *AdminAPI) DecommissionDataPartition(dataPartitionID uint64, nodeAddr string, raftForce bool, weight int, clientIDKey, decommissionType string) (err error) {
 	request := newRequest(get, proto.AdminDecommissionDataPartition).Header(api.h)
 	request.addParam("id", strconv.FormatUint(dataPartitionID, 10))
 	request.addParam("addr", nodeAddr)
 	request.addParam("raftForceDel", strconv.FormatBool(raftForce))
+	request.addParam("weight", strconv.Itoa(weight))
 	request.addParam("clientIDKey", clientIDKey)
 	request.addParam("decommissionType", decommissionType)
 	_, err = api.mc.serveRequest(request)
@@ -249,6 +250,20 @@ func (api *AdminAPI) QueryDataPartitionDecommissionStatus(partitionId uint64) (i
 	return
 }
 
+func (api *AdminAPI) QueryDataPartitionDiskDecommissionInfoStat() (infos []*proto.DecommissionInfoStat, err error) {
+	request := newRequest(get, proto.AdminQueryDiskDecommissionInfoStat).Header(api.h)
+	infos = make([]*proto.DecommissionInfoStat, 0)
+	err = api.mc.requestWith(&infos, request)
+	return
+}
+
+func (api *AdminAPI) QueryDataPartitionDataNodeDecommissionInfoStat() (infos []*proto.DecommissionInfoStat, err error) {
+	request := newRequest(get, proto.AdminQueryDataNodeDecommissionInfoStat).Header(api.h)
+	infos = make([]*proto.DecommissionInfoStat, 0)
+	err = api.mc.requestWith(&infos, request)
+	return
+}
+
 func (api *AdminAPI) DeleteVolume(volName, authKey string) (err error) {
 	request := newRequest(get, proto.AdminDeleteVol).Header(api.h)
 	request.addParam("name", volName)
@@ -296,16 +311,9 @@ func (api *AdminAPI) UpdateVolume(
 	request.addParam("followerRead", strconv.FormatBool(vv.FollowerRead))
 	request.addParam(proto.MetaFollowerReadKey, strconv.FormatBool(vv.MetaFollowerRead))
 	request.addParam(proto.VolEnableDirectRead, strconv.FormatBool(vv.DirectRead))
+	request.addParam(proto.VolIgnoreTinyRecover, strconv.FormatBool(vv.IgnoreTinyRecover))
 	request.addParam(proto.MaximallyReadKey, strconv.FormatBool(vv.MaximallyRead))
 	request.addParam("ebsBlkSize", strconv.Itoa(vv.ObjBlockSize))
-	request.addParam("cacheCap", strconv.FormatUint(vv.CacheCapacity, 10))
-	request.addParam("cacheAction", strconv.Itoa(vv.CacheAction))
-	request.addParam("cacheThreshold", strconv.Itoa(vv.CacheThreshold))
-	request.addParam("cacheTTL", strconv.Itoa(vv.CacheTtl))
-	request.addParam("cacheHighWater", strconv.Itoa(vv.CacheHighWater))
-	request.addParam("cacheLowWater", strconv.Itoa(vv.CacheLowWater))
-	request.addParam("cacheLRUInterval", strconv.Itoa(vv.CacheLruInterval))
-	request.addParam("cacheRuleKey", vv.CacheRule)
 	request.addParam("dpReadOnlyWhenVolFull", strconv.FormatBool(vv.DpReadOnlyWhenVolFull))
 	request.addParam("replicaNum", strconv.FormatUint(uint64(vv.DpReplicaNum), 10))
 	request.addParam("enableQuota", strconv.FormatBool(vv.EnableQuota))
@@ -323,10 +331,13 @@ func (api *AdminAPI) UpdateVolume(
 	request.addParamAny("remoteCachePath", vv.RemoteCachePath)
 	request.addParamAny("remoteCacheAutoPrepare", vv.RemoteCacheAutoPrepare)
 	request.addParamAny("remoteCacheTTL", vv.RemoteCacheTTL)
-	request.addParamAny("remoteCacheReadTimeoutSec", vv.RemoteCacheReadTimeoutSec)
+	request.addParamAny("remoteCacheReadTimeout", vv.RemoteCacheReadTimeout)
 	request.addParam("remoteCacheMaxFileSizeGB", strconv.FormatInt(vv.RemoteCacheMaxFileSizeGB, 10))
 	request.addParamAny("remoteCacheOnlyForNotSSD", vv.RemoteCacheOnlyForNotSSD)
 	request.addParamAny("remoteCacheMultiRead", vv.RemoteCacheMultiRead)
+	request.addParamAny("flashNodeTimeoutCount", vv.FlashNodeTimeoutCount)
+	request.addParamAny("remoteCacheSameZoneTimeout", vv.RemoteCacheSameZoneTimeout)
+	request.addParamAny("remoteCacheSameRegionTimeout", vv.RemoteCacheSameRegionTimeout)
 
 	if txMask != "" {
 		request.addParam("enableTxMask", txMask)
@@ -392,12 +403,12 @@ func (api *AdminAPI) VolAddAllowedStorageClass(volName string, addAllowedStorage
 }
 
 func (api *AdminAPI) CreateVolName(volName, owner string, capacity uint64, deleteLockTime int64, crossZone, normalZonesFirst bool,
-	business string, mpCount, dpCount, replicaNum, dpSize int, followerRead bool, zoneName, cacheRuleKey string, ebsBlkSize,
-	cacheCapacity, cacheAction, cacheThreshold, cacheTTL, cacheHighWater, cacheLowWater, cacheLRUInterval int,
+	business string, mpCount, dpCount, replicaNum, dpSize int, followerRead bool, zoneName string, ebsBlkSize int,
 	dpReadOnlyWhenVolFull bool, txMask string, txTimeout uint32, txConflictRetryNum int64, txConflictRetryInterval int64, optEnableQuota string,
 	clientIDKey string, volStorageClass uint32, allowedStorageClass string, optMetaFollowerRead string, optMaximallyRead string,
 	remoteCacheEnable string, remoteCacheAutoPrepare string, remoteCachePath string, remoteCacheTTL int64, remoteCacheReadTimeout int64,
-	remoteCacheMaxFileSizeGB int64, remoteCacheOnlyForNotSSD string, remoteCacheMultiRead string,
+	remoteCacheMaxFileSizeGB int64, remoteCacheOnlyForNotSSD string, remoteCacheMultiRead string, flashNodeTimeoutCount int64,
+	remoteCacheSameZoneTimeout int64, remoteCacheSameRegionTimeout int64,
 ) (err error) {
 	request := newRequest(get, proto.AdminCreateVol).Header(api.h)
 	request.addParam("name", volName)
@@ -415,15 +426,7 @@ func (api *AdminAPI) CreateVolName(volName, owner string, capacity uint64, delet
 	request.addParam(proto.MetaFollowerReadKey, optMetaFollowerRead)
 	request.addParam(proto.MaximallyReadKey, optMaximallyRead)
 	request.addParam("zoneName", zoneName)
-	request.addParam("cacheRuleKey", cacheRuleKey)
 	request.addParam("ebsBlkSize", strconv.Itoa(ebsBlkSize))
-	request.addParam("cacheCap", strconv.Itoa(cacheCapacity))
-	request.addParam("cacheAction", strconv.Itoa(cacheAction))
-	request.addParam("cacheThreshold", strconv.Itoa(cacheThreshold))
-	request.addParam("cacheTTL", strconv.Itoa(cacheTTL))
-	request.addParam("cacheHighWater", strconv.Itoa(cacheHighWater))
-	request.addParam("cacheLowWater", strconv.Itoa(cacheLowWater))
-	request.addParam("cacheLRUInterval", strconv.Itoa(cacheLRUInterval))
 	request.addParam("dpReadOnlyWhenVolFull", strconv.FormatBool(dpReadOnlyWhenVolFull))
 	request.addParam("enableQuota", optEnableQuota)
 	request.addParam("clientIDKey", clientIDKey)
@@ -437,6 +440,9 @@ func (api *AdminAPI) CreateVolName(volName, owner string, capacity uint64, delet
 	request.addParam("remoteCacheMaxFileSizeGB", strconv.FormatInt(remoteCacheMaxFileSizeGB, 10))
 	request.addParam("remoteCacheOnlyForNotSSD", remoteCacheOnlyForNotSSD)
 	request.addParam("remoteCacheMultiRead", remoteCacheMultiRead)
+	request.addParamAny("flashNodeTimeoutCount", flashNodeTimeoutCount)
+	request.addParamAny("remoteCacheSameZoneTimeout", remoteCacheSameZoneTimeout)
+	request.addParamAny("remoteCacheSameRegionTimeout", remoteCacheSameRegionTimeout)
 
 	if txMask != "" {
 		request.addParam("enableTxMask", txMask)
@@ -585,8 +591,9 @@ func (api *AdminAPI) SetMasterVolDeletionDelayTime(volDeletionDelayTimeHour int)
 func (api *AdminAPI) SetClusterParas(batchCount, markDeleteRate, deleteWorkerSleepMs, autoRepairRate, loadFactor, maxDpCntLimit, maxMpCntLimit, clientIDKey string,
 	enableAutoDecommissionDisk string, autoDecommissionDiskInterval string,
 	enableAutoDpMetaRepair string, autoDpMetaRepairParallelCnt string,
-	dpRepairTimeout string, dpTimeout string, dpBackupTimeout string,
+	dpRepairTimeout string, dpTimeout string, mpTimeout string, dpBackupTimeout string,
 	decommissionDpLimit, decommissionDiskLimit, forbidWriteOpOfProtoVersion0 string, mediaType string,
+	handleTimeout string, readDataNodeTimeout string,
 ) (err error) {
 	request := newRequest(get, proto.AdminSetNodeInfo).Header(api.h)
 	request.addParam("batchCount", batchCount)
@@ -623,6 +630,9 @@ func (api *AdminAPI) SetClusterParas(batchCount, markDeleteRate, deleteWorkerSle
 	if dpTimeout != "" {
 		request.addParam("dpTimeout", dpTimeout)
 	}
+	if mpTimeout != "" {
+		request.addParam("mpTimeout", mpTimeout)
+	}
 	if dpBackupTimeout != "" {
 		request.addParam("dpBackupTimeout", dpBackupTimeout)
 	}
@@ -638,6 +648,13 @@ func (api *AdminAPI) SetClusterParas(batchCount, markDeleteRate, deleteWorkerSle
 	if mediaType != "" {
 		request.addParam("dataMediaType", mediaType)
 	}
+	if handleTimeout != "" {
+		request.addParam("flashNodeHandleReadTimeout", handleTimeout)
+	}
+	if readDataNodeTimeout != "" {
+		request.addParam("flashNodeReadDataNodeTimeout", readDataNodeTimeout)
+	}
+
 	_, err = api.mc.serveRequest(request)
 	return
 }
@@ -649,18 +666,6 @@ func (api *AdminAPI) GetClusterParas() (delParas map[string]string, err error) {
 	}
 	delParas = make(map[string]string)
 	err = api.mc.requestWith(&delParas, newRequest(get, proto.AdminGetNodeInfo).Header(api.h))
-	return
-}
-
-func (api *AdminAPI) CreatePreLoadDataPartition(volName string, count int, capacity, ttl uint64, zongs string) (view *proto.DataPartitionsView, err error) {
-	view = &proto.DataPartitionsView{}
-	err = api.mc.requestWith(view, newRequest(get, proto.AdminCreatePreLoadDataPartition).Header(api.h).Param(
-		anyParam{"name", volName},
-		anyParam{"replicaNum", count},
-		anyParam{"capacity", capacity},
-		anyParam{"cacheTTL", ttl},
-		anyParam{"zoneName", zongs},
-	))
 	return
 }
 
@@ -747,14 +752,14 @@ func (api *AdminAPI) DiskDetail(addr string, diskPath string) (disk *proto.DiskI
 	return
 }
 
-func (api *AdminAPI) DecommissionDisk(addr string, disk string) (err error) {
+func (api *AdminAPI) DecommissionDisk(addr string, disk string, weight int) (err error) {
 	return api.mc.request(newRequest(post, proto.DecommissionDisk).Header(api.h).
-		addParam("addr", addr).addParam("disk", disk).addParam("decommissionType", "1"))
+		addParam("addr", addr).addParam("disk", disk).addParam("decommissionType", "1").addParam("weight", strconv.Itoa(weight)))
 }
 
-func (api *AdminAPI) RecommissionDisk(addr string, disk string) (err error) {
+func (api *AdminAPI) RecommissionDisk(addr string, disk string, recommissionType string) (err error) {
 	return api.mc.request(newRequest(post, proto.RecommissionDisk).Header(api.h).
-		addParam("addr", addr).addParam("disk", disk))
+		addParam("addr", addr).addParam("disk", disk).addParam("recommissionType", recommissionType))
 }
 
 func (api *AdminAPI) QueryDecommissionDiskProgress(addr string, disk string) (progress *proto.DecommissionProgress, err error) {
@@ -1005,35 +1010,35 @@ func (api *AdminAPI) ClientFlashGroups() (fgView proto.FlashGroupView, err error
 	return
 }
 
-func (api *AdminAPI) CreateBalanceTask() (task *proto.ClusterPlan, err error) {
+func (api *AdminAPI) CreateMetaNodeBalanceTask() (task *proto.ClusterPlan, err error) {
 	task = &proto.ClusterPlan{
 		Low:  make(map[string]*proto.ZonePressureView),
 		Plan: make([]*proto.MetaBalancePlan, 0),
 	}
-	err = api.mc.requestWith(task, newRequest(get, proto.CreateBalanceTask).Header(api.h))
+	err = api.mc.requestWith(task, newRequest(get, proto.CreateMetaNodeBalanceTask).Header(api.h))
 	return
 }
 
-func (api *AdminAPI) GetBalanceTask() (task *proto.ClusterPlan, err error) {
+func (api *AdminAPI) GetMetaNodeBalanceTask() (task *proto.ClusterPlan, err error) {
 	task = &proto.ClusterPlan{
 		Low:  make(map[string]*proto.ZonePressureView),
 		Plan: make([]*proto.MetaBalancePlan, 0),
 	}
-	err = api.mc.requestWith(task, newRequest(get, proto.GetBalanceTask).Header(api.h))
+	err = api.mc.requestWith(task, newRequest(get, proto.GetMetaNodeBalanceTask).Header(api.h))
 	return
 }
 
-func (api *AdminAPI) RunBalanceTask() (result string, err error) {
-	err = api.mc.requestWith(&result, newRequest(get, proto.RunBalanceTask).Header(api.h))
+func (api *AdminAPI) RunMetaNodeBalanceTask() (result string, err error) {
+	err = api.mc.requestWith(&result, newRequest(get, proto.RunMetaNodeBalanceTask).Header(api.h))
 	return
 }
 
-func (api *AdminAPI) StopBalanceTask() (result string, err error) {
-	err = api.mc.requestWith(&result, newRequest(get, proto.StopBalanceTask).Header(api.h))
+func (api *AdminAPI) StopMetaNodeBalanceTask() (result string, err error) {
+	err = api.mc.requestWith(&result, newRequest(get, proto.StopMetaNodeBalanceTask).Header(api.h))
 	return
 }
 
-func (api *AdminAPI) DeleteBalanceTask() (result string, err error) {
-	err = api.mc.requestWith(&result, newRequest(get, proto.DeleteBalanceTask).Header(api.h))
+func (api *AdminAPI) DeleteMetaNodeBalanceTask() (result string, err error) {
+	err = api.mc.requestWith(&result, newRequest(get, proto.DeleteMetaNodeBalanceTask).Header(api.h))
 	return
 }

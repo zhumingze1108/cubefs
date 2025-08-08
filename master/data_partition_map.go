@@ -422,7 +422,7 @@ func (dpMap *DataPartitionMap) setAllDataPartitionsToReadOnly() {
 	log.LogDebugf("action[setAllDataPartitionsToReadOnly] ReadWrite->ReadOnly dp cnt: %v", changedCnt)
 }
 
-func (dpMap *DataPartitionMap) checkBadDiskDataPartitions(diskPath, nodeAddr string) (partitions []*DataPartition) {
+func (dpMap *DataPartitionMap) checkBadDiskDataPartitions(diskPath, nodeAddr string, ignoreDiscard bool) (partitions []*DataPartition) {
 	dpMapCache := make([]*DataPartition, 0)
 	dpMap.RLock()
 	for _, dp := range dpMap.partitionMap {
@@ -432,11 +432,25 @@ func (dpMap *DataPartitionMap) checkBadDiskDataPartitions(diskPath, nodeAddr str
 
 	partitions = make([]*DataPartition, 0)
 	for _, dp := range dpMapCache {
+		if !ignoreDiscard && dp.IsDiscard {
+			continue
+		}
 		if dp.containsBadDisk(diskPath, nodeAddr) {
 			partitions = append(partitions, dp)
 		}
 	}
 	return
+}
+
+func (dpMap *DataPartitionMap) Range(f func(dp *DataPartition) bool) {
+	dpMap.RLock()
+	defer dpMap.RUnlock()
+
+	for _, dp := range dpMap.partitions {
+		if !f(dp) {
+			return
+		}
+	}
 }
 
 func (dpMap *DataPartitionMap) getReplicaDiskPaths(nodeAddr string) (diskPaths []string) {
@@ -476,4 +490,22 @@ func inStingList(target string, strArray []string) bool {
 		}
 	}
 	return false
+}
+
+func (dpMap *DataPartitionMap) CheckReadWritableCntUnderLimit(limit int, mediaType uint32) error {
+	dpMap.Lock()
+	defer dpMap.Unlock()
+
+	cntOfMediaType, ok := dpMap.rwCntByMediaType[mediaType]
+	if !ok {
+		err := fmt.Errorf("mediatype(%d) is not in dpMap.rwCntByMediaType", mediaType)
+		log.LogErrorf("CheckReadWritableCntUnderLimit: %s", err.Error())
+		return err
+	}
+	if cntOfMediaType >= limit {
+		err := fmt.Errorf("mediatype(%d) count(%d) limit(%d)", mediaType, cntOfMediaType, limit)
+		log.LogErrorf("CheckReadWritableCntUnderLimit: %s", err.Error())
+		return err
+	}
+	return nil
 }

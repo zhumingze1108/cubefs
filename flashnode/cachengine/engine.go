@@ -914,6 +914,16 @@ func (c *CacheEngine) GetEvictCount() map[string]int {
 	return result
 }
 
+func (c *CacheEngine) GetCacheBytes() map[string]int64 {
+	result := make(map[string]int64)
+	c.lruCacheMap.Range(func(key, value interface{}) bool {
+		cacheItem := value.(*lruCacheItem)
+		result[cacheItem.config.Path] = cacheItem.lruCache.GetAllocated()
+		return true
+	})
+	return result
+}
+
 func (c *CacheEngine) DoInactiveDisk(dataPath string) {
 	if value, ok := c.lruCacheMap.Load(dataPath); ok {
 		cacheItem := value.(*lruCacheItem)
@@ -1004,7 +1014,7 @@ func (c *CacheEngine) triggerCacheError(key string, dataPath string) {
 
 func (c *CacheEngine) SetReadDataNodeTimeout(timeout int) {
 	if c.readDataNodeTimeout != timeout && timeout > 0 {
-		log.LogInfof("CacheEngine set readDataNodeTimeout from %d to %d", c.readDataNodeTimeout, timeout)
+		log.LogInfof("CacheEngine set readDataNodeTimeout from %d(ms) to %d(ms)", c.readDataNodeTimeout, timeout)
 		c.readDataNodeTimeout = timeout
 	}
 }

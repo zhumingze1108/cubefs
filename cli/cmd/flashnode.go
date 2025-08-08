@@ -38,11 +38,13 @@ func newFlashNodeCmd(client *master.MasterClient) *cobra.Command {
 		newCmdFlashNodeRemove(client),
 		newCmdFlashNodeGet(client),
 		newCmdFlashNodeList(client),
+		newCmdFlashNodeRemoveAllInactive(client),
 
 		newCmdFlashNodeHTTPStat(client),
 		newCmdFlashNodeHTTPStatAll(client),
 		newCmdFlashNodeHTTPEvict(client),
 		newCmdFlashNodeHTTPInactiveDisk(client),
+		newCmdFlashNodeHTTPSlotStat(client),
 	)
 	return cmd
 }
@@ -68,11 +70,22 @@ func newCmdFlashNodeSet(client *master.MasterClient) *cobra.Command {
 }
 
 func newCmdFlashNodeRemove(client *master.MasterClient) *cobra.Command {
-	return &cobra.Command{
+	var optYes bool
+	cmd := &cobra.Command{
 		Use:   CliOpRemove + _flashnodeAddr,
 		Short: "remove flash node by addr",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) (err error) {
+			if !optYes {
+				fmt.Printf("decommission flashnode:[%v]\n", args[0])
+				stdout("\nConfirm (yes/no)[no]: ")
+				var userConfirm string
+				_, _ = fmt.Scanln(&userConfirm)
+				if userConfirm != "yes" {
+					err = fmt.Errorf("Abort by user.\n")
+					return
+				}
+			}
 			result, err := client.NodeAPI().RemoveFlashNode(args[0])
 			if err != nil {
 				return
@@ -81,6 +94,42 @@ func newCmdFlashNodeRemove(client *master.MasterClient) *cobra.Command {
 			return
 		},
 	}
+	cmd.Flags().BoolVarP(&optYes, "yes", "y", false, "Answer yes for all questions")
+	return cmd
+}
+
+func newCmdFlashNodeRemoveAllInactive(client *master.MasterClient) *cobra.Command {
+	var optYes bool
+	cmd := &cobra.Command{
+		Use:   "removeAllInactive",
+		Short: "remove all inactive flash nodes",
+		Args:  cobra.MinimumNArgs(0),
+		RunE: func(_ *cobra.Command, args []string) (err error) {
+			if !optYes {
+				fmt.Printf("remove all inactive flash nodes")
+				stdout("\nConfirm (yes/no)[no]: ")
+				var userConfirm string
+				_, _ = fmt.Scanln(&userConfirm)
+				if userConfirm != "yes" {
+					err = fmt.Errorf("Abort by user.\n")
+					return
+				}
+			}
+			var rmNodes []string
+			rmNodes, err = client.NodeAPI().RemoveAllInactiveFlashNodes()
+			if err != nil {
+				return
+			}
+
+			stdoutlnf("total remove %v flash nodes", len(rmNodes))
+			for _, rmNode := range rmNodes {
+				stdoutlnf("remove flashnode:%s", rmNode)
+			}
+			return
+		},
+	}
+	cmd.Flags().BoolVarP(&optYes, "yes", "y", false, "Answer yes for all questions")
+	return cmd
 }
 
 func newCmdFlashNodeGet(client *master.MasterClient) *cobra.Command {
@@ -100,27 +149,40 @@ func newCmdFlashNodeGet(client *master.MasterClient) *cobra.Command {
 }
 
 func newCmdFlashNodeList(client *master.MasterClient) *cobra.Command {
-	var showAllFlashNodes bool
-	cmd := &cobra.Command{
+	return &cobra.Command{
 		Use:   CliOpList,
-		Short: "list all flash nodes",
+		Short: "list all flash nodes or [active true/false] flash nodes",
 		Args:  cobra.MinimumNArgs(0),
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
-			zoneFlashNodes, err := client.NodeAPI().ListFlashNodes(showAllFlashNodes)
+			var active bool
+			activeFilter := -1
+			filterStr := "all"
+			if len(args) == 1 {
+				if active, err = strconv.ParseBool(args[0]); err != nil {
+					err = fmt.Errorf("Parse bool fail: %v\n", err)
+					return
+				}
+				if active {
+					activeFilter = 1
+					filterStr = "active:true"
+				} else {
+					activeFilter = 0
+					filterStr = "active:false"
+				}
+			}
+			zoneFlashNodes, err := client.NodeAPI().ListFlashNodes(activeFilter)
 			if err != nil {
 				return
 			}
-			stdoutln("[FlashNodes]")
+			stdoutln(fmt.Sprintf("[FlashNodes] %s", filterStr))
 			tbl := table{formatFlashNodeViewTableTitle}
 			for _, flashNodeViewInfos := range zoneFlashNodes {
-				tbl = showFlashNodesView(flashNodeViewInfos, true, tbl)
+				tbl = showFlashNodesView(flashNodeViewInfos, true, nil, tbl)
 			}
 			stdoutln(alignTable(tbl...))
 			return
 		},
 	}
-	cmd.Flags().BoolVar(&showAllFlashNodes, "all", true, "show all flashnodes contain inactive and not enabled")
-	return cmd
 }
 
 func newCmdFlashNodeHTTPStat(client *master.MasterClient) *cobra.Command {
@@ -160,6 +222,31 @@ func newCmdFlashNodeHTTPStatAll(client *master.MasterClient) *cobra.Command {
 				return
 			}
 			stdoutln(formatIndent(stat))
+			return
+		},
+	}
+}
+
+func newCmdFlashNodeHTTPSlotStat(client *master.MasterClient) *cobra.Command {
+	return &cobra.Command{
+		Use:   "httpSlotStat" + _flashnodeAddr,
+		Short: "show flashnode slot stat",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) (err error) {
+			// check flashnode whether exist
+			_, err = client.NodeAPI().GetFlashNode(args[0])
+			if err != nil {
+				return
+			}
+			stat, err := httpclient.New().Addr(addr2Prof(args[0])).FlashNode().SlotStat()
+			if err != nil {
+				return
+			}
+
+			sort.SliceStable(stat.SlotStat, func(i, j int) bool {
+				return stat.SlotStat[i].SlotId < stat.SlotStat[j].SlotId
+			})
+			stdout("%v\n", formatFlashNodeSlotStat(&stat))
 			return
 		},
 	}
@@ -213,17 +300,31 @@ func newCmdFlashNodeHTTPInactiveDisk(client *master.MasterClient) *cobra.Command
 	}
 }
 
-func showFlashNodesView(flashNodeViewInfos []*proto.FlashNodeViewInfo, showStat bool, tbl table) table {
+func showFlashNodesView(flashNodeViewInfos []*proto.FlashNodeViewInfo, showStat bool, groupStats map[uint64]string, tbl table) table {
 	sort.Slice(flashNodeViewInfos, func(i, j int) bool {
 		return flashNodeViewInfos[i].ID < flashNodeViewInfos[j].ID
 	})
+	var groupActiveInfo string
 	for _, fn := range flashNodeViewInfos {
+		groupActiveInfo = ""
+		nodeInfo := arow(fn.ZoneName, fn.ID, fn.Addr, formatYesNo(fn.IsActive), formatYesNo(fn.IsEnable),
+			fn.FlashGroupID, formatTimeToString(fn.ReportTime))
+		if groupStats != nil {
+			if v, ok := groupStats[fn.FlashGroupID]; ok {
+				groupActiveInfo = v
+			}
+			nodeInfo = arow(fn.ZoneName, fn.ID, fn.Addr, formatYesNo(fn.IsActive), formatYesNo(fn.IsEnable),
+				fn.FlashGroupID, groupActiveInfo, formatTimeToString(fn.ReportTime))
+		}
 		if !showStat {
-			tbl = tbl.append(arow(fn.ZoneName, fn.ID, fn.Addr, formatYesNo(fn.IsActive), formatYesNo(fn.IsEnable),
-				fn.FlashGroupID, formatTimeToString(fn.ReportTime)))
+			tbl = tbl.append(nodeInfo)
 			continue
 		}
-
+		if len(fn.DiskStat) == 0 {
+			nodeInfo = append(nodeInfo, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A")
+			tbl = tbl.append(nodeInfo)
+			continue
+		}
 		for index, stat := range fn.DiskStat {
 			dataPath, hitRate, evicts, limit, maxAlloc, hasAlloc, num, status := "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A"
 			if fn.IsActive && fn.IsEnable {
@@ -236,13 +337,15 @@ func showFlashNodesView(flashNodeViewInfos []*proto.FlashNodeViewInfo, showStat 
 				num = strconv.Itoa(stat.KeyNum)
 				status = strconv.Itoa(stat.Status)
 			}
-			if index == 0 {
-				tbl = tbl.append(arow(fn.ZoneName, fn.ID, fn.Addr, formatYesNo(fn.IsActive), formatYesNo(fn.IsEnable),
-					fn.FlashGroupID, formatTimeToString(fn.ReportTime), dataPath, hitRate, evicts, limit, maxAlloc, hasAlloc, num, status))
-			} else {
-				tbl = tbl.append(arow("", "", "", "", "",
-					"", "", dataPath, hitRate, evicts, limit, maxAlloc, hasAlloc, num, status))
+			if index != 0 {
+				if groupStats != nil {
+					nodeInfo = arow("", "", "", "", "", "", "", "")
+				} else {
+					nodeInfo = arow("", "", "", "", "", "", "")
+				}
 			}
+			nodeInfo = append(nodeInfo, dataPath, hitRate, evicts, limit, maxAlloc, hasAlloc, num, status)
+			tbl = tbl.append(nodeInfo)
 		}
 	}
 	return tbl

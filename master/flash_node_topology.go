@@ -310,7 +310,7 @@ func (t *flashNodeTopology) getFlashGroupView() (fgv *proto.FlashGroupView) {
 	t.flashGroupMap.Range(func(_, value interface{}) bool {
 		fg := value.(*FlashGroup)
 		if fg.GetStatus().IsActive() {
-			hosts := fg.getFlashNodeHosts(true)
+			hosts := fg.getFlashNodeHostsEnabled()
 			if len(hosts) == 0 {
 				return true
 			}
@@ -319,6 +319,21 @@ func (t *flashNodeTopology) getFlashGroupView() (fgv *proto.FlashGroupView) {
 				Slot:  fg.Slots,
 				Hosts: hosts,
 			})
+		}
+		return true
+	})
+	return
+}
+
+func (t *flashNodeTopology) checkForActiveNode() (exists bool) {
+	t.flashGroupMap.Range(func(_, value interface{}) bool {
+		fg := value.(*FlashGroup)
+		if fg.GetStatus().IsActive() {
+			hosts := fg.getFlashNodeHosts(true)
+			if len(hosts) > 0 {
+				exists = true
+				return false
+			}
 		}
 		return true
 	})
@@ -569,6 +584,9 @@ func (c *Cluster) scheduleToUpdateFlashGroupSlots() {
 						c.flashNodeTopo.createFlashGroupLock.Lock()
 						defer c.flashNodeTopo.createFlashGroupLock.Unlock()
 						slotStatus := flashGroup.getSlotStatus()
+						if slotStatus == proto.SlotStatus_Creating && (!flashGroup.GetStatus().IsActive() || len(flashGroup.flashNodes) == 0) {
+							return true
+						}
 						if slotStatus == proto.SlotStatus_Completed {
 							return true
 						} else if slotStatus == proto.SlotStatus_Creating || slotStatus == proto.SlotStatus_Deleting {

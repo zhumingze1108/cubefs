@@ -17,14 +17,12 @@ package util
 import (
 	"context"
 	"errors"
-	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cubefs/cubefs/util/log"
-	"github.com/cubefs/cubefs/util/timeutil"
 	"golang.org/x/time/rate"
 )
 
@@ -51,24 +49,26 @@ type LimiterStatus struct {
 }
 
 var (
-	IOLimitTicket      = time.Minute
+	IOLimitTicket      = 3 * 1000 // 1 min
 	IOLimitTicketInner = time.Millisecond * 100
 	LimitedIoError     = errors.New("limited io error")
+	LimitedFlowError   = errors.New("flow limited")
+	LimitedRunError    = errors.New("run limited")
 )
 
 // flow rate limiter's burst is double limit.
 // max queue size of io is 8-times io concurrency.
 func NewIOLimiter(flowLimit, ioConcurrency int) *IoLimiter {
-	return NewIOLimiterEx(flowLimit, ioConcurrency, 0)
+	return NewIOLimiterEx(flowLimit, ioConcurrency, 0, 0)
 }
 
-func NewIOLimiterEx(flowLimit, ioConcurrency, factor int) *IoLimiter {
+func NewIOLimiterEx(flowLimit, ioConcurrency, factor, hangMaxSecond int) *IoLimiter {
 	flow := rate.NewLimiter(rate.Inf, 0)
 	if flowLimit > 0 {
 		flow = rate.NewLimiter(rate.Limit(flowLimit), flowLimit/2)
 	}
 	l := &IoLimiter{limit: flowLimit, flow: flow}
-	l.io.Store(newIOQueue(ioConcurrency, factor))
+	l.io.Store(newIOQueue(ioConcurrency, factor, hangMaxSecond))
 	return l
 }
 
@@ -88,7 +88,12 @@ func (l *IoLimiter) ResetFlow(flowLimit int) {
 }
 
 func (l *IoLimiter) ResetIO(ioConcurrency, factor int) {
-	q := l.io.Swap(newIOQueue(ioConcurrency, factor)).(*ioQueue)
+	q := l.io.Swap(newIOQueueEx(ioConcurrency, factor)).(*ioQueue)
+	q.Close()
+}
+
+func (l *IoLimiter) ResetIOEx(ioConcurrency, factor, hangMaxMillSecond int) {
+	q := l.io.Swap(newIOQueue(ioConcurrency, factor, hangMaxMillSecond)).(*ioQueue)
 	q.Close()
 }
 
@@ -104,14 +109,15 @@ func (l *IoLimiter) Run(size int, allowHang bool, taskFn func()) (err error) {
 func (l *IoLimiter) RunNoWait(size int, allowHang bool, taskFn func()) (err error) {
 	if size > 0 && l.limit > 0 {
 		if !l.flow.AllowN(time.Now(), size) {
-			return fmt.Errorf("run limited")
+			return LimitedFlowError
 		}
 	}
 	return l.getIO().Run(taskFn, allowHang)
 }
 
 func (l *IoLimiter) TryRun(size int, taskFn func()) bool {
-	if ok := l.getIO().TryRun(taskFn); !ok {
+	if ok := l.getIO().TryRun(taskFn, false); !ok {
+		log.LogWarn("action[limitio] tryrun failed")
 		return false
 	}
 	if size > 0 {
@@ -123,12 +129,30 @@ func (l *IoLimiter) TryRun(size int, taskFn func()) bool {
 	return true
 }
 
-func (l *IoLimiter) Status() (st LimiterStatus) {
+func (l *IoLimiter) TryRunAsync(ctx context.Context, size int, waitForFlow bool, taskFn func()) error {
+	if size > 0 && l.limit > 0 {
+		if waitForFlow {
+			if err := l.flow.WaitN(ctx, size); err != nil {
+				return LimitedFlowError
+			}
+		} else {
+			if !l.flow.AllowN(time.Now(), size) {
+				return LimitedFlowError
+			}
+		}
+	}
+	if ok := l.getIO().TryRun(taskFn, true); !ok {
+		return LimitedRunError
+	}
+	return nil
+}
+
+func (l *IoLimiter) Status(ignoreUsed bool) (st LimiterStatus) {
 	st = l.getIO().Status()
 
 	limit := l.limit
 	st.FlowLimit = limit
-	if limit > 0 {
+	if limit > 0 && !ignoreUsed {
 		now := time.Now()
 		reserve := l.flow.ReserveN(now, l.flow.Burst())
 		duration := reserve.DelayFrom(now)
@@ -142,7 +166,7 @@ func (l *IoLimiter) Status() (st LimiterStatus) {
 }
 
 func (l *IoLimiter) Close() {
-	q := l.io.Swap(newIOQueue(0, 0)).(*ioQueue)
+	q := l.io.Swap(newIOQueue(0, 0, 0)).(*ioQueue)
 	q.Close()
 }
 
@@ -154,17 +178,22 @@ type task struct {
 }
 
 type ioQueue struct {
-	wg          sync.WaitGroup
-	once        sync.Once
-	running     uint32
-	concurrency int
-	stopCh      chan struct{}
-	queue       chan *task
-	midQueue    chan *task
-	factor      int
+	wg                sync.WaitGroup
+	once              sync.Once
+	running           uint32
+	concurrency       int
+	stopCh            chan struct{}
+	queue             chan *task
+	midQueue          chan *task
+	factor            int
+	hangMaxMillSecond int
 }
 
-func newIOQueue(concurrency, factor int) *ioQueue {
+func newIOQueueEx(concurrency, factor int) *ioQueue {
+	return newIOQueue(concurrency, factor, 0)
+}
+
+func newIOQueue(concurrency, factor, hangMaxMillSecond int) *ioQueue {
 	q := &ioQueue{concurrency: concurrency}
 	if q.concurrency <= 0 {
 		return q
@@ -172,6 +201,10 @@ func newIOQueue(concurrency, factor int) *ioQueue {
 
 	if factor <= 0 {
 		factor = defaultQueueFactor
+	}
+	q.hangMaxMillSecond = hangMaxMillSecond
+	if hangMaxMillSecond <= 0 {
+		q.hangMaxMillSecond = IOLimitTicket
 	}
 	q.factor = factor
 	q.midQueue = make(chan *task, 100)
@@ -209,7 +242,7 @@ func (q *ioQueue) innerRun() {
 		case <-q.stopCh:
 			return
 		case task := <-q.midQueue:
-			if timeutil.GetCurrentTime().After(task.tm.Add(IOLimitTicket)) {
+			if time.Now().After(task.tm.Add(time.Duration(q.hangMaxMillSecond) * time.Millisecond)) {
 				task.err = LimitedIoError
 				close(task.done)
 				continue
@@ -222,7 +255,7 @@ func (q *ioQueue) innerRun() {
 				case q.queue <- task:
 					stop = true
 				case <-tickerInner.C:
-					if timeutil.GetCurrentTime().After(task.tm.Add(IOLimitTicket)) {
+					if time.Now().After(task.tm.Add(time.Duration(q.hangMaxMillSecond) * time.Millisecond)) {
 						task.err = LimitedIoError
 						close(task.done)
 						stop = true
@@ -249,7 +282,7 @@ func (q *ioQueue) Run(taskFn func(), allowHang bool) (err error) {
 	if !allowHang {
 		ch = q.midQueue
 	}
-	task := &task{fn: taskFn, done: make(chan struct{}), tm: timeutil.GetCurrentTime()}
+	task := &task{fn: taskFn, done: make(chan struct{}), tm: time.Now()}
 	select {
 	case <-q.stopCh:
 		taskFn()
@@ -260,7 +293,7 @@ func (q *ioQueue) Run(taskFn func(), allowHang bool) (err error) {
 	return
 }
 
-func (q *ioQueue) TryRun(taskFn func()) bool {
+func (q *ioQueue) TryRun(taskFn func(), async bool) bool {
 	if q.concurrency <= 0 {
 		taskFn()
 		return true
@@ -279,9 +312,12 @@ func (q *ioQueue) TryRun(taskFn func()) bool {
 		taskFn()
 		return true
 	case q.queue <- task:
-		<-task.done
+		if !async {
+			<-task.done
+		}
 		return true
 	default:
+		log.LogWarnf("TryRun queue.cap(%v) queue.len(%v) running(%v)", cap(q.queue), len(q.queue), q.running)
 		return false
 	}
 }

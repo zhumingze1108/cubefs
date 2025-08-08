@@ -781,7 +781,7 @@ func (mp *metaPartition) EvictInode(req *EvictInodeReq, p *Packet, remoteAddr st
 	ino := NewInode(req.Inode, 0)
 	if item := mp.inodeTree.Get(ino); item == nil {
 		err = fmt.Errorf("mp %v inode %v reqeust cann't found", mp.config.PartitionId, ino)
-		log.LogErrorf("action[RenewalForbiddenMigration] %v", err)
+		log.LogWarnf("action[RenewalForbiddenMigration] %v", err)
 		p.PacketErrorWithBody(proto.OpNotExistErr, []byte(err.Error()))
 		return
 	} else {
@@ -930,29 +930,6 @@ func (mp *metaPartition) DeleteInodeBatch(req *proto.DeleteInodeBatchRequest, p 
 		return
 	}
 	p.PacketOkReply()
-	return
-}
-
-// ClearInodeCache clear a inode's cbfs extent but keep ebs extent.
-func (mp *metaPartition) ClearInodeCache(req *proto.ClearInodeCacheRequest, p *Packet) (err error) {
-	if len(mp.extDelCh) > defaultDelExtentsCnt-100 {
-		err = fmt.Errorf("extent del chan full")
-		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
-		return
-	}
-
-	ino := NewInode(req.Inode, 0)
-	val, err := ino.Marshal()
-	if err != nil {
-		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
-		return
-	}
-	resp, err := mp.submit(opFSMClearInodeCache, val)
-	if err != nil {
-		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
-		return
-	}
-	p.PacketErrorWithBody(resp.(uint8), nil)
 	return
 }
 
@@ -1250,7 +1227,11 @@ func (mp *metaPartition) UpdateExtentKeyAfterMigration(req *proto.UpdateExtentKe
 	if fsmRespStatus != proto.OpOk {
 		err = fmt.Errorf("mp(%v) inode(%v) storageClass(%v), raft resp inner err status(%v)",
 			mp.config.PartitionId, inoParm.Inode, inoParm.StorageClass, proto.GetMsgByCode(fsmRespStatus))
-		log.LogErrorf("action[UpdateExtentKeyAfterMigration] req(%v), err: %v", req, err.Error())
+		if fsmRespStatus == proto.OpNotExistErr {
+			log.LogWarnf("action[UpdateExtentKeyAfterMigration] req(%v), err: %v", req, err.Error())
+		} else {
+			log.LogErrorf("action[UpdateExtentKeyAfterMigration] req(%v), err: %v", req, err.Error())
+		}
 		p.PacketErrorWithBody(fsmRespStatus, []byte(err.Error()))
 		return
 	}
@@ -1308,12 +1289,6 @@ func (mp *metaPartition) InodeGetWithEk(req *InodeGetReq, p *Packet) (err error)
 		log.LogDebugf("[InodeGetWithEk] req ino %v, topLayer ino %v", retMsg.Msg, inode)
 		resp.LayAll = inode.Msg.getAllInodesInfo()
 	}
-	// get cache ek
-	ino.Extents.Range(func(_ int, ek proto.ExtentKey) bool {
-		resp.CacheExtents = append(resp.CacheExtents, ek)
-		log.LogInfof("action[InodeGetWithEk] Cache Extents append ek %v", ek)
-		return true
-	})
 	// get EK
 	if ino.HybridCloudExtents.sortedEks != nil {
 		if proto.IsStorageClassReplica(ino.StorageClass) {

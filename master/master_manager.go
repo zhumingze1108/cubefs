@@ -18,6 +18,7 @@ import (
 	"fmt"
 	syslog "log"
 	"strings"
+	"sync"
 
 	"github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
 	cfsProto "github.com/cubefs/cubefs/proto"
@@ -52,6 +53,8 @@ func (m *Server) handleLeaderChange(leader uint64) {
 	log.LogWarnf("action[handleLeaderChange] current id [%v] new leader addr [%v] leader id [%v]", m.id, m.leaderInfo.addr, leader)
 	m.reverseProxy = m.newReverseProxy()
 
+	m.metaReady = false
+	m.cluster.metaReady = false
 	if m.id == leader {
 		Warn(m.clusterName, fmt.Sprintf("clusterID[%v] current is leader, leader is changed to %v",
 			m.clusterName, m.leaderInfo.addr))
@@ -63,6 +66,7 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		m.cluster.checkMetaNodeHeartbeat()
 		m.cluster.checkLcNodeHeartbeat()
 		m.cluster.lcMgr.startLcScanHandleLeaderChange()
+		m.cluster.flashManMgr.startFlashScanHandleLeaderChange()
 		m.cluster.followerReadManager.reSet()
 	} else {
 		Warn(m.clusterName, fmt.Sprintf("clusterID[%v] leader is changed to %v",
@@ -72,6 +76,10 @@ func (m *Server) handleLeaderChange(leader uint64) {
 			close(m.cluster.lcMgr.exitCh)
 			m.cluster.lcMgr = newLifecycleManager()
 			m.cluster.lcMgr.cluster = m.cluster
+		}
+		if m.cluster.flashManMgr != nil {
+			close(m.cluster.flashManMgr.exitCh)
+			m.cluster.flashManMgr = newFlashManualTaskManager(m.cluster)
 		}
 		m.metaReady = false
 		m.cluster.metaReady = false
@@ -266,6 +274,12 @@ func (m *Server) loadMetadata() {
 	}
 	log.LogInfo("action[loadLcNodes] end")
 
+	log.LogInfo("action[loadFlashManualTasks] begin")
+	if err = m.cluster.loadFlashManualTasks(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadFlashManualTasks] end")
+
 	log.LogInfo("action[loadS3QoSInfo] begin")
 	if err = m.cluster.loadS3ApiQosInfo(); err != nil {
 		panic(err)
@@ -294,6 +308,8 @@ func (m *Server) clearMetadata() {
 	m.cluster.clearMetaNodes()
 	m.cluster.clearLcNodes()
 	m.cluster.clearVols()
+
+	m.cluster.DataNodeToDecommissionRepairDpMap = sync.Map{}
 
 	if m.user != nil {
 		// leader change event may be before m.user initialization

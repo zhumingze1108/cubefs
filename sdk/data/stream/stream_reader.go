@@ -41,7 +41,7 @@ type Streamer struct {
 	inode                uint64
 	parentInode          uint64
 	status               int32
-	refcnt               int
+	refcnt               int32
 	idle                 int // how long there is no new request
 	traversed            int // how many times the streamer is traversed
 	extents              *ExtentCache
@@ -89,7 +89,9 @@ func NewStreamer(client *ExtentClient, inode uint64, openForWrite, isCache bool,
 	s.openForWrite = openForWrite
 	s.isCache = isCache
 	s.fullPath = fullPath
-	log.LogDebugf("NewStreamer: streamer(%v)", s)
+	if log.EnableDebug() {
+		log.LogDebugf("NewStreamer: streamer(%v), reqChSize %d", s, reqChanSize)
+	}
 	if s.openForWrite {
 		err := s.client.forbiddenMigration(s.inode)
 		if err != nil {
@@ -116,8 +118,8 @@ func (s *Streamer) SetFullPath(fullPath string) {
 
 // String returns the string format of the streamer.
 func (s *Streamer) String() string {
-	return fmt.Sprintf("Streamer{ino(%v), fullPath(%v) refcnt(%v), isOpen(%v) openForWrite(%v), inflight(%v), eh(%v) addr(%p)}",
-		s.inode, s.fullPath, s.refcnt, s.isOpen, s.openForWrite, len(s.request), s.handler, s)
+	return fmt.Sprintf("Streamer{ino(%v), fullPath(%v), refcnt(%v), isOpen(%v) openForWrite(%v), inflight(%v), eh(%v) addr(%p)}",
+		s.inode, s.fullPath, atomic.LoadInt32(&s.refcnt), s.isOpen, s.openForWrite, len(s.request), s.handler, s)
 }
 
 // TODO should we call it RefreshExtents instead?
@@ -286,14 +288,20 @@ func (s *Streamer) read(data []byte, offset int, size int, storageClass uint32) 
 					log.LogDebugf("Streamer read from remoteCache, ino(%v) enableRemoteCache(true) storageClass(%v) remoteCacheOnlyForNotSSD(%v)",
 						s.inode, proto.StorageClassString(inodeInfo.StorageClass), s.client.RemoteCache.remoteCacheOnlyForNotSSD)
 					var cacheReadRequests []*CacheReadRequest
-					cacheReadRequests, err = s.prepareCacheRequests(uint64(offset), uint64(size), data)
+					cacheReadRequests, err = s.prepareCacheRequests(uint64(offset), uint64(size), data, inodeInfo.Generation)
 					if err == nil {
 						var read int
+						remoteCacheMetric := exporter.NewCounter("readRemoteCache")
+						remoteCacheMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
 						if read, err = s.readFromRemoteCache(ctx, uint64(offset), uint64(size), cacheReadRequests); err == nil {
+							remoteCacheHitMetric := exporter.NewCounter("readRemoteCacheHit")
+							remoteCacheHitMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
 							return read, err
 						}
 					}
-					log.LogWarnf("Stream read: readFromRemoteCache failed: ino(%v) offset(%v) size(%v), err(%v)", s.inode, offset, size, err)
+					if !proto.IsFlashNodeLimitError(err) {
+						log.LogWarnf("Stream read: readFromRemoteCache failed: ino(%v) offset(%v) size(%v), err(%v)", s.inode, offset, size, err)
+					}
 				} else {
 					log.LogDebugf("Streamer not read from remoteCache, ino(%v) enableRemoteCache(true) storageClass(%v) remoteCacheOnlyForNotSSD(%v)",
 						s.inode, proto.StorageClassString(inodeInfo.StorageClass), s.client.RemoteCache.remoteCacheOnlyForNotSSD)

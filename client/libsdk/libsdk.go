@@ -105,7 +105,6 @@ import (
 	"path"
 	gopath "path"
 	"reflect"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -117,6 +116,7 @@ import (
 	"github.com/bits-and-blooms/bitset"
 	"github.com/cubefs/cubefs/blobstore/api/access"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
+	blog "github.com/cubefs/cubefs/blobstore/util/log"
 	"github.com/cubefs/cubefs/client/blockcache/bcache"
 	"github.com/cubefs/cubefs/client/fs"
 	"github.com/cubefs/cubefs/proto"
@@ -254,13 +254,10 @@ type client struct {
 	ebsEndpoint            string
 	servicePath            string
 	volType                int
-	cacheAction            int
 	ebsBlockSize           int
 	enableBcache           bool
 	readBlockThread        int
 	writeBlockThread       int
-	cacheRuleKey           string
-	cacheThreshold         int
 	enableSummary          bool
 	secretKey              string
 	accessKey              string
@@ -271,7 +268,6 @@ type client struct {
 	enableAudit            bool
 	volStorageClass        uint32
 	volAllowedStorageClass []uint32
-	cacheDpStorageClass    uint32
 	enableInnerReq         bool
 
 	// runtime context
@@ -846,12 +842,6 @@ func cfs_open(id C.int64_t, path *C.char, flags C.int, mode C.mode_t) C.int {
 		info = newInfo
 	}
 	var fileCache bool
-	if c.cacheRuleKey == "" {
-		fileCache = false
-	} else {
-		fileCachePattern := fmt.Sprintf(".*%s.*", c.cacheRuleKey)
-		fileCache, _ = regexp.MatchString(fileCachePattern, absPath)
-	}
 	f := c.allocFD(info.Inode, fuseFlags, fuseMode, fileCache, info.Size, parentIno, absPath, info.StorageClass)
 	if f == nil {
 		return statusEMFILE
@@ -1518,6 +1508,10 @@ func (c *client) absPath(path string) string {
 func (c *client) start() (err error) {
 	masters := strings.Split(c.masterAddr, ",")
 	if c.logDir != "" {
+		_, err = os.Stat(c.logDir)
+		if err != nil {
+			os.MkdirAll(c.logDir, 0o755)
+		}
 		outputFilePath := gopath.Join(c.logDir, "output.log")
 		outputFile, err := os.OpenFile(outputFilePath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o666)
 		sysOutputFile = outputFile
@@ -1573,15 +1567,23 @@ func (c *client) start() (err error) {
 	}
 	var ebsc *blobstore.BlobStoreClient
 	if c.ebsEndpoint != "" {
+		ebsLogLevel := blog.Lfatal
+		var ebsLogger *access.Logger
+
+		if c.logDir != "" {
+			ebsLogLevel = log.GetBlobLogLevel()
+			ebsLogger = &access.Logger{
+				Filename: gopath.Join(c.logDir, "libcfs/ebs.log"),
+			}
+		}
 		if ebsc, err = blobstore.NewEbsClient(access.Config{
 			ConnMode: access.NoLimitConnMode,
 			Consul: access.ConsulConfig{
 				Address: c.ebsEndpoint,
 			},
 			MaxSizePutOnce: MaxSizePutOnce,
-			Logger: &access.Logger{
-				Filename: gopath.Join(c.logDir, "libcfs/ebs.log"),
-			},
+			Logger:         ebsLogger,
+			LogLevel:       ebsLogLevel,
 		}); err != nil {
 			return
 		}
@@ -1613,7 +1615,6 @@ func (c *client) start() (err error) {
 		DisableMetaCache:            true,
 		VolStorageClass:             c.volStorageClass,
 		VolAllowedStorageClass:      c.volAllowedStorageClass,
-		VolCacheDpStorageClass:      c.cacheDpStorageClass,
 		OnRenewalForbiddenMigration: mw.RenewalForbiddenMigration,
 		OnForbiddenMigration:        mw.ForbiddenMigration,
 		MetaWrapper:                 mw,
@@ -1687,10 +1688,8 @@ func (c *client) allocFD(ino uint64, flags, mode uint32, fileCache bool, fileSiz
 			EnableBcache:    c.enableBcache,
 			WConcurrency:    c.writeBlockThread,
 			ReadConcurrency: c.readBlockThread,
-			CacheAction:     c.cacheAction,
 			FileCache:       fileCache,
 			FileSize:        fileSize,
-			CacheThreshold:  c.cacheThreshold,
 			StorageClass:    storageClass,
 		}
 		f.fileWriter.FreeCache()
@@ -1885,12 +1884,8 @@ func (c *client) loadConfFromMaster(masters []string) (err error) {
 	}
 	c.volType = volumeInfo.VolType
 	c.ebsBlockSize = volumeInfo.ObjBlockSize
-	c.cacheAction = volumeInfo.CacheAction
-	c.cacheRuleKey = volumeInfo.CacheRule
-	c.cacheThreshold = volumeInfo.CacheThreshold
 	c.volStorageClass = volumeInfo.VolStorageClass
 	c.volAllowedStorageClass = volumeInfo.AllowedStorageClass
-	c.cacheDpStorageClass = volumeInfo.CacheDpStorageClass
 
 	var clusterInfo *proto.ClusterInfo
 	clusterInfo, err = mc.AdminAPI().GetClusterInfo()

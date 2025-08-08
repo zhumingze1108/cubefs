@@ -141,10 +141,8 @@ type Volume struct {
 	ticker     *time.Ticker
 	createTime int64
 
-	volType        int
-	ebsBlockSize   int
-	cacheAction    int
-	cacheThreshold int
+	volType      int
+	ebsBlockSize int
 
 	closeOnce sync.Once
 	closeCh   chan struct{}
@@ -3079,7 +3077,6 @@ func NewVolume(config *VolumeConfig) (*Volume, error) {
 		OnRenewalForbiddenMigration: metaWrapper.RenewalForbiddenMigration,
 		VolStorageClass:             volumeInfo.VolStorageClass,
 		VolAllowedStorageClass:      volumeInfo.AllowedStorageClass,
-		VolCacheDpStorageClass:      volumeInfo.CacheDpStorageClass,
 		OnForbiddenMigration:        metaWrapper.ForbiddenMigration,
 		MetaWrapper:                 metaWrapper,
 	}
@@ -3100,18 +3097,16 @@ func NewVolume(config *VolumeConfig) (*Volume, error) {
 	}
 
 	v := &Volume{
-		mw:             metaWrapper,
-		ec:             extentClient,
-		mc:             mc,
-		name:           config.Volume,
-		owner:          volumeInfo.Owner,
-		store:          config.Store,
-		createTime:     metaWrapper.VolCreateTime(),
-		volType:        volumeInfo.VolType,
-		ebsBlockSize:   volumeInfo.ObjBlockSize,
-		cacheAction:    volumeInfo.CacheAction,
-		cacheThreshold: volumeInfo.CacheThreshold,
-		closeCh:        make(chan struct{}),
+		mw:           metaWrapper,
+		ec:           extentClient,
+		mc:           mc,
+		name:         config.Volume,
+		owner:        volumeInfo.Owner,
+		store:        config.Store,
+		createTime:   metaWrapper.VolCreateTime(),
+		volType:      volumeInfo.VolType,
+		ebsBlockSize: volumeInfo.ObjBlockSize,
+		closeCh:      make(chan struct{}),
 		onAsyncTaskError: func(err error) {
 			if err == syscall.ENOENT {
 				config.OnAsyncTaskError.OnError(proto.ErrVolNotExists)
@@ -3145,10 +3140,8 @@ func (v *Volume) getEbsWriter(ino uint64, storageClass uint32) (writer *blobstor
 		EnableBcache:    enableBlockcache,
 		WConcurrency:    writeThreads,
 		ReadConcurrency: readThreads,
-		CacheAction:     v.cacheAction,
 		FileCache:       false,
 		FileSize:        0,
-		CacheThreshold:  v.cacheThreshold,
 		StorageClass:    storageClass,
 	}
 
@@ -3170,10 +3163,8 @@ func (v *Volume) getEbsReader(ino uint64, storageClass uint32) (reader *blobstor
 		EnableBcache:    enableBlockcache,
 		WConcurrency:    writeThreads,
 		ReadConcurrency: readThreads,
-		CacheAction:     v.cacheAction,
 		FileCache:       false,
 		FileSize:        0,
-		CacheThreshold:  v.cacheThreshold,
 		StorageClass:    storageClass,
 	}
 

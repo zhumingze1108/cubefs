@@ -215,7 +215,7 @@ func newCmdFlashGroupNodeAdd(client *master.MasterClient) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&optAddr, CliFlagAddress, "", "add flash node of given addr")
-	cmd.Flags().StringVar(&optZoneName, CliFlagZoneName, "", "add flash node from given zone")
+	cmd.Flags().StringVar(&optZoneName, CliFlagFlashZoneName, "", "add flash node from given zone")
 	cmd.Flags().IntVar(&optCount, CliFlagCount, 0, "add given count flash node from zone")
 	return cmd
 }
@@ -262,7 +262,7 @@ func newCmdFlashGroupNodeRemove(client *master.MasterClient) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&optAddr, CliFlagAddress, "", "remove flash node of given addr")
-	cmd.Flags().StringVar(&optZoneName, CliFlagZoneName, "", "remove flash node from given zone")
+	cmd.Flags().StringVar(&optZoneName, CliFlagFlashZoneName, "", "remove flash node from given zone")
 	cmd.Flags().IntVar(&optCount, CliFlagCount, 0, "remove given count flash node from zone")
 	cmd.Flags().BoolVarP(&optYes, "yes", "y", false, "Answer yes for all questions")
 	return cmd
@@ -297,7 +297,7 @@ func newCmdFlashGroupGet(client *master.MasterClient) *cobra.Command {
 				tbl = table{formatFlashNodeSimpleViewTableTitle}
 			}
 			for _, flashNodeViewInfos := range fgView.ZoneFlashNodes {
-				tbl = showFlashNodesView(flashNodeViewInfos, showHitRate, tbl)
+				tbl = showFlashNodesView(flashNodeViewInfos, showHitRate, nil, tbl)
 			}
 			stdoutln(alignTable(tbl...))
 			return
@@ -435,7 +435,7 @@ func newCmdFlashGroupSearch(client *master.MasterClient) *cobra.Command {
 					stdoutlnf("Found in FlashGroup:%d", whichGroup)
 					tbl := table{formatFlashNodeSimpleViewTableTitle}
 					for _, fnNodes := range fg.ZoneFlashNodes {
-						tbl = showFlashNodesView(fnNodes, false, tbl)
+						tbl = showFlashNodesView(fnNodes, false, nil, tbl)
 					}
 					stdoutln(alignTable(tbl...))
 					return
@@ -460,10 +460,12 @@ func newCmdFlashGroupGraph(client *master.MasterClient) *cobra.Command {
 			set := make(map[uint32]struct{})
 			groups := make(map[uint64]proto.FlashGroupAdminView)
 			groupn := make(map[uint64]int)
+			groupStatusMap := make(map[uint64]string)
 			slots := make([]slotInfo, 0)
 			for _, fg := range fgView.FlashGroups {
 				groups[fg.ID] = fg
 				groupn[fg.ID] = 0
+				groupStatusMap[fg.ID] = fg.Status.String()
 				for _, slot := range fg.Slots {
 					if _, in := set[slot]; in {
 						continue
@@ -478,7 +480,6 @@ func newCmdFlashGroupGraph(client *master.MasterClient) *cobra.Command {
 			sort.Slice(slots, func(i, j int) bool {
 				return slots[i].slot < slots[j].slot
 			})
-
 			stdoutln("[Flash Groups]")
 			tbl := table{arow("Slot", "ID", "Status", "Count", "Ref", "Proportion")}
 			for idx, slot := range slots {
@@ -493,7 +494,7 @@ func newCmdFlashGroupGraph(client *master.MasterClient) *cobra.Command {
 			}
 			stdoutln(alignTable(tbl...))
 
-			fnView, err := client.NodeAPI().ListFlashNodes(true)
+			fnView, err := client.NodeAPI().ListFlashNodes(-1)
 			if err != nil {
 				return
 			}
@@ -508,11 +509,15 @@ func newCmdFlashGroupGraph(client *master.MasterClient) *cobra.Command {
 					}
 				}
 			}
+			graphFlashNodeTitle := make([]interface{}, len(formatFlashNodeViewTableTitle)+1)
+			copy(graphFlashNodeTitle, formatFlashNodeViewTableTitle[:6])
+			graphFlashNodeTitle[6] = "GroupStatus"
+			copy(graphFlashNodeTitle[7:], formatFlashNodeViewTableTitle[6:])
 			stdoutln("[FlashNodes Busy]")
-			tbl = showFlashNodesView(busyNodes, true, table{formatFlashNodeViewTableTitle})
+			tbl = showFlashNodesView(busyNodes, true, groupStatusMap, table{graphFlashNodeTitle})
 			stdoutln(alignTable(tbl...))
 			stdoutln("[FlashNodes Idle]")
-			tbl = showFlashNodesView(idleNodes, true, table{formatFlashNodeViewTableTitle})
+			tbl = showFlashNodesView(idleNodes, true, nil, table{formatFlashNodeViewTableTitle})
 			stdoutln(alignTable(tbl...))
 			return
 		},

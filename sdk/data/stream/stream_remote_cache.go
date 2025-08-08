@@ -28,9 +28,21 @@ import (
 const SIZE_GB = 1024 * 1024 * 1024
 
 type PrepareRemoteCacheRequest struct {
-	ctx   context.Context
-	inode uint64
-	ek    *proto.ExtentKey
+	ctx    context.Context
+	inode  uint64
+	ek     *proto.ExtentKey
+	warmUp bool
+	gen    uint64
+}
+
+func NewPrepareRemoteCacheRequest(inode uint64, ek *proto.ExtentKey, warmUp bool, gen uint64) *PrepareRemoteCacheRequest {
+	return &PrepareRemoteCacheRequest{
+		ctx:    context.Background(),
+		inode:  inode,
+		ek:     ek,
+		warmUp: warmUp,
+		gen:    gen,
+	}
 }
 
 func (pr *PrepareRemoteCacheRequest) String() string {
@@ -61,20 +73,21 @@ func (s *Streamer) sendToPrepareRomoteCacheChan(req *PrepareRemoteCacheRequest) 
 	}
 }
 
-func (s *Streamer) prepareRemoteCache(ctx context.Context, ek *proto.ExtentKey) {
-	cReadRequests, err := s.prepareCacheRequests(ek.FileOffset, uint64(ek.Size), nil)
+func (s *Streamer) prepareRemoteCache(ctx context.Context, ek *proto.ExtentKey, gen uint64) {
+	cReadRequests, err := s.prepareCacheRequests(ek.FileOffset, uint64(ek.Size), nil, gen)
 	if err != nil {
 		log.LogWarnf("Streamer prepareRemoteCache: prepareCacheRequests failed. start(%v), size(%v), err(%v)", ek.FileOffset, ek.Size, err)
 		return
 	}
 
 	for _, req := range cReadRequests {
-		fg := s.getFlashGroup(req.CacheRequest.FixedFileOffset)
+		slot, fg, ownerSlot := s.getFlashGroup(req.CacheRequest.FixedFileOffset)
 		if fg == nil {
 			err = fmt.Errorf("cannot find any flashGroups")
 			log.LogWarnf("Streamer prepareRemoteCache failed: %v", err)
 			break
 		}
+		req.CacheRequest.Slot = uint64(slot)<<32 | uint64(ownerSlot)
 		prepareReq := &proto.CachePrepareRequest{
 			CacheRequest: req.CacheRequest,
 			FlashNodes:   fg.Hosts,
@@ -88,11 +101,6 @@ func (s *Streamer) prepareRemoteCache(ctx context.Context, ek *proto.ExtentKey) 
 }
 
 func (s *Streamer) readFromRemoteCache(ctx context.Context, offset, size uint64, cReadRequests []*CacheReadRequest) (total int, err error) {
-	bgTime := stat.BeginStat()
-	defer func() {
-		stat.EndStat("readFromRemoteCache", err, bgTime, 1)
-	}()
-
 	metric := exporter.NewTPCnt("readFromRemoteCache")
 	metricBytes := exporter.NewCounter("readFromRemoteCacheBytes")
 	defer func() {
@@ -106,16 +114,20 @@ func (s *Streamer) readFromRemoteCache(ctx context.Context, offset, size uint64,
 			total += int(req.Size_)
 			continue
 		}
-		fg := s.getFlashGroup(req.CacheRequest.FixedFileOffset)
+		slot, fg, ownerSlot := s.getFlashGroup(req.CacheRequest.FixedFileOffset)
 		if fg == nil {
 			err = fmt.Errorf("readFromRemoteCache failed: cannot find any flashGroups")
 			return
 		}
-
+		req.CacheRequest.Slot = uint64(slot)<<32 | uint64(ownerSlot)
 		if read, err = s.client.RemoteCache.Read(ctx, fg, s.inode, req); err != nil {
-			log.LogWarnf("readFromRemoteCache: flashGroup read failed. offset(%v) size(%v) fg(%v) req(%v) err(%v)", offset, size, fg, req, err)
+			if !proto.IsFlashNodeLimitError(err) {
+				log.LogWarnf("readFromRemoteCache: flashGroup read failed. offset(%v) size(%v) fg(%v) req(%v) err(%v)", offset, size, fg, req, err)
+			}
 			return
 		} else {
+			log.LogDebugf("readFromRemoteCache: inode(%d) cacheReadRequest version %v, source %v",
+				s.inode, req.CacheRequest.Version, req.CacheRequest.Sources)
 			total += read
 		}
 	}
@@ -123,9 +135,10 @@ func (s *Streamer) readFromRemoteCache(ctx context.Context, offset, size uint64,
 	return total, nil
 }
 
-func (s *Streamer) getFlashGroup(fixedFileOffset uint64) *FlashGroup {
+func (s *Streamer) getFlashGroup(fixedFileOffset uint64) (uint32, *FlashGroup, uint32) {
 	slot := proto.ComputeCacheBlockSlot(s.client.dataWrapper.VolName, s.inode, fixedFileOffset)
-	return s.client.RemoteCache.GetFlashGroupBySlot(slot)
+	fg, ownerSlot := s.client.RemoteCache.GetFlashGroupBySlot(slot)
+	return slot, fg, ownerSlot
 }
 
 func (s *Streamer) getDataSource(start, size, fixedFileOffset uint64, isRead bool) ([]*proto.DataSource, error) {
@@ -138,12 +151,9 @@ func (s *Streamer) getDataSource(start, size, fixedFileOffset uint64, isRead boo
 			continue
 		}
 		if eReq.ExtentKey.PartitionId == 0 {
-			if eReq.ExtentKey.FileOffset+uint64(eReq.ExtentKey.Size) > start && eReq.ExtentKey.FileOffset < start+size {
-				err := fmt.Errorf("temporary ek, isRead[%v] start(%v) size(%v) eReq(%v) fixedOff(%v)", isRead, start, size, eReq, fixedFileOffset)
-				log.LogErrorf("getDataSource failed: err(%v)", err)
-				return nil, err
-			}
-			continue
+			err := fmt.Errorf("temporary ek(%v), isRead[%v] start(%v) size(%v) eReq(%v) fixedOff(%v)", eReq.ExtentKey, isRead, start, size, eReq, fixedFileOffset)
+			log.LogWarnf("getDataSource failed: err(%v)", err)
+			return nil, err
 		}
 
 		dp, ok := s.client.dataWrapper.TryGetPartition(eReq.ExtentKey.PartitionId)
@@ -163,13 +173,15 @@ func (s *Streamer) getDataSource(start, size, fixedFileOffset uint64, isRead boo
 			Hosts:        sortedHosts,
 		}
 		sources = append(sources, source)
-		log.LogDebugf("getDataSource: append  source inode %v PartitionID %v ExtentID %v FileOffset %v ExtentOffset %v",
-			s.inode, source.PartitionID, source.ExtentID, source.FileOffset, source.ExtentOffset)
+		log.LogDebugf("getDataSource: append  source inode %v PartitionID %v ExtentID %v FileOffset %v "+
+			"ExtentOffset %v fixedFileOffset %v size %v",
+			s.inode, source.PartitionID, source.ExtentID, source.FileOffset, source.ExtentOffset, fixedFileOffset,
+			source.Size_)
 	}
 	return sources, nil
 }
 
-func (s *Streamer) prepareCacheRequests(offset, size uint64, data []byte) ([]*CacheReadRequest, error) {
+func (s *Streamer) prepareCacheRequests(offset, size uint64, data []byte, gen uint64) ([]*CacheReadRequest, error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("prepareCacheRequests", nil, bgTime, 1)
@@ -186,13 +198,6 @@ func (s *Streamer) prepareCacheRequests(offset, size uint64, data []byte) ([]*Ca
 			log.LogWarnf("Streamer prepareCacheRequests: getDataSource failed. fixedOff(%v) err(%v)", fixedOff, err)
 			return nil, err
 		}
-		info, err := s.client.getInodeInfo(s.inode)
-		if err != nil {
-			log.LogWarnf("Streamer prepareCacheRequests: getInodeInfo failed. fixedOff(%v) err(%v)", fixedOff, err)
-			return nil, err
-		}
-		gen := info.Generation
-
 		cReq := &proto.CacheRequest{
 			Volume:          s.client.dataWrapper.VolName,
 			Inode:           s.inode,
@@ -216,6 +221,7 @@ func (s *Streamer) prepareCacheRequests(offset, size uint64, data []byte) ([]*Ca
 			cReadRequests = append(cReadRequests, cReadRequest)
 		}
 	}
+	log.LogDebugf("prepareCacheRequests: inode %v extent[offset=%v,size=%v] cReadRequests %v ", s.inode, offset, size, cReadRequests)
 	return cReadRequests, nil
 }
 

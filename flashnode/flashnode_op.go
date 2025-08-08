@@ -20,11 +20,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/cubefs/cubefs/flashnode/cachengine"
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/data/stream"
+	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/exporter"
@@ -44,16 +47,6 @@ func (f *FlashNode) preHandle(conn net.Conn, p *proto.Packet) error {
 }
 
 func (f *FlashNode) handlePacket(conn net.Conn, p *proto.Packet) (err error) {
-	start := time.Now()
-	defer func() {
-		logContent := fmt.Sprintf("client:%v  req:[%v](%v) cost %v ", conn.RemoteAddr().String(), p.GetOpMsg(),
-			p.GetReqID(), time.Since(start).String())
-		if err != nil {
-			log.LogErrorf("handlePacket: %v  error:%v", logContent, err.Error())
-		} else {
-			log.LogDebugf("handlePacket: %v", logContent)
-		}
-	}()
 	switch p.Opcode {
 	case proto.OpFlashNodeHeartbeat:
 		err = f.opFlashNodeHeartbeat(conn, p)
@@ -61,6 +54,14 @@ func (f *FlashNode) handlePacket(conn net.Conn, p *proto.Packet) (err error) {
 		err = f.opCachePrepare(conn, p)
 	case proto.OpFlashNodeCacheRead:
 		err = f.opCacheRead(conn, p)
+	case proto.OpFlashNodeSetReadIOLimits:
+		err = f.opSetReadIOLimits(conn, p)
+	case proto.OpFlashNodeSetWriteIOLimits:
+		err = f.opSetWriteIOLimits(conn, p)
+	case proto.OpFlashNodeScan:
+		err = f.opFlashNodeScan(conn, p)
+	case proto.OpFlashNodeTaskCommand:
+		err = f.opFlashNodeTaskCommand(conn, p)
 	default:
 		err = fmt.Errorf("unknown Opcode:%d", p.Opcode)
 	}
@@ -70,31 +71,36 @@ func (f *FlashNode) handlePacket(conn net.Conn, p *proto.Packet) (err error) {
 
 func (f *FlashNode) SetTimeout(handleReadTimeout int, readDataNodeTimeout int) {
 	if f.handleReadTimeout != handleReadTimeout && handleReadTimeout > 0 {
-		log.LogInfof("FlashNode set handleReadTimeout from %d to %d", f.handleReadTimeout, handleReadTimeout)
+		log.LogInfof("FlashNode set handleReadTimeout from %d(ms) to %d(ms)", f.handleReadTimeout, handleReadTimeout)
 		f.handleReadTimeout = handleReadTimeout
+		f.limitWrite.ResetIOEx(f.diskWriteIocc*len(f.disks), f.diskWriteIoFactorFlow, f.handleReadTimeout)
+		f.limitWrite.ResetFlow(f.diskWriteFlow)
 	}
 	f.cacheEngine.SetReadDataNodeTimeout(readDataNodeTimeout)
 }
 
 func (f *FlashNode) opFlashNodeHeartbeat(conn net.Conn, p *proto.Packet) (err error) {
 	data := p.Data
+	go responseAckOKToMaster(conn, p)
 	req := &proto.HeartBeatRequest{}
+	resp := &proto.FlashNodeHeartbeatResponse{}
 	adminTask := &proto.AdminTask{
 		Request: req,
 	}
-
 	decode := json.NewDecoder(bytes.NewBuffer(data))
 	decode.UseNumber()
 	if err = decode.Decode(adminTask); err == nil {
 		f.SetTimeout(req.FlashNodeHandleReadTimeout, req.FlashNodeReadDataNodeTimeout)
 	} else {
-		log.LogErrorf("decode HeartBeatRequest error: %s", err.Error())
+		log.LogWarnf("decode HeartBeatRequest error: %s", err.Error())
+		resp.Status = proto.TaskFailed
+		resp.Result = fmt.Sprintf("flashnode(%v) heartbeat decode err(%v)", f.localAddr, err.Error())
+		goto end
 	}
 
-	resp := &proto.FlashNodeHeartbeatResponse{}
 	resp.Stat = make([]*proto.FlashNodeDiskCacheStat, 0)
 	for _, cacheStat := range f.cacheEngine.GetHeartBeatCacheStat() {
-		stat := &proto.FlashNodeDiskCacheStat{
+		cacheStat := &proto.FlashNodeDiskCacheStat{
 			DataPath:  cacheStat.DataPath,
 			Medium:    cacheStat.Medium,
 			Total:     cacheStat.Total,
@@ -107,38 +113,45 @@ func (f *FlashNode) opFlashNodeHeartbeat(conn net.Conn, p *proto.Packet) (err er
 			KeyNum:    cacheStat.Num,
 			Status:    cacheStat.Status,
 		}
-		resp.Stat = append(resp.Stat, stat)
+		resp.Stat = append(resp.Stat, cacheStat)
 	}
+	resp.LimiterStatus = &proto.FlashNodeLimiterStatusInfo{
+		WriteStatus: proto.FlashNodeLimiterStatus{Status: f.limitWrite.Status(true), DiskNum: len(f.disks), ReadTimeout: f.handleReadTimeout},
+		ReadStatus:  proto.FlashNodeLimiterStatus{Status: f.limitRead.Status(true), DiskNum: len(f.disks), ReadTimeout: f.handleReadTimeout},
+	}
+	resp.FlashNodeTaskCountLimit = f.taskCountLimit
+	resp.ManualScanningTasks = make(map[string]*proto.FlashNodeManualTaskResponse)
 
-	reply, err := json.Marshal(resp)
-	if err != nil {
-		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
-		return
+	f.manualScanners.Range(func(_, mScanner interface{}) bool {
+		scanner := mScanner.(*ManualScanner)
+		result := scanner.copyResponse()
+		resp.ManualScanningTasks[scanner.ID] = result
+		return true
+	})
+	resp.Status = proto.TaskSucceeds
+end:
+	adminTask.Response = resp
+	f.respondToMaster(adminTask)
+	if log.EnableInfo() {
+		log.LogInfof("[opMasterHeartbeat] master:%s handleReadTimeout %v(ms) readDataNodeTimeout %v(ms)",
+			conn.RemoteAddr().String(), req.FlashNodeHandleReadTimeout, req.FlashNodeReadDataNodeTimeout)
 	}
-	p.PacketOkWithBody(reply)
-
-	if err = p.WriteToConn(conn); err != nil {
-		log.LogErrorf("ack master response: %s", err.Error())
-		return err
-	}
-	log.LogInfof("[opMasterHeartbeat] master:%s handleReadTimeout(%v) readDataNodeTimeout(%v)",
-		conn.RemoteAddr().String(), req.FlashNodeHandleReadTimeout, req.FlashNodeReadDataNodeTimeout)
 	return
 }
 
 func (f *FlashNode) opCacheRead(conn net.Conn, p *proto.Packet) (err error) {
 	var volume string
 	bgTime := stat.BeginStat()
-	metricOpCacheRead := exporter.NewTPCnt("opCacheRead")
 	defer func() {
-		metricOpCacheRead.SetWithLabels(err, map[string]string{exporter.Vol: volume})
 		stat.EndStat("FlashNode:opCacheRead", err, bgTime, 1)
 	}()
 
 	defer func() {
 		if err != nil {
-			log.LogErrorf("action[opCacheRead] volume:[%s], logMsg:%s", volume,
-				p.LogMessage(p.GetOpMsg(), conn.RemoteAddr().String(), p.StartT, err))
+			if !proto.IsFlashNodeLimitError(err) {
+				log.LogWarnf("action[opCacheRead] volume:[%s], logMsg:%s", volume,
+					p.LogMessage(p.GetOpMsg(), conn.RemoteAddr().String(), p.StartT, err))
+			}
 			p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
 			if e := p.WriteToConn(conn); e != nil {
 				log.LogErrorf("action[opCacheRead] write to conn %v", e)
@@ -146,7 +159,7 @@ func (f *FlashNode) opCacheRead(conn net.Conn, p *proto.Packet) (err error) {
 		}
 	}()
 
-	ctx, ctxCancel := context.WithTimeout(context.Background(), time.Duration(f.handleReadTimeout)*time.Second)
+	ctx, ctxCancel := context.WithTimeout(context.Background(), time.Duration(f.handleReadTimeout)*time.Millisecond)
 	defer ctxCancel()
 
 	req := new(proto.CacheReadRequest)
@@ -157,77 +170,242 @@ func (f *FlashNode) opCacheRead(conn net.Conn, p *proto.Packet) (err error) {
 		err = fmt.Errorf("no cache read request")
 		return
 	}
-	volume = req.CacheRequest.Volume
 
+	volume = req.CacheRequest.Volume
 	cr := req.CacheRequest
+
+	f.updateSlotStat(cr.Slot)
+
 	block, err := f.cacheEngine.GetCacheBlockForRead(volume, cr.Inode, cr.FixedFileOffset, cr.Version, req.Size_)
 	if err != nil {
-		log.LogInfof("opCacheRead: GetCacheBlockForRead failed, req(%v) err(%v)", req, err)
 		hitRateMap := f.cacheEngine.GetHitRate()
 		for dataPath, hitRate := range hitRateMap {
 			if hitRate < f.lowerHitRate {
-				log.LogWarnf("opCacheRead: flashnode %v dataPath(%v) is lower hitrate %v", f.localAddr, dataPath, hitRate)
+				log.LogDebugf("opCacheRead: flashnode %v dataPath(%v) is lower hitrate %v", f.localAddr, dataPath, hitRate)
 				errMetric := exporter.NewCounter("lowerHitRate")
 				errMetric.AddWithLabels(1, map[string]string{exporter.FlashNode: f.localAddr, exporter.Disk: dataPath, exporter.Err: "LowerHitRate"})
 			}
 		}
 		bgTime2 := stat.BeginStat()
-		missCacheMetric := exporter.NewTPCnt("MissCacheRead")
-		if writable := f.limitWrite.TryRun(int(req.Size_), func() {
-			if block2, err := f.cacheEngine.CreateBlock(cr, conn.RemoteAddr().String(), false); err != nil {
-				log.LogWarnf("opCacheRead: CreateBlock failed, req(%v) err(%v)", req, err)
+		missTaskDone := make(chan struct{})
+		// try to cache more miss data, but reply to client more quickly
+		reqSize := 0
+		for _, source := range req.CacheRequest.Sources {
+			reqSize += int(source.Size_)
+		}
+		if err = f.limitWrite.TryRunAsync(ctx, reqSize, f.waitForCacheBlock, func() {
+			if block2, err2 := f.cacheEngine.CreateBlock(cr, conn.RemoteAddr().String(), false); err2 != nil {
+				log.LogWarnf("opCacheRead: CreateBlock failed, req(%v) err(%v)", req, err2)
+				close(missTaskDone)
 				return
 			} else {
-				block2.InitOnceForCacheRead(f.cacheEngine, cr.Sources)
+				block2.InitOnceForCacheRead(f.cacheEngine, cr.Sources, missTaskDone)
 			}
-		}); !writable {
-			err = fmt.Errorf("create block cache limited")
-			stat.EndStat("MissCacheRead", err, bgTime2, 1)
-			missCacheMetric.SetWithLabels(err, map[string]string{exporter.Vol: volume})
+		}); err != nil {
+			stat.EndStat("MissCacheReadLimit", err, bgTime2, 1)
 			return
+		}
+		if !f.waitForCacheBlock {
+			stat.EndStat("MissCacheRead:Data is caching", nil, bgTime2, 1)
+			return fmt.Errorf("require data is caching")
 		}
 		select {
 		case <-ctx.Done():
-			stat.EndStat("MissCacheRead", ctx.Err(), bgTime2, 1)
-			missCacheMetric.SetWithLabels(err, map[string]string{exporter.Vol: volume})
+			stat.EndStat("MissCacheReadCancel", ctx.Err(), bgTime2, 1)
 			return ctx.Err()
-		default:
+		case <-missTaskDone:
 			block, err = f.cacheEngine.GetCacheBlockForRead(volume, cr.Inode, cr.FixedFileOffset, cr.Version, req.Size_)
 		}
 		stat.EndStat("MissCacheRead", err, bgTime2, 1)
-		missCacheMetric.SetWithLabels(err, map[string]string{exporter.Vol: volume})
 		if err != nil {
 			return err
 		}
 	}
-	bgTime = stat.BeginStat()
-	hitCacheMetric := exporter.NewTPCnt("HitCacheRead")
+
+	bgTime2 := stat.BeginStat()
+	// reply to client as quick as possible if hit cache
 	err2 := f.limitRead.RunNoWait(int(req.Size_), false, func() {
 		err = f.doStreamReadRequest(ctx, conn, req, p, block)
 	})
 	if err2 != nil {
 		err = err2
-		stat.EndStat("HitCacheRead", err, bgTime, 1)
-		hitCacheMetric.SetWithLabels(err, map[string]string{exporter.Vol: volume})
+		stat.EndStat("HitCacheRead", err, bgTime2, 1)
 		return
 	}
-	stat.EndStat("HitCacheRead", err, bgTime, 1)
-	hitCacheMetric.SetWithLabels(err, map[string]string{exporter.Vol: volume})
+	stat.EndStat("HitCacheRead", err, bgTime2, 1)
 	return
 }
 
-func (f *FlashNode) doStreamReadRequest(ctx context.Context, conn net.Conn, req *proto.CacheReadRequest, p *proto.Packet, block *cachengine.CacheBlock) (err error) {
+func (f *FlashNode) opFlashNodeScan(conn net.Conn, p *proto.Packet) (err error) {
+	data := p.Data
+	responseAckOKToMaster(conn, p)
+	var (
+		req  = &proto.FlashNodeManualTaskRequest{}
+		resp = &proto.FlashNodeManualTaskResponse{
+			FlashNode: f.localAddr,
+		}
+		adminTask = &proto.AdminTask{
+			Request: req,
+		}
+	)
+	decoder := json.NewDecoder(bytes.NewBuffer(data))
+	decoder.UseNumber()
+	if err = decoder.Decode(adminTask); err != nil {
+		resp.Status = proto.TaskFailed
+		resp.Done = true
+		resp.StartErr = err.Error()
+		adminTask.Response = resp
+		f.respondToMaster(adminTask)
+		return
+	}
+	err = f.startTaskScan(adminTask)
+	f.respondToMaster(adminTask)
+
+	return
+}
+
+func (f *FlashNode) opFlashNodeTaskCommand(conn net.Conn, p *proto.Packet) error {
+	data := p.Data
+	var err error
+	defer func() {
+		if err != nil {
+			p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
+		} else {
+			p.PacketOkReply()
+		}
+		if e := p.WriteToConn(conn); e != nil {
+			log.LogErrorf("action[opFlashNodeTaskCommand] write to conn %v", e)
+		}
+	}()
+	req := &proto.FlashNodeManualTaskCommand{}
+	adminTask := &proto.AdminTask{
+		Request: req,
+	}
+	decode := json.NewDecoder(bytes.NewBuffer(data))
+	decode.UseNumber()
+	if err = decode.Decode(adminTask); err != nil {
+		log.LogErrorf("decode FlashNodeManualTaskCommand error: %s", err.Error())
+		return err
+	}
+	mScanner, ok := f.manualScanners.Load(req.ID)
+	if !ok {
+		err = fmt.Errorf("task id(%v) not exist", req.ID)
+		return err
+	}
+	scanner := mScanner.(*ManualScanner)
+	scanner.processCommand(req.Command)
+	return nil
+}
+
+func (f *FlashNode) startTaskScan(adminTask *proto.AdminTask) (err error) {
+	request := adminTask.Request.(*proto.FlashNodeManualTaskRequest)
+	log.LogInfof("startTaskScan: scan task(%v) received!", request.Task)
+	resp := &proto.FlashNodeManualTaskResponse{}
+	adminTask.Response = resp
+
+	if _, ok := f.manualScanners.Load(request.Task.Id); ok {
+		log.LogInfof("startManualScan: scan task(%v) is already running!", request.Task)
+		return
+	}
+	var (
+		metaWrapper  *meta.MetaWrapper
+		extentClient *stream.ExtentClient
+	)
+	metaWrapper, extentClient, err = f.getValidViewInfo(request)
+	if err != nil {
+		resp.ID = request.Task.Id
+		resp.Volume = request.Task.VolName
+		resp.Status = proto.TaskFailed
+		resp.Done = true
+		resp.StartErr = err.Error()
+		return
+	}
+	f.scannerMutex.Lock()
+	if _, ok := f.manualScanners.Load(request.Task.Id); ok {
+		log.LogInfof("startManualScan: scan task(%v) is already running!", request.Task)
+		f.scannerMutex.Unlock()
+		return
+	}
+	scanner := NewManualScanner(adminTask, f, metaWrapper, extentClient)
+	f.manualScanners.Store(scanner.ID, scanner)
+	f.scannerMutex.Unlock()
+
+	resp.Status = proto.TaskStart
+	if err = scanner.Start(); err != nil {
+		log.LogErrorf("start scanner[%v] failed err: %v", scanner.ID, err)
+		return
+	}
+	return
+}
+
+func (f *FlashNode) getValidViewInfo(req *proto.FlashNodeManualTaskRequest) (metaWrapper *meta.MetaWrapper, extentClient *stream.ExtentClient, err error) {
+	task := req.Task
+	var volumeInfo *proto.SimpleVolView
+	volumeInfo, err = f.mc.AdminAPI().GetVolumeSimpleInfo(task.VolName)
+	if err != nil {
+		log.LogErrorf("NewVolume: get volume info from master failed: volume(%v) err(%v)", task.VolName, err)
+		return
+	}
+	if volumeInfo.Status == 1 {
+		log.LogWarnf("NewVolume: volume has been marked for deletion: volume(%v) status(%v - 0:normal/1:markDelete)",
+			task.VolName, volumeInfo.Status)
+		err = proto.ErrVolNotExists
+		return
+	}
+	metaConfig := &meta.MetaConfig{
+		Volume:          task.VolName,
+		Masters:         f.masters,
+		Authenticate:    false,
+		ValidateOwner:   false,
+		InnerReq:        true,
+		MetaSendTimeout: 600,
+	}
+	if metaWrapper, err = meta.NewMetaWrapper(metaConfig); err != nil {
+		log.LogErrorf("NewMetaWrapper err: %v", err)
+		return
+	}
+
+	if task.Action == proto.FlashManualWarmupAction {
+		extentConfig := &stream.ExtentConfig{
+			Volume:                      task.VolName,
+			Masters:                     f.masters,
+			FollowerRead:                false,
+			OnGetExtents:                metaWrapper.GetExtents,
+			OnRenewalForbiddenMigration: metaWrapper.RenewalForbiddenMigration,
+			VolStorageClass:             volumeInfo.VolStorageClass,
+			VolAllowedStorageClass:      volumeInfo.AllowedStorageClass,
+			OnForbiddenMigration:        metaWrapper.ForbiddenMigration,
+			MetaWrapper:                 metaWrapper,
+			NeedRemoteCache:             true,
+		}
+		log.LogInfof("[NewS3Scanner] extentConfig: vol(%v) volStorageClass(%v) allowedStorageClass(%v), followerRead(%v)",
+			extentConfig.Volume, extentConfig.VolStorageClass, extentConfig.VolAllowedStorageClass, extentConfig.FollowerRead)
+		if extentClient, err = stream.NewExtentClient(extentConfig); err != nil {
+			log.LogErrorf("NewExtentClient err: %v", err)
+			return
+		}
+	}
+	return
+}
+
+func (f *FlashNode) doStreamReadRequest(ctx context.Context, conn net.Conn, req *proto.CacheReadRequest, p *proto.Packet,
+	block *cachengine.CacheBlock,
+) (err error) {
 	const action = "action[doStreamReadRequest]"
 	needReplySize := uint32(req.Size_)
 	offset := int64(req.Offset)
 	defer func() {
 		if err != nil {
-			log.LogWarnf("%s cache block(%v) err:%v", action, block.String(), err)
+			// too many caching logs
+			if strings.Compare(err.Error(), "require data is caching") != 0 {
+				log.LogWarnf("%s cache block(%v) err:%v", action, block.String(), err)
+			}
 		} else {
 			f.metrics.updateReadCountMetric(block.GetRootPath())
 			f.metrics.updateReadBytesMetric(req.Size_, block.GetRootPath())
 		}
 	}()
+
 	for needReplySize > 0 {
 		err = nil
 		reply := proto.NewPacket()
@@ -253,7 +431,7 @@ func (f *FlashNode) doStreamReadRequest(ctx context.Context, conn net.Conn, req 
 		reply.ExtentOffset = offset
 		p.Size = currReadSize
 		p.ExtentOffset = offset
-		reply.CRC, err = block.Read(ctx, reply.Data[:], offset, int64(currReadSize))
+		reply.CRC, err = block.Read(ctx, reply.Data[:], offset, int64(currReadSize), f.waitForCacheBlock)
 		if err != nil {
 			bufRelease()
 			return
@@ -266,16 +444,13 @@ func (f *FlashNode) doStreamReadRequest(ctx context.Context, conn net.Conn, req 
 		p.ResultCode = proto.OpOk
 
 		bgTime := stat.BeginStat()
-		metric := exporter.NewTPCnt("HitCacheRead_ReplyToClient")
 		if err = reply.WriteToConn(conn); err != nil {
-			metric.SetWithLabels(err, map[string]string{exporter.Vol: req.CacheRequest.Volume, exporter.Client: conn.RemoteAddr().String()})
 			bufRelease()
 			log.LogErrorf("%s volume:[%s] %s", action, req.CacheRequest.Volume,
 				reply.LogMessage(reply.GetOpMsg(), conn.RemoteAddr().String(), reply.StartT, err))
 			return
 		}
 		stat.EndStat("HitCacheRead:ReplyToClient", err, bgTime, 1)
-		metric.SetWithLabels(err, map[string]string{exporter.Vol: req.CacheRequest.Volume, exporter.Client: conn.RemoteAddr().String()})
 		needReplySize -= currReadSize
 		offset += int64(currReadSize)
 		bufRelease()
@@ -291,6 +466,7 @@ func (f *FlashNode) doStreamReadRequest(ctx context.Context, conn net.Conn, req 
 func (f *FlashNode) opCachePrepare(conn net.Conn, p *proto.Packet) (err error) {
 	action := "action[opCachePrepare]"
 	var volume string
+	bgTime := stat.BeginStat()
 	defer func() {
 		if err != nil {
 			log.LogErrorf("%s volume:[%s] %s", action, volume,
@@ -300,6 +476,7 @@ func (f *FlashNode) opCachePrepare(conn net.Conn, p *proto.Packet) (err error) {
 				log.LogErrorf("%s write to conn %v", action, e)
 			}
 		}
+		stat.EndStat("FlashNode:opCachePrepare", err, bgTime, 1)
 	}()
 
 	req := new(proto.CachePrepareRequest)
@@ -310,6 +487,8 @@ func (f *FlashNode) opCachePrepare(conn net.Conn, p *proto.Packet) (err error) {
 		err = fmt.Errorf("no cache prepare request")
 		return
 	}
+
+	f.updateSlotStat(req.CacheRequest.Slot)
 	volume = req.CacheRequest.Volume
 
 	if err = f.cacheEngine.PrepareCache(p.ReqID, req.CacheRequest, conn.RemoteAddr().String()); err != nil {
@@ -381,4 +560,79 @@ func (f *FlashNode) sendPrepareRequest(addr string, req *proto.CachePrepareReque
 		return fmt.Errorf("ResultCode(%v)", reply.ResultCode)
 	}
 	return nil
+}
+
+func (f *FlashNode) opSetReadIOLimits(conn net.Conn, p *proto.Packet) (err error) {
+	data := p.Data
+	req := &proto.FlashNodeSetIOLimitsRequest{}
+	adminTask := &proto.AdminTask{
+		Request: req,
+	}
+	update := false
+	decode := json.NewDecoder(bytes.NewBuffer(data))
+	decode.UseNumber()
+	if err = decode.Decode(adminTask); err == nil {
+		log.LogDebugf("opSetReadIOLimits  req: %v", req)
+		if req.Iocc != -1 {
+			f.diskReadIocc = req.Iocc
+			update = true
+		}
+		if req.Flow != -1 {
+			f.diskReadFlow = req.Flow
+			update = true
+		}
+		if req.Factor != -1 {
+			f.diskReadIoFactorFlow = req.Factor
+			update = true
+		}
+		if update {
+			f.limitRead.ResetIOEx(f.diskReadIocc*len(f.disks), f.diskReadIoFactorFlow, f.handleReadTimeout)
+			f.limitRead.ResetFlow(f.diskReadFlow)
+		}
+	} else {
+		log.LogErrorf("decode FlashNodeSetIOLimitsRequest error: %s", err.Error())
+	}
+	p.PacketOkReply()
+	return
+}
+
+func (f *FlashNode) opSetWriteIOLimits(conn net.Conn, p *proto.Packet) (err error) {
+	data := p.Data
+	req := &proto.FlashNodeSetIOLimitsRequest{}
+	adminTask := &proto.AdminTask{
+		Request: req,
+	}
+	update := false
+	decode := json.NewDecoder(bytes.NewBuffer(data))
+	decode.UseNumber()
+	if err = decode.Decode(adminTask); err == nil {
+		log.LogDebugf("opSetReadIOLimits  req: %v", req)
+		if req.Iocc != -1 {
+			f.diskWriteIocc = req.Iocc
+			update = true
+		}
+		if req.Flow != -1 {
+			f.diskWriteFlow = req.Flow
+			update = true
+		}
+		if req.Factor != -1 {
+			f.diskWriteIoFactorFlow = req.Factor
+			update = true
+		}
+		if update {
+			f.limitWrite.ResetIOEx(f.diskWriteIocc*len(f.disks), f.diskWriteIoFactorFlow, f.handleReadTimeout)
+			f.limitWrite.ResetFlow(f.diskWriteFlow)
+		}
+	} else {
+		log.LogErrorf("decode opSetWriteIOLimits error: %s", err.Error())
+	}
+	p.PacketOkReply()
+	return
+}
+
+func responseAckOKToMaster(conn net.Conn, p *proto.Packet) {
+	p.PacketOkReply()
+	if err := p.WriteToConn(conn); err != nil {
+		log.LogErrorf("ack master response: %s", err.Error())
+	}
 }

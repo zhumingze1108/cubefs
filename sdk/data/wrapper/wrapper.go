@@ -95,7 +95,7 @@ type Wrapper struct {
 
 // NewDataPartitionWrapper returns a new data partition wrapper.
 func NewDataPartitionWrapper(client SimpleClientInfo, volName string, masters []string, preload bool,
-	minWriteAbleDataPartitionCnt int, verReadSeq uint64, volStorageClass uint32, volAllowedStorageClass []uint32, innerReq bool,
+	verReadSeq uint64, volStorageClass uint32, volAllowedStorageClass []uint32, innerReq bool,
 ) (w *Wrapper, err error) {
 	log.LogInfof("action[NewDataPartitionWrapper] verReadSeq %v", verReadSeq)
 
@@ -428,10 +428,6 @@ func (w *Wrapper) updateDataPartitionByRsp(forceUpdate bool, refreshPolicy Refre
 			hddDpCount += 1
 		}
 
-		// do not insert preload dp in cold vol
-		if (proto.IsCold(w.volType) || proto.IsStorageClassBlobStore(w.volStorageClass)) && proto.IsPreLoadDp(dp.PartitionType) {
-			continue
-		}
 		if dp.Status == proto.ReadWrite {
 			dp.MetricsRefresh()
 			rwPartitionGroups = append(rwPartitionGroups, dp)
@@ -553,35 +549,6 @@ func (w *Wrapper) clearPartitions() {
 	w.partitions = make(map[uint64]*DataPartition)
 }
 
-func (w *Wrapper) AllocatePreLoadDataPartition(volName string, count int, capacity, ttl uint64, zones string) (err error) {
-	var dpv *proto.DataPartitionsView
-
-	if dpv, err = w.mc.AdminAPI().CreatePreLoadDataPartition(volName, count, capacity, ttl, zones); err != nil {
-		log.LogWarnf("CreatePreLoadDataPartition fail: err(%v)", err)
-		return
-	}
-	convert := func(response *proto.DataPartitionResponse) *DataPartition {
-		return &DataPartition{
-			DataPartitionResponse: *response,
-			ClientWrapper:         w,
-		}
-	}
-	rwPartitionGroups := make([]*DataPartition, 0)
-	for _, partition := range dpv.DataPartitions {
-		dp := convert(partition)
-		if (proto.IsCold(w.volType) || proto.IsStorageClassBlobStore(w.volStorageClass)) && !proto.IsPreLoadDp(dp.PartitionType) {
-			continue
-		}
-		log.LogInfof("updateDataPartition: dp(%v)", dp)
-		w.replaceOrInsertPartition(dp)
-		dp.MetricsRefresh()
-		rwPartitionGroups = append(rwPartitionGroups, dp)
-	}
-
-	w.refreshDpSelector(MergeDpPolicy, rwPartitionGroups)
-	return nil
-}
-
 func (w *Wrapper) replaceOrInsertPartition(dp *DataPartition) {
 	var oldstatus int8
 	w.Lock.Lock()
@@ -621,6 +588,11 @@ func (w *Wrapper) GetDataPartition(partitionID uint64) (*DataPartition, error) {
 			}
 			return dp, nil
 		}
+
+		if partitionID == 0 {
+			return nil, fmt.Errorf("get from master failed, maybe flush data failed, partition[%v] not exsit, err %s", partitionID, err.Error())
+		}
+
 		return nil, fmt.Errorf("get from master failed, partition[%v] not exsit", partitionID)
 	}
 	if !ok {

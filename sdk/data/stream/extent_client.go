@@ -26,6 +26,8 @@ import (
 	"syscall"
 	"time"
 
+	syslog "log"
+
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/manager"
@@ -117,6 +119,7 @@ func init() {
 func SetReqChansize(size int) {
 	if size > defaultChanSize {
 		reqChanSize = size
+		syslog.Printf("SetReqChanSize %d\n", reqChanSize)
 	}
 }
 
@@ -144,16 +147,14 @@ type ExtentConfig struct {
 	OnCacheBcache     CacheBcacheFunc
 	OnEvictBcache     EvictBacheFunc
 
-	DisableMetaCache             bool
-	MinWriteAbleDataPartitionCnt int
-	StreamRetryTimeout           int
+	DisableMetaCache   bool
+	StreamRetryTimeout int
 
 	OnRenewalForbiddenMigration RenewalForbiddenMigrationFunc
 	OnForbiddenMigration        ForbiddenMigrationFunc
 
 	VolStorageClass        uint32
 	VolAllowedStorageClass []uint32
-	VolCacheDpStorageClass uint32
 
 	OnGetInodeInfo      GetInodeInfoFunc
 	BcacheOnlyForNotSSD bool
@@ -206,7 +207,6 @@ type ExtentClient struct {
 	multiVerMgr               *MultiVerMgr
 	renewalForbiddenMigration RenewalForbiddenMigrationFunc
 	forbiddenMigration        ForbiddenMigrationFunc
-	CacheDpStorageClass       uint32
 	getInodeInfo              GetInodeInfoFunc
 	bcacheOnlyForNotSSD       bool
 	AheadRead                 *AheadReadCache
@@ -306,7 +306,7 @@ retry:
 	}
 
 	client.dataWrapper, err = wrapper.NewDataPartitionWrapper(client, config.Volume, config.Masters, config.Preload,
-		config.MinWriteAbleDataPartitionCnt, config.VerReadSeq, config.VolStorageClass, config.VolAllowedStorageClass, config.InnerReq)
+		config.VerReadSeq, config.VolStorageClass, config.VolAllowedStorageClass, config.InnerReq)
 	if err != nil {
 		log.LogErrorf("NewExtentClient: new data partition wrapper failed: volume(%v) mayRetry(%v) err(%v)",
 			config.Volume, limit, err)
@@ -345,7 +345,6 @@ retry:
 	client.preload = config.Preload
 	client.disableMetaCache = config.DisableMetaCache
 	client.renewalForbiddenMigration = config.OnRenewalForbiddenMigration
-	client.CacheDpStorageClass = config.VolCacheDpStorageClass
 	client.forbiddenMigration = config.OnForbiddenMigration
 	client.getInodeInfo = config.OnGetInodeInfo
 
@@ -369,7 +368,6 @@ retry:
 	}
 	client.readLimiter = rate.NewLimiter(readLimit, defaultReadLimitBurst)
 	client.writeLimiter = rate.NewLimiter(writeLimit, defaultWriteLimitBurst)
-	client.AheadRead = NewAheadReadCache(config.AheadReadEnable, config.AheadReadTotalMem, config.AheadReadBlockTimeOut, config.AheadReadWindowCnt)
 
 	if config.MaxStreamerLimit > 0 {
 		if config.MaxStreamerLimit <= defaultStreamerLimit {
@@ -404,6 +402,8 @@ retry:
 		log.LogInfof("NewExtentClient for (%v) not init remoteCache, config.NeedRemoteCache %v", client.volumeName,
 			config.NeedRemoteCache)
 	}
+
+	client.AheadRead = NewAheadReadCache(config.AheadReadEnable, config.AheadReadTotalMem, config.AheadReadBlockTimeOut, config.AheadReadWindowCnt)
 
 	return
 }
@@ -441,7 +441,7 @@ func (client *ExtentClient) enableRemoteCacheCluster(enabled bool) {
 }
 
 func (client *ExtentClient) UpdateRemoteCacheConfig(view *proto.SimpleVolView) {
-	if client.extentConfig.NeedRemoteCache {
+	if client.extentConfig != nil && client.extentConfig.NeedRemoteCache {
 		client.RemoteCache.UpdateRemoteCacheConfig(client, view)
 	} else {
 		log.LogInfof("UpdateRemoteCacheConfig do nothing, client.extentConfig.NeedRemoteCache %v", client.extentConfig.NeedRemoteCache)
@@ -947,10 +947,6 @@ func (client *ExtentClient) Close() error {
 	return nil
 }
 
-func (client *ExtentClient) AllocatePreLoadDataPartition(volName string, count int, capacity, ttl uint64, zones string) (err error) {
-	return client.dataWrapper.AllocatePreLoadDataPartition(volName, count, capacity, ttl, zones)
-}
-
 func (client *ExtentClient) CheckDataPartitionExsit(partitionID uint64) error {
 	_, err := client.dataWrapper.GetDataPartition(partitionID)
 	return err
@@ -993,7 +989,17 @@ func (c *ExtentClient) servePrepareRequest(prepareReq *PrepareRemoteCacheRequest
 		log.LogWarnf("servePrepareRequest: streamer is nil, prepare request: (%v)", prepareReq)
 		return
 	}
-	s.prepareRemoteCache(prepareReq.ctx, prepareReq.ek)
+	if prepareReq.warmUp {
+		s.extents.Append(prepareReq.ek, false)
+		s.prepareRemoteCache(prepareReq.ctx, prepareReq.ek, prepareReq.gen)
+	} else {
+		inodeInfo, err := s.client.getInodeInfo(prepareReq.inode)
+		if err != nil {
+			log.LogWarnf("servePrepareRequest: get inode info error: (%v)", err)
+			return
+		}
+		s.prepareRemoteCache(prepareReq.ctx, prepareReq.ek, inodeInfo.Generation)
+	}
 }
 
 func (c *ExtentClient) shouldRemoteCache(fullPath string) bool {

@@ -21,7 +21,6 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
-	"github.com/cubefs/cubefs/util/auditlog"
 	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
@@ -123,7 +122,7 @@ func (m *Server) freezeEmptyMetaPartition(w http.ResponseWriter, r *http.Request
 	err = m.cluster.FreezeEmptyMetaPartitionJob(name, freezeList)
 
 	rstMsg := fmt.Sprintf("Freeze empty volume(%s) meta partitions(%d)", name, cleans)
-	auditlog.LogMasterOp("freezeEmptyMetaPartition", rstMsg, err)
+	AuditLog(r, "freezeEmptyMetaPartition", rstMsg, err)
 	if err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
 		return
@@ -216,7 +215,7 @@ func (m *Server) cleanEmptyMetaPartition(w http.ResponseWriter, r *http.Request)
 	err = m.cluster.StartCleanEmptyMetaPartition(name)
 
 	rstMsg := fmt.Sprintf("Clean volume(%s) empty meta partitions", name)
-	auditlog.LogMasterOp("cleanEmptyMetaPartition", rstMsg, err)
+	AuditLog(r, "cleanEmptyMetaPartition", rstMsg, err)
 	if err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
 		return
@@ -244,7 +243,7 @@ func (m *Server) removeBackupMetaPartition(w http.ResponseWriter, r *http.Reques
 		return true
 	})
 
-	auditlog.LogMasterOp("removeBackupMetaPartition", "clean all backup meta partitions", nil)
+	AuditLog(r, "removeBackupMetaPartition", "clean all backup meta partitions", nil)
 
 	sendOkReply(w, r, newSuccessHTTPReply("Remove all backup meta partitions successfully."))
 }
@@ -367,102 +366,15 @@ func (m *Server) migrateMetaPartitionHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	rstMsg := fmt.Sprintf("migrateMetaPartitionHandler id(%d) from src [%s] to target[%s] has migrate successfully", mpid, srcAddr, targetAddr)
-	auditlog.LogMasterOp("MigrateMetaPartition", rstMsg, nil)
+	AuditLog(r, "MigrateMetaPartition", rstMsg, nil)
 	sendOkReply(w, r, newSuccessHTTPReply(rstMsg))
 }
 
-func parseMigrateResultParam(r *http.Request) (targetAddr string, id uint64, err error) {
-	if err = r.ParseForm(); err != nil {
-		return
-	}
-
-	targetAddr = r.FormValue(targetAddrKey)
-	if targetAddr == "" {
-		err = fmt.Errorf("parseMigrateResultParam targetAddrKey is null")
-		return
-	}
-	if ipAddr, ok := util.ParseAddrToIpAddr(targetAddr); ok {
-		targetAddr = ipAddr
-	}
-
-	value := r.FormValue(idKey)
-	if value == "" {
-		err = fmt.Errorf("parseMigrateResultParam meta partition id is needed")
-		return
-	}
-
-	if id, err = strconv.ParseUint(value, 10, 64); err != nil {
-		return
-	}
-
-	return
-}
-
-func (m *Server) migrateResultHandler(w http.ResponseWriter, r *http.Request) {
-	var (
-		targetAddr string
-		mpid       uint64
-		err        error
-		mp         *MetaPartition
-	)
-	metric := exporter.NewTPCnt(apiToMetricsName(proto.MigrateResult))
-	defer func() {
-		doStatAndMetric(proto.MigrateResult, metric, err, nil)
-	}()
-
-	targetAddr, mpid, err = parseMigrateResultParam(r)
-	if err != nil {
-		sendErrReply(w, r, newErrHTTPReply(err))
-		return
-	}
-
-	mp, err = m.cluster.getMetaPartitionByID(mpid)
-	if err != nil {
-		err = fmt.Errorf("Failed to get meta partition (%d)", mpid)
-		sendErrReply(w, r, newErrHTTPReply(err))
-		return
-	}
-
-	ret := MigrateResult{
-		Mp: MetaReplicaInfo{
-			MaxInodeID:  mp.MaxInodeID,
-			InodeCount:  mp.InodeCount,
-			DentryCount: mp.DentryCount,
-			FreeListLen: mp.FreeListLen,
-			TxCnt:       mp.TxCnt,
-			TxRbInoCnt:  mp.TxRbInoCnt,
-			TxRbDenCnt:  mp.TxRbDenCnt,
-		},
-	}
-
-	metaNode, err := m.cluster.metaNode(targetAddr)
-	if err != nil {
-		err = fmt.Errorf("Failed to get meta partition (%d)", mpid)
-		sendErrReply(w, r, newErrHTTPReply(err))
-		return
-	}
-
-	for _, mpv := range metaNode.metaPartitionInfos {
-		if mpv.PartitionID != mpid {
-			continue
-		}
-		ret.Target.MaxInodeID = mpv.MaxInodeID
-		ret.Target.InodeCount = mpv.InodeCnt
-		ret.Target.DentryCount = mpv.DentryCnt
-		ret.Target.FreeListLen = mpv.FreeListLen
-		ret.Target.TxCnt = mpv.TxCnt
-		ret.Target.TxRbInoCnt = mpv.TxRbInoCnt
-		ret.Target.TxRbDenCnt = mpv.TxRbDenCnt
-	}
-
-	sendOkReply(w, r, newSuccessHTTPReply(ret))
-}
-
-func (m *Server) createBalancePlan(w http.ResponseWriter, r *http.Request) {
+func (m *Server) createMetaNodeBalancePlan(w http.ResponseWriter, r *http.Request) {
 	var err error
-	metric := exporter.NewTPCnt(apiToMetricsName(proto.CreateBalanceTask))
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.CreateMetaNodeBalanceTask))
 	defer func() {
-		doStatAndMetric(proto.CreateBalanceTask, metric, err, nil)
+		doStatAndMetric(proto.CreateMetaNodeBalanceTask, metric, err, nil)
 	}()
 
 	var plan *proto.ClusterPlan
@@ -484,6 +396,7 @@ func (m *Server) createBalancePlan(w http.ResponseWriter, r *http.Request) {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: "Not find meta node that needs partition rebalance.", Data: nil})
 		return
 	}
+	plan.Type = ManualPlan
 
 	// Save into raft storage.
 	err = m.cluster.syncAddBalanceTask(plan)
@@ -492,16 +405,16 @@ func (m *Server) createBalancePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auditlog.LogMasterOp("createBalancePlan", "create meta partition balance task", nil)
+	AuditLog(r, "createBalancePlan", "create meta partition balance task", nil)
 
 	sendOkReply(w, r, newSuccessHTTPReply(plan))
 }
 
-func (m *Server) getBalancePlan(w http.ResponseWriter, r *http.Request) {
+func (m *Server) getMetaNodeBalancePlan(w http.ResponseWriter, r *http.Request) {
 	var err error
-	metric := exporter.NewTPCnt(apiToMetricsName(proto.GetBalanceTask))
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.GetMetaNodeBalanceTask))
 	defer func() {
-		doStatAndMetric(proto.GetBalanceTask, metric, err, nil)
+		doStatAndMetric(proto.GetMetaNodeBalanceTask, metric, err, nil)
 	}()
 
 	var plan *proto.ClusterPlan
@@ -519,11 +432,11 @@ func (m *Server) getBalancePlan(w http.ResponseWriter, r *http.Request) {
 	sendOkReply(w, r, newSuccessHTTPReply(plan))
 }
 
-func (m *Server) runBalancePlan(w http.ResponseWriter, r *http.Request) {
+func (m *Server) runMetaNodeBalancePlan(w http.ResponseWriter, r *http.Request) {
 	var err error
-	metric := exporter.NewTPCnt(apiToMetricsName(proto.RunBalanceTask))
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.RunMetaNodeBalanceTask))
 	defer func() {
-		doStatAndMetric(proto.RunBalanceTask, metric, err, nil)
+		doStatAndMetric(proto.RunMetaNodeBalanceTask, metric, err, nil)
 	}()
 
 	err = m.cluster.RunMetaPartitionBalanceTask()
@@ -532,16 +445,16 @@ func (m *Server) runBalancePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auditlog.LogMasterOp("runBalancePlan", "start to run meta partition balance task", nil)
+	AuditLog(r, "runBalancePlan", "start to run meta partition balance task", nil)
 
 	sendOkReply(w, r, newSuccessHTTPReply("Start running balance task successfully."))
 }
 
-func (m *Server) stopBalancePlan(w http.ResponseWriter, r *http.Request) {
+func (m *Server) stopMetaNodeBalancePlan(w http.ResponseWriter, r *http.Request) {
 	var err error
-	metric := exporter.NewTPCnt(apiToMetricsName(proto.StopBalanceTask))
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.StopMetaNodeBalanceTask))
 	defer func() {
-		doStatAndMetric(proto.StopBalanceTask, metric, err, nil)
+		doStatAndMetric(proto.StopMetaNodeBalanceTask, metric, err, nil)
 	}()
 
 	err = m.cluster.StopMetaPartitionBalanceTask()
@@ -550,16 +463,16 @@ func (m *Server) stopBalancePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auditlog.LogMasterOp("stopBalancePlan", "stop meta partition balance task", nil)
+	AuditLog(r, "stopBalancePlan", "stop meta partition balance task", nil)
 
 	sendOkReply(w, r, newSuccessHTTPReply("Stop balance task successfully."))
 }
 
-func (m *Server) deleteBalancePlan(w http.ResponseWriter, r *http.Request) {
+func (m *Server) deleteMetaNodeBalancePlan(w http.ResponseWriter, r *http.Request) {
 	var err error
-	metric := exporter.NewTPCnt(apiToMetricsName(proto.DeleteBalanceTask))
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.DeleteMetaNodeBalanceTask))
 	defer func() {
-		doStatAndMetric(proto.DeleteBalanceTask, metric, err, nil)
+		doStatAndMetric(proto.DeleteMetaNodeBalanceTask, metric, err, nil)
 	}()
 
 	err = m.cluster.DeleteMetaPartitionBalanceTask()
@@ -568,7 +481,97 @@ func (m *Server) deleteBalancePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auditlog.LogMasterOp("deleteBalancePlan", "Remove meta partition balance task", nil)
+	AuditLog(r, "deleteBalancePlan", "Remove meta partition balance task", nil)
 
 	sendOkReply(w, r, newSuccessHTTPReply("Delete balance plan task successfully."))
+}
+
+func (m *Server) offlineMetaNode(w http.ResponseWriter, r *http.Request) {
+	var (
+		rstMsg      string
+		offLineAddr string
+		err         error
+		plan        *proto.ClusterPlan
+		metaNode    *MetaNode
+	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.OfflineMetaNode))
+	defer func() {
+		doStatAndMetric(proto.OfflineMetaNode, metric, err, nil)
+		AuditLog(r, proto.OfflineMetaNode, rstMsg, err)
+	}()
+
+	if offLineAddr, err = parseAndExtractNodeAddr(r); err != nil {
+		log.LogErrorf("parse node addr failed, err: %v", err)
+		sendErrReply(w, r, newErrHTTPReply(proto.ErrParamError))
+		return
+	}
+
+	if metaNode, err = m.cluster.metaNode(offLineAddr); err != nil {
+		log.LogWarnf("metanode(%s) is not exist", offLineAddr)
+		sendErrReply(w, r, newErrHTTPReply(proto.ErrMetaNodeNotExists))
+		return
+	}
+
+	if metaNode.MetaPartitionCount == 0 {
+		err = m.cluster.DoMetaNodeOffline(offLineAddr)
+		if err != nil {
+			log.LogErrorf("DoMetaNodeOffline(%s) err: %s", offLineAddr, err.Error())
+			sendErrReply(w, r, newErrHTTPReply(proto.ErrInternalError))
+			return
+		}
+		rstMsg = fmt.Sprintf("Offline metanode %s successfully", offLineAddr)
+		sendOkReply(w, r, newSuccessHTTPReply(rstMsg))
+		return
+	}
+
+	// search the raft storage. Only store one plan
+	plan, err = m.cluster.loadBalanceTask()
+	if err == nil {
+		if plan.Status == PlanTaskDone {
+			// remove the done task.
+			log.LogWarnf("remove the plan task(%v) before kick out(%s)", plan, offLineAddr)
+			err = m.cluster.DeleteMetaPartitionBalanceTask()
+			if err != nil {
+				log.LogErrorf("failed to delete meta partition balance task: %s", err.Error())
+				sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
+				return
+			}
+		} else {
+			log.LogWarnf("one balance task exist. clear it before kick out(%s)", offLineAddr)
+			err = fmt.Errorf("There is a meta partition task plan. Clear it before kick out new metanode")
+			sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error(), Data: plan})
+			return
+		}
+	} else if err != proto.ErrNoMpMigratePlan {
+		log.LogErrorf("Failed to load balance task err: %s", err.Error())
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+
+	if plan, err = m.cluster.CreateOfflineMetaNodePlan(offLineAddr); err != nil {
+		log.LogErrorf("Failed to create kick out plan for metanode(%s) err: %s", offLineAddr, err.Error())
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+
+	if plan.Total <= 0 {
+		err = fmt.Errorf("kick out plan is empty for metanode(%s)", offLineAddr)
+		log.LogErrorf(err.Error())
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+
+	plan.Type = OfflinePlan
+	plan.Status = PlanTaskRun
+
+	// Save into raft storage.
+	err = m.cluster.syncAddBalanceTask(plan)
+	if err != nil {
+		log.LogErrorf("syncAddBalanceTask metanode(%s) err: %s", offLineAddr, err.Error())
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+
+	rstMsg = fmt.Sprintf("Offline metanode %s at background successfully", offLineAddr)
+	sendOkReply(w, r, newSuccessHTTPReply(rstMsg))
 }

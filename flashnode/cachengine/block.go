@@ -29,14 +29,13 @@ import (
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/auditlog"
-	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/stat"
 )
 
 const (
 	_cacheBlockOpenOpt = os.O_CREATE | os.O_RDWR
-	HeaderSize         = 24
+	HeaderSize         = 40
 )
 
 type CacheBlock struct {
@@ -177,14 +176,12 @@ func (cb *CacheBlock) WriteAt(data []byte, offset, size int64) (err error) {
 }
 
 // Read reads data from an extent.
-func (cb *CacheBlock) Read(ctx context.Context, data []byte, offset, size int64) (crc uint32, err error) {
+func (cb *CacheBlock) Read(ctx context.Context, data []byte, offset, size int64, waitForBlock bool) (crc uint32, err error) {
 	var file *os.File
-	if err = cb.ready(ctx); err != nil {
+	if err = cb.ready(ctx, waitForBlock); err != nil {
 		return
 	}
-
 	bgTime := stat.BeginStat()
-	metric := exporter.NewTPCnt("HitCacheRead_ReadFromDisk")
 	defer func() {
 		if err != nil {
 			if IsDiskErr(err.Error()) {
@@ -193,7 +190,6 @@ func (cb *CacheBlock) Read(ctx context.Context, data []byte, offset, size int64)
 			}
 		}
 		stat.EndStat("HitCacheRead:ReadFromDisk", err, bgTime, 1)
-		metric.SetWithLabels(err, map[string]string{exporter.Vol: cb.volume})
 	}()
 
 	if offset >= cb.getAllocSize() || offset > cb.getUsedSize() || cb.getUsedSize() == 0 {
@@ -219,6 +215,14 @@ func (cb *CacheBlock) Read(ctx context.Context, data []byte, offset, size int64)
 
 func (cb *CacheBlock) writeCacheBlockFileHeader(file *os.File) (err error) {
 	if _, err = file.Seek(0, 0); err != nil {
+		return
+	}
+	// add two reserverd
+	var reserved uint64 = 0
+	if err = binary.Write(file, binary.BigEndian, reserved); err != nil {
+		return
+	}
+	if err = binary.Write(file, binary.BigEndian, reserved); err != nil {
 		return
 	}
 	if err = binary.Write(file, binary.BigEndian, cb.getAllocSize()); err != nil {
@@ -247,9 +251,18 @@ func (cb *CacheBlock) writeCacheBlockFileHeader(file *os.File) (err error) {
 func (cb *CacheBlock) checkCacheBlockFileHeader(file *os.File) (allocSize, usedSize int64, expiredTime time.Time, err error) {
 	var stat os.FileInfo
 	var seconds int64
+	var reserved1, reserved2 uint64
 	if stat, err = file.Stat(); err != nil {
 		return
 	}
+
+	if err = binary.Read(file, binary.BigEndian, &reserved1); err != nil {
+		return
+	}
+	if err = binary.Read(file, binary.BigEndian, &reserved2); err != nil {
+		return
+	}
+
 	if err = binary.Read(file, binary.BigEndian, &allocSize); err != nil {
 		return
 	}
@@ -348,7 +361,7 @@ func (cb *CacheBlock) initFilePath(isLoad bool) (err error) {
 	}
 	_, err = os.Stat(cb.filePath)
 	if !isLoad {
-		msg := fmt.Sprintf("init cache block(%s) to local : err %v", cb.info(), err)
+		msg := fmt.Sprintf("init cache block(%s) to local: err %v", cb.info(), err)
 		log.LogDebugf("%v", msg)
 		auditlog.LogFlashNodeOp("BlockInit", msg, err)
 	}
@@ -466,14 +479,20 @@ func (cb *CacheBlock) prepareSource(ctx context.Context, sourceCh <-chan *proto.
 	}
 }
 
-func (cb *CacheBlock) ready(ctx context.Context) error {
-	select {
-	case <-cb.readyCh:
-		return nil
-	case <-cb.closeCh:
-		return CacheClosedError
-	case <-ctx.Done():
-		return ctx.Err()
+func (cb *CacheBlock) ready(ctx context.Context, waitForBlock bool) error {
+	for {
+		select {
+		case <-cb.readyCh:
+			return nil
+		case <-cb.closeCh:
+			return CacheClosedError
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if !waitForBlock {
+				return fmt.Errorf("require data is caching")
+			}
+		}
 	}
 }
 
@@ -487,17 +506,17 @@ func (cb *CacheBlock) notifyReady() {
 
 // align AllocSize with PageSize-4KB
 func computeAllocSize(sources []*proto.DataSource) (alloc uint64) {
-	for _, s := range sources {
-		blockOffset := s.FileOffset & (proto.CACHE_BLOCK_SIZE - 1)
-		blockEnd := blockOffset + s.Size_ - 1
-		pageOffset := blockOffset / proto.PageSize
-		pageEnd := blockEnd / proto.PageSize
-		if blockEnd < blockOffset {
-			return 0
-		}
-		for i := pageOffset; i <= pageEnd; i++ {
-			alloc += proto.PageSize
-		}
+	if len(sources) == 0 {
+		return
+	}
+	firstSource := sources[0]
+	lastSource := sources[len(sources)-1]
+	start := firstSource.FileOffset / proto.CACHE_BLOCK_SIZE * proto.CACHE_BLOCK_SIZE
+	end := lastSource.FileOffset + lastSource.Size_
+
+	alloc = end - start
+	if alloc%proto.PageSize != 0 {
+		alloc = (alloc/proto.PageSize + 1) * proto.PageSize
 	}
 	return
 }
@@ -543,7 +562,7 @@ func (cb *CacheBlock) GetRootPath() string {
 	return cb.rootPath
 }
 
-func (cb *CacheBlock) InitOnceForCacheRead(engine *CacheEngine, sources []*proto.DataSource) {
+func (cb *CacheBlock) InitOnceForCacheRead(engine *CacheEngine, sources []*proto.DataSource, done chan struct{}) {
 	cb.initOnce.Do(func() {
 		cb.InitForCacheRead(sources, engine.readDataNodeTimeout)
 		select {
@@ -553,13 +572,13 @@ func (cb *CacheBlock) InitOnceForCacheRead(engine *CacheEngine, sources []*proto
 		default:
 		}
 	})
+	close(done)
 }
 
 func (cb *CacheBlock) InitForCacheRead(sources []*proto.DataSource, readDataNodeTimeout int) {
 	var err error
 	var file *os.File
 	bgTime := stat.BeginStat()
-	metric := exporter.NewTPCnt("MissCacheRead_InitForCacheRead")
 	defer func() {
 		if err != nil {
 			if IsDiskErr(err.Error()) {
@@ -568,8 +587,11 @@ func (cb *CacheBlock) InitForCacheRead(sources []*proto.DataSource, readDataNode
 			}
 			cb.notifyClose()
 		}
+		if value, ok := cb.cacheEngine.lruCacheMap.Load(cb.rootPath); ok {
+			cacheItem := value.(*lruCacheItem)
+			cacheItem.lruCache.FreePreAllocatedSize(cb.blockKey)
+		}
 		stat.EndStat("MissCacheRead:InitForCacheRead", err, bgTime, 1)
-		metric.SetWithLabels(err, map[string]string{exporter.Vol: cb.volume})
 	}()
 	sb := strings.Builder{}
 	for _, s := range sources {
@@ -622,5 +644,5 @@ func (cb *CacheBlock) InitForCacheRead(sources []*proto.DataSource, readDataNode
 }
 
 func (cb *CacheBlock) info() string {
-	return fmt.Sprintf("path(%v)_from(%v)", cb.filePath, cb.clientIP)
+	return fmt.Sprintf("path(%v)_from(%v)_size(%v)", cb.filePath, cb.clientIP, cb.allocSize)
 }

@@ -31,6 +31,9 @@ func (i *Int) Key(key string) *Argument { return NewArgument(key, &i.V) }
 func (i *Int) ID() *Argument            { return i.Key("id") }
 func (i *Int) ExtentID() *Argument      { return i.Key("extentID") }
 func (i *Int) Count() *Argument         { return i.Key("count") }
+func (i *Int) Flow() *Argument          { return i.Key("flow") }
+func (i *Int) Iocc() *Argument          { return i.Key("iocc") }
+func (i *Int) Factor() *Argument        { return i.Key("factor") }
 
 func (u *Uint) Key(key string) *Argument { return NewArgument(key, &u.V) }
 func (u *Uint) ID() *Argument            { return u.Key("id") }
@@ -46,3 +49,5 @@ func (s *String) Disk() *Argument          { return s.Key("disk") }
 func (s *String) DiskPath() *Argument      { return s.Key("diskPath") }
 func (s *String) Addr() *Argument          { return s.Key("addr") }
 func (s *String) ZoneName() *Argument      { return s.Key("zoneName") }
+
+func (s *String) QosType() *Argument { return s.Key("qosType") }

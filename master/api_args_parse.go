@@ -411,6 +411,7 @@ type updateVolReq struct {
 	followerRead             bool
 	metaFollowerRead         bool
 	directRead               bool
+	ignoreTinyRecover        bool
 	maximallyRead            bool
 	leaderRetryTimeout       int64
 	authenticate             bool
@@ -449,70 +450,7 @@ func parseColdVolUpdateArgs(r *http.Request, vol *Vol) (args *coldVolArgs, err e
 	if vol.volStorageClass != proto.StorageClass_BlobStore {
 		log.LogInfof("[parseColdVolUpdateArgs] vol(%v) storageClass(%v) is not blobstore, skip parse cache args",
 			vol.Name, proto.StorageClassString(vol.volStorageClass))
-		args.cacheCap = vol.CacheCapacity
-		args.cacheAction = vol.CacheAction
-		args.cacheThreshold = vol.CacheThreshold
-		args.cacheTtl = vol.CacheTTL
-		args.cacheHighWater = vol.CacheHighWater
-		args.cacheLowWater = vol.CacheLowWater
-		args.cacheLRUInterval = vol.CacheLRUInterval
-		args.cacheRule = vol.CacheRule
 		return
-	}
-
-	if args.cacheCap, err = extractUint64WithDefault(r, cacheCapacity, vol.CacheCapacity); err != nil {
-		return
-	}
-
-	if args.cacheAction, err = extractUintWithDefault(r, cacheActionKey, vol.CacheAction); err != nil {
-		return
-	}
-
-	if args.cacheThreshold, err = extractUintWithDefault(r, cacheThresholdKey, vol.CacheThreshold); err != nil {
-		return
-	}
-
-	if args.cacheTtl, err = extractUintWithDefault(r, cacheTTLKey, vol.CacheTTL); err != nil {
-		return
-	}
-
-	if args.cacheHighWater, err = extractUintWithDefault(r, cacheHighWaterKey, vol.CacheHighWater); err != nil {
-		return
-	}
-
-	if args.cacheLowWater, err = extractUintWithDefault(r, cacheLowWaterKey, vol.CacheLowWater); err != nil {
-		return
-	}
-
-	if args.cacheLRUInterval, err = extractUintWithDefault(r, cacheLRUIntervalKey, vol.CacheLRUInterval); err != nil {
-		return
-	}
-
-	if args.cacheLRUInterval < 2 {
-		return nil, fmt.Errorf("cacheLruInterval(%d) muster be bigger than 2 minute", args.cacheLRUInterval)
-	}
-
-	args.cacheRule = extractStrWithDefault(r, cacheRuleKey, vol.CacheRule)
-	emptyCacheRule, err := extractBoolWithDefault(r, emptyCacheRuleKey, false)
-	if err != nil {
-		return
-	}
-
-	if emptyCacheRule {
-		args.cacheRule = ""
-	}
-
-	// do some check
-	if args.cacheLowWater >= args.cacheHighWater {
-		return nil, fmt.Errorf("low water(%d) must be less than high water(%d)", args.cacheLowWater, args.cacheHighWater)
-	}
-
-	if args.cacheHighWater >= 90 || args.cacheLowWater >= 90 {
-		return nil, fmt.Errorf("low(%d) or high water(%d) can't be large than 90, low than 0", args.cacheLowWater, args.cacheHighWater)
-	}
-
-	if args.cacheAction < proto.NoCache || args.cacheAction > proto.RWCache {
-		return nil, fmt.Errorf("cache action is illegal (%d)", args.cacheAction)
 	}
 
 	return
@@ -595,6 +533,10 @@ func parseVolUpdateReq(r *http.Request, vol *Vol, req *updateVolReq) (err error)
 	}
 
 	if req.directRead, err = extractBoolWithDefault(r, proto.VolEnableDirectRead, vol.DirectRead); err != nil {
+		return
+	}
+
+	if req.ignoreTinyRecover, err = extractBoolWithDefault(r, proto.VolIgnoreTinyRecover, vol.IgnoreTinyRecover); err != nil {
 		return
 	}
 
@@ -770,14 +712,6 @@ func (qos *qosArgs) isArgsWork() bool {
 
 type coldVolArgs struct {
 	objBlockSize            int
-	cacheCap                uint64
-	cacheAction             int
-	cacheThreshold          int
-	cacheTtl                int
-	cacheHighWater          int
-	cacheLowWater           int
-	cacheLRUInterval        int
-	cacheRule               string
 	accessTimeValidInterval int64
 	trashInterval           int64
 	enablePersistAccessTime bool
@@ -819,58 +753,22 @@ type createVolReq struct {
 	// hybrid cloud
 	volStorageClass     uint32
 	allowedStorageClass []uint32
-	cacheDpStorageClass uint32
 	// remote cache
-	remoteCacheEnable        bool
-	remoteCacheAutoPrepare   bool
-	remoteCachePath          string
-	remoteCacheTTL           int64
-	remoteCacheReadTimeout   int64
-	remoteCacheMaxFileSizeGB int64
-	remoteCacheOnlyForNotSSD bool
-	remoteCacheMultiRead     bool
-}
-
-func checkCacheAction(action int) error {
-	if action != proto.NoCache && action != proto.RCache && action != proto.RWCache {
-		return fmt.Errorf("cache action is not legal, action [%d]", action)
-	}
-
-	return nil
+	remoteCacheEnable            bool
+	remoteCacheAutoPrepare       bool
+	remoteCachePath              string
+	remoteCacheTTL               int64
+	remoteCacheReadTimeout       int64
+	remoteCacheMaxFileSizeGB     int64
+	remoteCacheOnlyForNotSSD     bool
+	remoteCacheMultiRead         bool
+	flashNodeTimeoutCount        int64
+	remoteCacheSameZoneTimeout   int64
+	remoteCacheSameRegionTimeout int64
 }
 
 func parseColdArgs(r *http.Request) (args coldVolArgs, err error) {
-	args.cacheRule = extractStr(r, cacheRuleKey)
-
 	if args.objBlockSize, err = extractUint(r, ebsBlkSizeKey); err != nil {
-		return
-	}
-
-	if args.cacheCap, err = extractUint64(r, cacheCapacity); err != nil {
-		return
-	}
-
-	if args.cacheAction, err = extractUint(r, cacheActionKey); err != nil {
-		return
-	}
-
-	if args.cacheThreshold, err = extractUint(r, cacheThresholdKey); err != nil {
-		return
-	}
-
-	if args.cacheTtl, err = extractUint(r, cacheTTLKey); err != nil {
-		return
-	}
-
-	if args.cacheHighWater, err = extractUint(r, cacheHighWaterKey); err != nil {
-		return
-	}
-
-	if args.cacheLowWater, err = extractUint(r, cacheLowWaterKey); err != nil {
-		return
-	}
-
-	if args.cacheLRUInterval, err = extractUint(r, cacheLRUIntervalKey); err != nil {
 		return
 	}
 
@@ -1095,13 +993,22 @@ func parseRequestToCreateVol(r *http.Request, req *createVolReq) (err error) {
 		return
 	}
 
-	if req.remoteCacheMaxFileSizeGB, err = extractInt64WithDefault(r, remoteCacheMaxFileSizeGB, DefaultRemoteCacheMaxFileSizeGB); err != nil {
+	if req.remoteCacheMaxFileSizeGB, err = extractInt64WithDefault(r, remoteCacheMaxFileSizeGB, proto.DefaultRemoteCacheMaxFileSizeGB); err != nil {
 		return
 	}
 	if req.remoteCacheOnlyForNotSSD, err = extractBoolWithDefault(r, remoteCacheOnlyForNotSSD, false); err != nil {
 		return
 	}
 	if req.remoteCacheMultiRead, err = extractBoolWithDefault(r, remoteCacheMultiRead, false); err != nil {
+		return
+	}
+	if req.flashNodeTimeoutCount, err = extractInt64WithDefault(r, flashNodeTimeoutCount, proto.DefaultFlashNodeTimeoutCount); err != nil {
+		return
+	}
+	if req.remoteCacheSameZoneTimeout, err = extractInt64WithDefault(r, remoteCacheSameZoneTimeout, proto.DefaultRemoteCacheSameZoneTimeout); err != nil {
+		return
+	}
+	if req.remoteCacheSameRegionTimeout, err = extractInt64WithDefault(r, remoteCacheSameRegionTimeout, proto.DefaultRemoteCacheSameRegionTimeout); err != nil {
 		return
 	}
 	return
@@ -1411,6 +1318,60 @@ func parseAndExtractVolDeletionDelayTime(r *http.Request) (volDeletionDelayTimeH
 	return
 }
 
+func parseAndExtractMetaNodeGOGC(r *http.Request) (metaNodeGOGC int, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	var value string
+	if value = r.FormValue(metaNodeGOGCKey); value == "" {
+		err = keyNotFound(metaNodeGOGCKey)
+		return
+	}
+	if metaNodeGOGC, err = strconv.Atoi(value); err != nil {
+		return
+	}
+	return
+}
+
+func parseAndExtractDataNodeGOGC(r *http.Request) (dataNodeGOGC int, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	var value string
+	if value = r.FormValue(dataNodeGOGCKey); value == "" {
+		err = keyNotFound(dataNodeGOGCKey)
+		return
+	}
+	if dataNodeGOGC, err = strconv.Atoi(value); err != nil {
+		return
+	}
+	return
+}
+
+func parseAndExtractFileStatsThresholds(r *http.Request) (thresholds []uint64, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	var value string
+	if value = r.FormValue(thresholdKey); value == "" {
+		err = keyNotFound(thresholdKey)
+		return
+	}
+	thresholdsStr := strings.Split(value, ",")
+	for _, t := range thresholdsStr {
+		threshold, err := strconv.ParseUint(t, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid threshold value: %s", t)
+		}
+		thresholds = append(thresholds, threshold)
+	}
+	if len(thresholds) == 0 {
+		err = fmt.Errorf("at least one threshold needs to be configured")
+		return
+	}
+	return
+}
+
 func parseAndExtractSetNodeSetInfoParams(r *http.Request) (params map[string]interface{}, err error) {
 	if err = r.ParseForm(); err != nil {
 		return
@@ -1602,6 +1563,28 @@ func parseAndExtractSetNodeInfoParams(r *http.Request) (params map[string]interf
 		params[markDiskBrokenThresholdKey] = val
 	}
 
+	if value = r.FormValue(flashNodeHandleReadTimeout); value != "" {
+		noParams = false
+		val := int64(0)
+		val, err = strconv.ParseInt(value, 10, 32)
+		if err != nil {
+			err = unmatchedKey(flashNodeHandleReadTimeout)
+			return
+		}
+		params[flashNodeHandleReadTimeout] = val
+	}
+
+	if value = r.FormValue(flashNodeReadDataNodeTimeout); value != "" {
+		noParams = false
+		val := int64(0)
+		val, err = strconv.ParseInt(value, 10, 32)
+		if err != nil {
+			err = unmatchedKey(flashNodeReadDataNodeTimeout)
+			return
+		}
+		params[flashNodeReadDataNodeTimeout] = val
+	}
+
 	if value = r.FormValue(autoDecommissionDiskKey); value != "" {
 		noParams = false
 		val := false
@@ -1655,6 +1638,17 @@ func parseAndExtractSetNodeInfoParams(r *http.Request) (params map[string]interf
 			return
 		}
 		params[dpTimeoutKey] = val
+	}
+
+	if value = r.FormValue(mpTimeoutKey); value != "" {
+		noParams = false
+		val := int64(0)
+		val, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			err = unmatchedKey(mpTimeoutKey)
+			return
+		}
+		params[mpTimeoutKey] = val
 	}
 
 	if value = r.FormValue(decommissionLimit); value != "" {
@@ -1848,19 +1842,6 @@ func extractUint(r *http.Request, key string) (val int, err error) {
 	}
 
 	val = int(valParsed)
-	return val, nil
-}
-
-func extractPositiveUint(r *http.Request, key string) (val int, err error) {
-	var str string
-	if str = r.FormValue(key); str == "" {
-		return 0, fmt.Errorf("args [%s] is not legal", key)
-	}
-
-	if val, err = strconv.Atoi(str); err != nil || val <= 0 {
-		return 0, fmt.Errorf("args [%s] is not legal, val %s", key, str)
-	}
-
 	return val, nil
 }
 
@@ -2085,6 +2066,49 @@ func sendErrReply(w http.ResponseWriter, r *http.Request, httpReply *proto.HTTPR
 	}
 }
 
+func parseRequestToUpdateDecommissionFirstHostParallelLimit(r *http.Request) (addr string, limit uint64, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	if addr = r.FormValue(addrKey); addr == "" {
+		err = keyNotFound(addrKey)
+		return
+	}
+
+	var value string
+	if value = r.FormValue(decommissionFirstHostParallelLimit); value == "" {
+		err = keyNotFound(decommissionFirstHostParallelLimit)
+		return
+	}
+
+	limit, err = strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func parseRequestToUpdateDecommissionFirstHostDiskParallelLimit(r *http.Request) (limit uint64, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	var value string
+	if value = r.FormValue(decommissionFirstHostDiskParallelLimit); value == "" {
+		err = keyNotFound(decommissionFirstHostDiskParallelLimit)
+		return
+	}
+
+	limit, err = strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
 func parseRequestToUpdateDecommissionLimit(r *http.Request) (limit uint64, err error) {
 	if err = r.ParseForm(); err != nil {
 		return
@@ -2104,32 +2128,31 @@ func parseRequestToUpdateDecommissionLimit(r *http.Request) (limit uint64, err e
 	return
 }
 
-func parseSetConfigParam(r *http.Request) (key string, value string, err error) {
+func parseSetConfigParam(r *http.Request) (config map[string]string, err error) {
 	if err = r.ParseForm(); err != nil {
 		return
 	}
-	value = r.FormValue(cfgmetaPartitionInodeIdStep)
-	if value != "" {
-		key = cfgmetaPartitionInodeIdStep
-		return
+	config = make(map[string]string)
+	keyList := []string{
+		cfgmetaPartitionInodeIdStep,
+		cfgMetaNodeMemoryHighPer,
+		cfgMetaNodeMemoryLowPer,
+		cfgAutoMpMigrate,
+		flashNodeHandleReadTimeout,
+		flashNodeReadDataNodeTimeout,
 	}
-	value = r.FormValue(cfgMetaNodeMemoryHighPer)
-	if value != "" {
-		key = cfgMetaNodeMemoryHighPer
-		return
-	}
-	value = r.FormValue(cfgMetaNodeMemoryLowPer)
-	if value != "" {
-		key = cfgMetaNodeMemoryLowPer
-		return
-	}
-	value = r.FormValue(cfgAutoMpMigrate)
-	if value != "" {
-		key = cfgAutoMpMigrate
-		return
+	for _, val := range keyList {
+		key := val
+		value := r.FormValue(key)
+		if value == "" {
+			continue
+		}
+		config[key] = value
 	}
 
-	err = keyNotFound("config")
+	if len(config) == 0 {
+		err = keyNotFound("config")
+	}
 	return
 }
 

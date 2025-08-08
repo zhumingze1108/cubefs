@@ -819,6 +819,7 @@ func FindMigrateDestInOneNodeSet(migratePlan *proto.ClusterPlan, mpPlan *proto.M
 		find, dests = GetMigrateAddrExcludeZone(getParam)
 	}
 	if !find {
+		log.LogWarnf("getParam: %+v. mpPlan: %+v. Resource: %+v", getParam, mpPlan, convertStructToJson(migratePlan.Low))
 		return fmt.Errorf("can't find the request low pressure nodes (%d)", getParam.RequestNum)
 	}
 
@@ -1085,6 +1086,13 @@ func (c *Cluster) DoMetaPartitionBalanceTask(plan *proto.ClusterPlan) {
 				c.PlanRun = false
 				return
 			}
+			// switch raft leader if the source is leader. And waiting for the leader to be elected.
+			err = c.changeAndCheckMetaPartitionLeader(mrPlan, mpPlan, mp)
+			if err != nil {
+				log.LogErrorf("changeAndCheckMetaPartitionLeader error: %s", err.Error())
+				c.SetMetaReplicaPlanStatusError(plan, mrPlan)
+				return
+			}
 
 			log.LogDebugf("Start to migrate meta partition(%d) from %s to %s", mpPlan.ID, mrPlan.Source, mrPlan.Destination)
 			err = c.migrateMetaPartition(mrPlan.Source, mrPlan.Destination, mp)
@@ -1125,6 +1133,13 @@ func (c *Cluster) DoMetaPartitionBalanceTask(plan *proto.ClusterPlan) {
 	err = c.syncUpdateBalanceTask(plan)
 	if err != nil {
 		log.LogErrorf("syncUpdateBalanceTask err: %s", err.Error())
+	}
+
+	if plan.Type == OfflinePlan {
+		err = c.offlineMetaNode(plan)
+		if err != nil {
+			log.LogErrorf("offlineMetaNode err: %s", err.Error())
+		}
 	}
 }
 
@@ -1284,6 +1299,7 @@ func (c *Cluster) AutoCreateRunningMigratePlan() (*proto.ClusterPlan, error) {
 		return nil, nil
 	}
 
+	plan.Type = AutoPlan
 	plan.Status = PlanTaskRun
 
 	// Save into raft storage.
@@ -1407,4 +1423,203 @@ func CaculateNodeMemoryRatio(metanode *MetaNode) float64 {
 		nodeMemRatio = 0.0
 	}
 	return nodeMemRatio
+}
+
+func (c *Cluster) CreateOfflineMetaNodePlan(offLineAddr string) (*proto.ClusterPlan, error) {
+	cView := &proto.ClusterPlan{
+		Low:    make(map[string]*proto.ZonePressureView),
+		Plan:   make([]*proto.MetaBalancePlan, 0),
+		Status: PlanTaskInit,
+	}
+
+	err := c.GetLowMemPressureTopology(cView)
+	if err != nil {
+		log.LogErrorf("GetLowMemPressureTopology error: %s", err.Error())
+		return cView, err
+	}
+
+	err = c.FillOffLineAddrToPlan(offLineAddr, cView)
+	if err != nil {
+		log.LogErrorf("FillOffLineAddrToPlan error: %s", err.Error())
+		return cView, err
+	}
+
+	err = FindMigrateDestination(cView)
+	if err != nil {
+		log.LogErrorf("FindMigrateDestination error: %s", err.Error())
+		return cView, err
+	}
+	cView.Total = len(cView.Plan)
+
+	return cView, nil
+}
+
+func (c *Cluster) FillOffLineAddrToPlan(offLineAddr string, migratePlan *proto.ClusterPlan) (err error) {
+	// Get the meta node list that memory usage percent larger than metaNodeMemHighThresPer
+	overLoadNodes := make([]*proto.MetaNodeBalanceInfo, 0, 1)
+	value, ok := c.metaNodes.Load(offLineAddr)
+	if !ok {
+		err = fmt.Errorf("Failed to load %s from c.metaNodes", offLineAddr)
+		log.LogError(err.Error())
+		return err
+	}
+	metanode, ok := value.(*MetaNode)
+	if !ok {
+		err = fmt.Errorf("Failed to convert to metanode for %s", offLineAddr)
+		log.LogError(err.Error())
+		return err
+	}
+	metaRecord := c.MetaNodeRecord(metanode)
+	// remove all the meta partition from the off line meta node.
+	metaRecord.Estimate = metanode.MetaPartitionCount
+	overLoadNodes = append(overLoadNodes, metaRecord)
+
+	for _, metaNode := range overLoadNodes {
+		err = c.AddMetaPartitionIntoPlan(metaNode, migratePlan, overLoadNodes)
+		if err != nil {
+			log.LogErrorf("Error to add meta partition into plan: %s", err.Error())
+			continue
+		}
+	}
+
+	return nil
+}
+
+func (c *Cluster) offlineMetaNode(plan *proto.ClusterPlan) (err error) {
+	if plan.Type != OfflinePlan {
+		err = fmt.Errorf("Invalid plan type: %s", plan.Type)
+		log.LogErrorf("offlineMetaNode err: %s", err.Error())
+		return err
+	}
+
+	if len(plan.Plan) <= 0 {
+		err = fmt.Errorf("empty plan")
+		log.LogErrorf("offlineMetaNode err: %s", err.Error())
+		return err
+	}
+
+	if len(plan.Plan[0].Plan) <= 0 {
+		err = fmt.Errorf("empty value in plan[0]")
+		log.LogErrorf("offlineMetaNode err: %s", err.Error())
+		return err
+	}
+
+	if plan.DoneNum != len(plan.Plan) {
+		err = fmt.Errorf("plan count(%d) not equal to done num(%d)", len(plan.Plan), plan.DoneNum)
+		log.LogErrorf("offlineMetaNode err: %s", err.Error())
+		return err
+	}
+
+	offLineAddr := plan.Plan[0].Plan[0].Source
+	err = c.DoMetaNodeOffline(offLineAddr)
+	if err != nil {
+		log.LogErrorf("DoMetaNodeOffline err: %s", err.Error())
+		return err
+	}
+
+	return nil
+}
+
+func (c *Cluster) DoMetaNodeOffline(offLineAddr string) (err error) {
+	metaNode, err := c.metaNode(offLineAddr)
+	if err != nil {
+		return err
+	}
+
+	metaNode.MigrateLock.Lock()
+	defer metaNode.MigrateLock.Unlock()
+
+	metaNode.ToBeOffline = true
+	defer func() {
+		metaNode.ToBeOffline = false
+	}()
+
+	mps := c.getAllMetaPartitionsByMetaNode(metaNode.Addr)
+	if len(mps) != 0 {
+		err = fmt.Errorf("metaNode[%s] has persistence meta partitions (%d)", metaNode.Addr, len(mps))
+		log.LogErrorf(err.Error())
+		return
+	}
+
+	if err = c.syncDeleteMetaNode(metaNode); err != nil {
+		msg := fmt.Sprintf("action[offlineMetaNode], clusterID[%v] node[%v] synDelMetaNode failed,err[%s]",
+			c.Name, offLineAddr, err.Error())
+		Warn(c.Name, msg)
+		return err
+	}
+
+	c.deleteMetaNodeFromCache(metaNode)
+	msg := fmt.Sprintf("action[offlineMetaNode],clusterID[%v] kickout node[%v] success", c.Name, offLineAddr)
+	Warn(c.Name, msg)
+
+	return nil
+}
+
+func convertStructToJson(low map[string]*proto.ZonePressureView) string {
+	body, err := json.Marshal(low)
+	if err != nil {
+		log.LogErrorf("Error to encode migrate plan: %s", err.Error())
+		return ""
+	}
+	return string(body)
+}
+
+func (c *Cluster) changeAndCheckMetaPartitionLeader(mrPlan *proto.MrBalanceInfo, mpPlan *proto.MetaBalancePlan, mp *MetaPartition) error {
+	for i := 0; i < CheckMetaLeaderRetry; i++ {
+		leader, err := mp.getMetaReplicaLeader()
+		if err != nil {
+			log.LogWarnf("metapartition[%d] has no leader", mp.PartitionID)
+			time.Sleep(CheckMetaLeaderInterval * time.Second)
+			continue
+		}
+		if leader.Addr != mrPlan.Source {
+			// the leader is not the source node, the meta partition can be migrated.
+			return nil
+		}
+
+		// try to change leader.
+		newLeader := selectOneLeaderAddr(mrPlan, mpPlan, mp)
+		if newLeader == "" {
+			err = fmt.Errorf("selectOneLeaderAddr mp[%d] source: %s failed", mp.PartitionID, mrPlan.Source)
+			log.LogErrorf(err.Error())
+			return err
+		}
+		err = mp.tryToChangeLeaderByHost(newLeader)
+		if err != nil {
+			log.LogErrorf("metapartition[%d] try to change leader to host[%s] failed, err[%s]",
+				mp.PartitionID, newLeader, err.Error())
+		}
+		time.Sleep(CheckMetaLeaderInterval * time.Second)
+	}
+	leader, err := mp.getMetaReplicaLeader()
+	if err != nil {
+		log.LogErrorf("metapartition[%d] has no leader", mp.PartitionID)
+		return err
+	}
+	return fmt.Errorf("after change leader %d times, it is still is %s. source: %s", CheckMetaLeaderRetry, leader.Addr, mrPlan.Source)
+}
+
+func selectOneLeaderAddr(mrPlan *proto.MrBalanceInfo, mpPlan *proto.MetaBalancePlan, mp *MetaPartition) string {
+	// Select one address which is not in the meta partition plan.
+	for _, replica := range mp.Replicas {
+		isSelected := true
+		for _, item := range mpPlan.Plan {
+			if item.Source == replica.Addr {
+				isSelected = false
+				break
+			}
+		}
+		if isSelected {
+			return replica.Addr
+		}
+	}
+
+	// Select one address which is not the current source address.
+	for _, replica := range mp.Replicas {
+		if mrPlan.Source != replica.Addr {
+			return replica.Addr
+		}
+	}
+
+	return ""
 }

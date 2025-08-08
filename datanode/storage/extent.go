@@ -35,6 +35,7 @@ import (
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/atomicutil"
 	"github.com/cubefs/cubefs/util/log"
+	"github.com/cubefs/cubefs/util/timeutil"
 )
 
 const (
@@ -51,7 +52,10 @@ const (
 	magicNumber   = byte('M')
 )
 
-var ErrNonBytecodeEncode = errors.New("non-bytecode serialization method")
+var (
+	ErrNonBytecodeEncode = errors.New("non-bytecode serialization method")
+	atime                uint64
+)
 
 func alignment(block []byte, AlignSize int) int {
 	return int(uintptr(unsafe.Pointer(&block[0])) & uintptr(AlignSize-1))
@@ -92,17 +96,14 @@ func (wparam *WriteParam) String() (m string) {
 }
 
 type ExtentInfo struct {
+	IsDeleted           bool   `json:"deleted"`
+	Crc                 uint32 `json:"Crc"`
 	FileID              uint64 `json:"fileId"`
 	Size                uint64 `json:"size"`
-	Crc                 uint32 `json:"Crc"`
-	IsDeleted           bool   `json:"deleted"`
 	ModifyTime          int64  `json:"modTime"` // random write not update modify time
-	AccessTime          int64  `json:"accessTime"`
-	Source              string `json:"src"`
 	SnapshotDataOff     uint64 `json:"snapSize"`
 	SnapPreAllocDataOff uint64 `json:"snapPreAllocSize"`
 	ApplyID             uint64 `json:"applyID"`
-	ApplySize           int64  `json:"ApplySize"`
 }
 
 func (ei *ExtentInfo) TotalSize() uint64 {
@@ -113,11 +114,7 @@ func (ei *ExtentInfo) TotalSize() uint64 {
 }
 
 func (ei *ExtentInfo) String() (m string) {
-	source := ei.Source
-	if source == "" {
-		source = "none"
-	}
-	return fmt.Sprintf("FileID(%v)_Size(%v)_IsDeleted(%v)_Source(%v)_MT(%d)_AT(%d)_CRC(%d)", ei.FileID, ei.Size, ei.IsDeleted, source, ei.ModifyTime, ei.AccessTime, ei.Crc)
+	return fmt.Sprintf("FileID(%v)_Size(%v)_IsDeleted(%v)_MT(%d)_CRC(%d)", ei.FileID, ei.Size, ei.IsDeleted, ei.ModifyTime, ei.Crc)
 }
 
 func MarshalBinarySlice(eiSlice []*ExtentInfo) (v []byte, err error) {
@@ -154,7 +151,8 @@ func (ei *ExtentInfo) MarshalBinaryWithBuffer(buff *bytes.Buffer) (err error) {
 	if err = binary.Write(buff, binary.BigEndian, ei.ModifyTime); err != nil {
 		return
 	}
-	if err = binary.Write(buff, binary.BigEndian, ei.AccessTime); err != nil {
+	// Compatible with older versions
+	if err = binary.Write(buff, binary.BigEndian, &atime); err != nil {
 		return
 	}
 	if err = binary.Write(buff, binary.BigEndian, ei.SnapPreAllocDataOff); err != nil {
@@ -222,7 +220,8 @@ func (ei *ExtentInfo) UnmarshalBinaryWithBuffer(buff *bytes.Buffer) (err error) 
 	if err = binary.Read(buff, binary.BigEndian, &ei.ModifyTime); err != nil {
 		return
 	}
-	if err = binary.Read(buff, binary.BigEndian, &ei.AccessTime); err != nil {
+	// Compatible with older versions
+	if err = binary.Read(buff, binary.BigEndian, &atime); err != nil {
 		return
 	}
 
@@ -243,21 +242,6 @@ func (ei *ExtentInfo) UnmarshalBinaryWithBuffer(buff *bytes.Buffer) (err error) 
 func (ei *ExtentInfo) UnmarshalBinary(v []byte) (err error) {
 	err = ei.UnmarshalBinaryWithBuffer(bytes.NewBuffer(v))
 	return
-}
-
-// SortedExtentInfos defines an array sorted by AccessTime
-type SortedExtentInfos []*ExtentInfo
-
-func (extInfos SortedExtentInfos) Len() int {
-	return len(extInfos)
-}
-
-func (extInfos SortedExtentInfos) Less(i, j int) bool {
-	return extInfos[i].AccessTime < extInfos[j].AccessTime
-}
-
-func (extInfos SortedExtentInfos) Swap(i, j int) {
-	extInfos[i], extInfos[j] = extInfos[j], extInfos[i]
 }
 
 // Extent is an implementation of Extent for local regular extent file data management.
@@ -344,8 +328,8 @@ func (e *Extent) InitToFS() (err error) {
 		e.dataSize = 0
 		return
 	}
-	atomic.StoreInt64(&e.modifyTime, time.Now().Unix())
-	atomic.StoreInt64(&e.accessTime, time.Now().Unix())
+	atomic.StoreInt64(&e.modifyTime, timeutil.GetCurrentTimeUnix())
+	atomic.StoreInt64(&e.accessTime, timeutil.GetCurrentTimeUnix())
 	e.dataSize = 0
 	return
 }
@@ -451,8 +435,7 @@ func (e *Extent) RestoreFromFS() (err error) {
 
 	atomic.StoreInt64(&e.modifyTime, info.ModTime().Unix())
 
-	ts := info.Sys().(*syscall.Stat_t)
-	atomic.StoreInt64(&e.accessTime, time.Unix(int64(ts.Atim.Sec), int64(ts.Atim.Nsec)).Unix())
+	atomic.StoreInt64(&e.accessTime, timeutil.GetCurrentTimeUnix())
 	return
 }
 
@@ -738,14 +721,19 @@ func (e *Extent) autoComputeExtentCrc(extSize int64, crcFunc UpdateCrcFunc) (crc
 		blockCnt += 1
 	}
 	log.LogDebugf("autoComputeExtentCrc. path %v extent %v extent size %v,blockCnt %v", e.filePath, e.extentID, extSize, blockCnt)
-	crcData := make([]byte, blockCnt*util.PerBlockCrcSize)
+	crcData := bytespool.Alloc(blockCnt * util.PerBlockCrcSize)
+	bdata := bytespool.Alloc(util.BlockSize)
+	defer func() {
+		bytespool.Free(crcData)
+		bytespool.Free(bdata)
+	}()
 	for blockNo := 0; blockNo < blockCnt; blockNo++ {
 		blockCrc := binary.BigEndian.Uint32(e.header[blockNo*util.PerBlockCrcSize : (blockNo+1)*util.PerBlockCrcSize])
 		if blockCrc != 0 {
 			binary.BigEndian.PutUint32(crcData[blockNo*util.PerBlockCrcSize:(blockNo+1)*util.PerBlockCrcSize], blockCrc)
 			continue
 		}
-		bdata := make([]byte, util.BlockSize)
+
 		offset := int64(blockNo * util.BlockSize)
 		readN, err := e.file.ReadAt(bdata[:util.BlockSize], offset)
 		if readN == 0 && err != nil {

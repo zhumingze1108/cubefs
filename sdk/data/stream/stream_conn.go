@@ -118,7 +118,7 @@ func NewStreamConn(dp *wrapper.DataPartition, follower bool, timeout time.Durati
 
 // String returns the string format of the stream connection.
 func (sc *StreamConn) String() string {
-	return fmt.Sprintf("Partition(%v) CurrentAddr(%v) Hosts(%v) LeaderAddr(%v) LocalIp(%v)", sc.dp.PartitionID, sc.currAddr, sc.dp.Hosts, sc.dp.LeaderAddr, sc.dp.ClientWrapper.LocalIp)
+	return fmt.Sprintf("Partition(%v) CurrentAddr(%v) Hosts(%v) LeaderAddr(%v)", sc.dp.PartitionID, sc.currAddr, sc.dp.Hosts, sc.dp.LeaderAddr)
 }
 
 func (sc *StreamConn) getRetryTimeOut() time.Duration {
@@ -133,7 +133,7 @@ func (sc *StreamConn) getRetryTimeOut() time.Duration {
 func (sc *StreamConn) Send(retry *bool, req *Packet, getReply GetReplyFunc) (err error) {
 	req.ExtentType |= proto.PacketProtocolVersionFlag
 	log.LogDebugf("sc details: " + sc.String())
-	if req.IsReadOperation() && !sc.dp.ClientWrapper.InnerReq() {
+	if req.IsReadOperation() && !sc.dp.ClientWrapper.InnerReq() && !sc.dp.ClientWrapper.FollowerRead() {
 		return sc.sendReadToDP(sc.dp, req, retry, getReply)
 	}
 	return sc.sendToDataPartitionLeader(req, retry, getReply)
@@ -141,7 +141,7 @@ func (sc *StreamConn) Send(retry *bool, req *Packet, getReply GetReplyFunc) (err
 
 func (sc *StreamConn) sendReadToDP(dp *wrapper.DataPartition, req *Packet, retry *bool, getReply GetReplyFunc) (err error) {
 	err = sc.sendToDataPartition(req, retry, getReply)
-	if err == nil || dp.ClientWrapper.FollowerRead() || err == proto.ErrCodeVersionOp || strings.Contains(err.Error(), "OpForbidErr") || err == ExtentNotFoundError {
+	if err == nil || err == proto.ErrCodeVersionOp || strings.Contains(err.Error(), "OpForbidErr") || err == ExtentNotFoundError {
 		return
 	}
 	log.LogWarnf("sendReadToDP: send to leader failed, try to read quorum, req (%v), dp(%v), err(%v)", req, dp, err)
@@ -239,7 +239,7 @@ func (sc *StreamConn) sendToDataPartition(req *Packet, retry *bool, getReply Get
 		}
 		log.LogWarnf("sendToDataPartition: try addr(%v) failed! reqPacket(%v) err(%v)", addr, req, err)
 	}
-	return errors.NewErrorf("sendToDataPartition Failed: sc(%v) reqPacket(%v)", sc, req)
+	return errors.NewErrorf("sendToDataPartition Failed: sc(%v) reqPacket(%v) err(%v)", sc, req, err)
 }
 
 func (sc *StreamConn) readActiveHosts(dp *wrapper.DataPartition, req *Packet, getReply GetReplyFunc) (err error) {

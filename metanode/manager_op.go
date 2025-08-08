@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,7 +128,21 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 			resp.Result = err.Error()
 			goto end
 		}
-		m.fileStatsEnable = req.FileStatsEnable
+		if !m.useLocalGOGC {
+			if m.gogcValue != req.MetaNodeGOGC && req.MetaNodeGOGC >= defaultGOGCLowerLimit && req.MetaNodeGOGC <= defaultGOGCUpperLimit {
+				oldGOGC := m.gogcValue
+				debug.SetGCPercent(req.MetaNodeGOGC)
+				m.gogcValue = req.MetaNodeGOGC
+				log.LogWarnf("[opMasterHeartbeat] change GOGC, old(%v) new(%v)", oldGOGC, req.MetaNodeGOGC)
+			}
+		}
+
+		if m.fileStatsConfig != nil {
+			m.fileStatsConfig.fileStatsEnable = req.FileStatsEnable
+			if len(req.FileStatsThresholds) != 0 {
+				m.updateFileStatsConfig(req.FileStatsThresholds)
+			}
+		}
 
 		log.LogDebugf("metaNode.raftPartitionCanUsingDifferentPort from %v to %v", m.metaNode.raftPartitionCanUsingDifferentPort, req.RaftPartitionCanUsingDifferentPortEnabled)
 		m.metaNode.raftPartitionCanUsingDifferentPort = req.RaftPartitionCanUsingDifferentPortEnabled
@@ -191,14 +206,17 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 				StatByMigrateStorageClass: partition.GetMigrateStatByStorageClass(),
 				ForbidWriteOpOfProtoVer0:  mpForbidWriteVer0,
 				LocalPeers:                mConf.Peers,
+				ReadOnlyReasons:           0,
 			}
 			mpr.TxCnt, mpr.TxRbInoCnt, mpr.TxRbDenCnt = partition.TxGetCnt()
 
 			if mConf.Cursor >= mConf.End {
 				mpr.Status = proto.ReadOnly
+				mpr.ReadOnlyReasons |= proto.MpCursorOutOfRange
 			}
 			if resp.Used > uint64(float64(resp.Total)*MaxUsedMemFactor) {
 				mpr.Status = proto.ReadOnly
+				mpr.ReadOnlyReasons |= proto.MetaMemUseLimit
 			}
 
 			addr, isLeader := partition.IsLeader()
@@ -1313,8 +1331,13 @@ func (m *metadataManager) opMetaExtentAddWithCheck(conn net.Conn, p *Packet,
 		return
 	}
 
-	if err = mp.ExtentAppendWithCheck(req, p); err != nil {
-		log.LogErrorf("%s [opMetaExtentAddWithCheck] ExtentAppendWithCheck: %s", remoteAddr, err.Error())
+	if err = mp.ExtentAppendWithCheck(req, p, remoteAddr); err != nil {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "over quota") {
+			log.LogWarnf("%s [opMetaExtentAddWithCheck] ExtentAppendWithCheck: %s", remoteAddr, errMsg)
+		} else {
+			log.LogErrorf("%s [opMetaExtentAddWithCheck] ExtentAppendWithCheck: %s", remoteAddr, errMsg)
+		}
 	}
 	m.updatePackRspSeq(mp, p)
 	if err = m.respondToClientWithVer(conn, p); err != nil {
@@ -1458,33 +1481,6 @@ func (m *metadataManager) opMetaExtentsTruncate(conn net.Conn, p *Packet,
 	return
 }
 
-func (m *metadataManager) opMetaClearInodeCache(conn net.Conn, p *Packet,
-	remoteAddr string,
-) (err error) {
-	req := &proto.ClearInodeCacheRequest{}
-	if err = json.Unmarshal(p.Data, req); err != nil {
-		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
-		m.respondToClientWithVer(conn, p)
-		err = errors.NewErrorf("[%v],req[%v],err[%v]", p.GetOpMsgWithReqAndResult(), req, string(p.Data))
-		return
-	}
-	mp, err := m.getPartition(req.PartitionID)
-	if err != nil {
-		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
-		m.respondToClientWithVer(conn, p)
-		err = errors.NewErrorf("[%v],req[%v],err[%v]", p.GetOpMsgWithReqAndResult(), req, string(p.Data))
-		return
-	}
-	if !m.serveProxy(conn, mp, p) {
-		return
-	}
-	err = mp.ClearInodeCache(req, p)
-	m.respondToClientWithVer(conn, p)
-	log.LogDebugf("%s [opMetaClearInodeCache] req: %d - %v, resp: %v, body: %s",
-		remoteAddr, p.GetReqID(), req, p.GetResultMsg(), p.Data)
-	return
-}
-
 // Delete a meta partition.
 func (m *metadataManager) opDeleteMetaPartition(conn net.Conn,
 	p *Packet, remoteAddr string,
@@ -1515,7 +1511,9 @@ func (m *metadataManager) opDeleteMetaPartition(conn net.Conn,
 	os.RemoveAll(conf.RootDir)
 	p.PacketOkReply()
 	m.respondToClientWithVer(conn, p)
-	runtime.GC()
+	go func() {
+		debug.FreeOSMemory()
+	}()
 	log.LogInfof("%s [opDeleteMetaPartition] req: %d - %v, resp: %v",
 		remoteAddr, p.GetReqID(), req, err)
 	return

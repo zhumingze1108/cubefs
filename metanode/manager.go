@@ -95,7 +95,7 @@ type metadataManager struct {
 	mu                   sync.RWMutex
 	partitions           map[uint64]MetaPartition // Key: metaRangeId, Val: metaPartition
 	metaNode             *MetaNode
-	fileStatsEnable      bool
+	fileStatsConfig      *fileStatsConfig
 	curQuotaGoroutineNum int32
 	maxQuotaGoroutineNum int32
 	cpuUtil              atomicutil.Float64
@@ -103,6 +103,8 @@ type metadataManager struct {
 	volUpdating          *sync.Map // map[string]*verOp2Phase
 	verUpdateChan        chan string
 	enableGcTimer        bool
+	useLocalGOGC         bool
+	gogcValue            int
 	gcRecyclePercent     float64
 	gcTimer              *util.RecycleTimer
 }
@@ -128,7 +130,7 @@ func (m *metadataManager) getDataPartitions(volName string) (view *proto.DataPar
 func (m *metadataManager) getVolumeView(volName string) (view *proto.SimpleVolView, err error) {
 	view, err = masterClient.AdminAPI().GetVolumeSimpleInfo(volName)
 	if err != nil {
-		log.LogErrorf("action[getVolumeView]: failed to get view of volume %v", volName)
+		log.LogWarnf("action[getVolumeView]: failed to get view of volume %v", volName)
 	}
 	return
 }
@@ -155,7 +157,7 @@ func (m *metadataManager) updateVolumes() {
 		vol := k.(string)
 		dataView, volView, err := m.getVolumeUpdateInfo(vol)
 		if err != nil {
-			log.LogErrorf("action[updateVolumes]: failed to update volume %v err %v", vol, err)
+			log.LogWarnf("action[updateVolumes]: failed to update volume %v err %v", vol, err)
 			return true
 		}
 		dataViews[vol] = dataView
@@ -312,8 +314,6 @@ func (m *metadataManager) HandleMetadataOperation(conn net.Conn, p *Packet, remo
 		err = m.opMetaBatchExtentsAdd(conn, p, remoteAddr)
 	case proto.OpMetaBatchObjExtentsAdd:
 		err = m.opMetaBatchObjExtentsAdd(conn, p, remoteAddr)
-	case proto.OpMetaClearInodeCache:
-		err = m.opMetaClearInodeCache(conn, p, remoteAddr)
 	case proto.OpMetaUpdateInodeMeta:
 		err = m.opMetaUpdateInodeMeta(conn, p, remoteAddr)
 	case proto.OpFreezeEmptyMetaPartition:
@@ -529,6 +529,7 @@ func (m *metadataManager) startSnapshotVersionPromote() {
 // onStart creates the connection pool and loads the partitions.
 func (m *metadataManager) onStart() (err error) {
 	m.connPool = util.NewConnectPool()
+	m.initFileStatsConfig()
 	err = m.loadPartitions()
 	if err != nil {
 		return
@@ -862,6 +863,7 @@ func NewMetadataManager(conf MetadataManagerConfig, metaNode *MetaNode) Metadata
 		metaNode:             metaNode,
 		maxQuotaGoroutineNum: defaultMaxQuotaGoroutine,
 		volUpdating:          new(sync.Map),
+		gogcValue:            DefaultGOGCValue,
 		enableGcTimer:        conf.EnableGcTimer,
 		gcRecyclePercent:     conf.GcRecyclePercent,
 	}
