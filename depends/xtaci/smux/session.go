@@ -27,6 +27,7 @@ type writeRequest struct {
 	prio   uint32
 	frame  Frame
 	result chan writeResult
+	stop   chan struct{}
 }
 
 type writeResult struct {
@@ -78,6 +79,8 @@ type Session struct {
 
 	shaper chan writeRequest // a shaper for writing
 	writes chan writeRequest
+
+	frameLock sync.Mutex
 }
 
 func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
@@ -453,6 +456,16 @@ func (s *Session) sendLoop() {
 		case <-s.die:
 			return
 		case request := <-s.writes:
+
+			s.frameLock.Lock()
+			select {
+			case <-request.stop:
+				close(request.result)
+				s.frameLock.Unlock()
+				continue
+			default:
+			}
+
 			buf[0] = request.frame.ver
 			buf[1] = request.frame.cmd
 			binary.LittleEndian.PutUint16(buf[2:], uint16(len(request.frame.data)))
@@ -462,8 +475,10 @@ func (s *Session) sendLoop() {
 				vec[0] = buf[:headerSize]
 				vec[1] = request.frame.data
 				n, err = bw.WriteBuffers(vec)
+				s.frameLock.Unlock() // unlock after write to buf
 			} else {
 				copy(buf[headerSize:], request.frame.data)
+				s.frameLock.Unlock() // unlock after copy data
 				n, err = s.conn.Write(buf[:headerSize+len(request.frame.data)])
 			}
 
@@ -485,6 +500,7 @@ func (s *Session) sendLoop() {
 				s.notifyWriteError(err)
 				return
 			}
+
 		}
 	}
 }
@@ -496,12 +512,24 @@ func (s *Session) writeFrame(f Frame) (n int, err error) {
 }
 
 // internal writeFrame version to support deadline used in keepalive
-func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, prio uint32) (int, error) {
+func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, prio uint32) (n int, err error) {
 	req := writeRequest{
 		prio:   prio,
 		frame:  f,
 		result: make(chan writeResult, 1),
+		stop:   make(chan struct{}),
 	}
+
+	defer func() {
+		if err != nil {
+			s.frameLock.Lock()
+			close(req.stop)
+			s.frameLock.Unlock()
+			return
+		}
+		close(req.stop)
+	}()
+
 	select {
 	case s.shaper <- req:
 	case <-s.die:
