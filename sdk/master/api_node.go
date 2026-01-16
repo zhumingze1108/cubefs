@@ -207,9 +207,13 @@ func (api *NodeAPI) QueryDecommissionedDisks(addr string) (disks *proto.Decommis
 	return
 }
 
-func (api *NodeAPI) QueryDecommissionSuccessDisks(addr string) (disks *proto.DecommissionedDisks, err error) {
-	disks = &proto.DecommissionedDisks{}
-	err = api.mc.requestWith(disks, newRequest(get, proto.QueryDecommissionSuccessDisk).Header(api.h).addParam("addr", addr))
+func (api *NodeAPI) QueryDecommissionSuccessDisks() (disks []proto.DecommissionedDisks, err error) {
+	err = api.mc.requestWith(&disks, newRequest(get, proto.QueryDecommissionSuccessDisks).Header(api.h))
+	return
+}
+
+func (api *NodeAPI) QueryLostDisks() (disks []proto.DecommissionedDisks, err error) {
+	err = api.mc.requestWith(&disks, newRequest(get, proto.QueryLostDisks).Header(api.h))
 	return
 }
 

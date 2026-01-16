@@ -800,6 +800,7 @@ type BadDiskRecoverProgress struct {
 type BadDiskInfo struct {
 	Address              string
 	Path                 string
+	CanReplace           bool
 	TotalPartitionCnt    int
 	DiskErrPartitionList []uint64
 }

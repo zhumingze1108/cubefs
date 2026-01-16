@@ -148,6 +148,11 @@ const (
 
 	AdminGetUpgradeCompatibleSettings = "/admin/getUpgradeCompatibleSettings"
 
+	// query disk information api
+	QueryDecommissionSuccessDisks = "/admin/queryDecommissionSuccessDisks"
+	QueryLostDisks                = "/admin/queryLostDisks"
+	QueryBadDisks                 = "/admin/queryBadDisks"
+
 	// graphql coonsole api
 	ConsoleIQL        = "/iql"
 	ConsoleLoginAPI   = "/login"
@@ -202,7 +207,6 @@ const (
 	PauseDecommissionDisk                     = "/disk/pauseDecommission"
 	CancelDecommissionDisk                    = "/disk/cancelDecommission"
 	QueryDecommissionDiskDecoFailedDps        = "/disk/queryDecommissionFailedDps"
-	QueryBadDisks                             = "/disk/queryBadDisks"
 	QueryDisks                                = "/disk/queryDisks"
 	QueryDiskDetail                           = "/disk/detail"
 	RestoreStoppedAutoDecommissionDisk        = "/disk/restoreStoppedAutoDecommissionDisk"
@@ -272,8 +276,7 @@ const (
 
 	AddLcNode = "/lcNode/add"
 
-	QueryDisableDisk             = "/dataNode/queryDisableDisk"
-	QueryDecommissionSuccessDisk = "/dataNode/queryDecommissionSuccessDisk"
+	QueryDisableDisk = "/dataNode/queryDisableDisk"
 	// Operation response
 	GetMetaNodeTaskResponse = "/metaNode/response" // Method: 'POST', ContentType: 'application/json'
 	GetDataNodeTaskResponse = "/dataNode/response" // Method: 'POST', ContentType: 'application/json'

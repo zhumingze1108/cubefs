@@ -2398,15 +2398,15 @@ func (s *DataNode) handlePacketToReloadDisk(p *repl.Packet) {
 	}
 	log.LogWarnf("action[handlePacketToReloadDisk] try reload disk %v req %v", request.DiskPath, task.RequestID)
 
-	disk, err := s.space.GetDisk(request.DiskPath)
+	_, err = s.space.GetDisk(request.DiskPath)
 	if err != nil {
 		log.LogErrorf("action[handlePacketToReloadDisk] disk(%v) is not found err(%v).", request.DiskPath, err)
 		return
 	}
 
-	if !disk.isLost {
-		err = errors.NewErrorf("disk(%v) is not lost", request.DiskPath)
-		log.LogErrorf("action[handlePacketToReloadDisk] disk(%v) is not lost", request.DiskPath)
+	if s.mustMount && !isMountPoint(request.DiskPath) {
+		err = errors.NewErrorf("disk(%v) is not mounted", request.DiskPath)
+		log.LogErrorf("action[handlePacketToReloadDisk] disk(%v) is not mounted, reload failed", request.DiskPath)
 		return
 	}
 

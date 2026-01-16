@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -53,6 +54,8 @@ func newClusterCmd(client *master.MasterClient) *cobra.Command {
 		newClusterChangeMasterLeaderCmd(client),
 		newClusterQueryDistributionOptimizationStatusCmd(client),
 		newClusterQueryDpDecommissionStatusCmd(client),
+		newClusterQueryDecommissionSuccessDisksCmd(client),
+		newClusterQueryLostDisksCmd(client),
 	)
 	return clusterCmd
 }
@@ -85,6 +88,8 @@ const (
 	cmdQueryDiskOpShort                          = "query Disk_op information of a cluster"
 	cmdQueryClusterDistributionOptimizationShort = "query distribution optimization status"
 	cmdQueryDpDecommissionStatusShort            = "query data partition decommission status by type"
+	cmdQueryClusterDecommissionSuccessDisksShort = "query all decommission success disks"
+	cmdQueryClusterLostDisksShort                = "query all lost disks"
 )
 
 func newClusterInfoCmd(client *master.MasterClient) *cobra.Command {
@@ -1200,5 +1205,53 @@ Decommission types:
 	}
 	cmd.Flags().IntVar(&decommissionType, "type", 0, "Decommission type (required)")
 	cmd.MarkFlagRequired("type")
+	return cmd
+}
+
+func newClusterQueryDecommissionSuccessDisksCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   CliOpQueryDecommissionSuccessDisks,
+		Short: cmdQueryClusterDecommissionSuccessDisksShort,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			disks, err := client.NodeAPI().QueryDecommissionSuccessDisks()
+			if err != nil {
+				stdout("%v", err)
+				return err
+			}
+			sort.SliceStable(disks, func(i, j int) bool { return disks[i].Node < disks[j].Node })
+			stdoutln("[DecommissionSuccess disks]")
+			for _, item := range disks {
+				stdoutln(item.Node)
+				for _, disk := range item.Disks {
+					stdout("  %v\n", disk)
+				}
+			}
+			return nil
+		},
+	}
+	return cmd
+}
+
+func newClusterQueryLostDisksCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   CliOpQueryLostDisks,
+		Short: cmdQueryClusterLostDisksShort,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			disks, err := client.NodeAPI().QueryLostDisks()
+			if err != nil {
+				stdout("%v", err)
+				return err
+			}
+			sort.SliceStable(disks, func(i, j int) bool { return disks[i].Node < disks[j].Node })
+			stdoutln("[Lost disks]")
+			for _, item := range disks {
+				stdoutln(item.Node)
+				for _, disk := range item.Disks {
+					stdout("  %v\n", disk)
+				}
+			}
+			return nil
+		},
+	}
 	return cmd
 }

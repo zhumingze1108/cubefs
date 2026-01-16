@@ -1168,3 +1168,28 @@ func checkDiskPathWithMaster(diskPath string, id uint64, infos map[uint64]string
 	}
 	return false
 }
+
+// IsMountPoint checks if the target path is a mount point by comparing
+// the device ID of the path with its parent directory.
+// If they differ, it indicates the path is on a different filesystem (i.e., a mount point).
+func isMountPoint(path string) bool {
+	var stat1, stat2 os.FileInfo
+
+	stat1, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	stat2, err = os.Lstat(filepath.Dir(path))
+	if err != nil {
+		return false
+	}
+	// Symbolic links are not mount points
+	if stat1.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+
+	dev1 := stat1.Sys().(*syscall.Stat_t).Dev
+	dev2 := stat2.Sys().(*syscall.Stat_t).Dev
+
+	return dev1 != dev2
+}

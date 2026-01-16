@@ -215,7 +215,7 @@ func (manager *SpaceManager) StartDiskSample() {
 
 func (manager *SpaceManager) StartCheckDiskLost() {
 	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
+		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 
 		for range ticker.C {
@@ -226,36 +226,31 @@ func (manager *SpaceManager) StartCheckDiskLost() {
 
 func (manager *SpaceManager) checkAllDisksLost() {
 	manager.diskMutex.Lock()
-	var (
-		lostPaths      []string
-		recoveredPaths []string
-	)
+	var lostPaths []string
+
+	mustMount := manager.dataNode.mustMount
 
 	for _, disk := range manager.disks {
-		path := path.Join(disk.Path, DiskStatusFile)
-		if _, err := os.Stat(path); err != nil {
-			if disk.isLost {
-				continue
-			}
+		if mustMount && !isMountPoint(disk.Path) && !disk.isLost {
+			log.LogErrorf("[checkAllDisksLost] Disk %s is lost", disk.Path)
+			lostPaths = append(lostPaths, disk.Path)
+			continue
+		}
+
+		statusPath := path.Join(disk.Path, DiskStatusFile)
+		if _, err := os.Stat(statusPath); err != nil && !disk.isLost {
 			if os.IsNotExist(err) || os.IsPermission(err) {
 				log.LogErrorf("[checkAllDisksLost] Disk %s is lost: %v", disk.Path, err)
 				lostPaths = append(lostPaths, disk.Path)
 			} else {
-				log.LogErrorf("[checkAllDisksLost] Failed to check disk %s,err %v", disk.Path, err)
+				log.LogErrorf("[checkAllDisksLost] Failed to check disk %s, err %v", disk.Path, err)
 			}
-		} else if disk.isLost {
-			log.LogWarnf("[checkAllDisksLost] Lost disk %s enter recover process", disk.Path)
-			recoveredPaths = append(recoveredPaths, disk.Path)
 		}
 	}
 	manager.diskMutex.Unlock()
 
 	for _, path := range lostPaths {
 		manager.processLostDisk(path)
-	}
-
-	for _, path := range recoveredPaths {
-		manager.reloadDisk(path)
 	}
 }
 
@@ -292,9 +287,9 @@ func (manager *SpaceManager) processLostDisk(path string) {
 
 func (manager *SpaceManager) reloadDisk(path string) (err error) {
 	manager.diskMutex.Lock()
-	defer manager.diskMutex.Unlock()
 	disk, exists := manager.disks[path]
 	if !exists {
+		manager.diskMutex.Unlock()
 		log.LogErrorf("[reloadDisk] Failed to reload disk %s, err %v", path, err)
 		return fmt.Errorf("disk not found")
 	}
@@ -302,7 +297,15 @@ func (manager *SpaceManager) reloadDisk(path string) (err error) {
 	log.LogWarnf("[reloadDisk] Disk %s reload start.", path)
 	delete(manager.disks, path)
 	manager.diskList = removeDiskFromList(manager.diskList, path)
+	manager.diskMutex.Unlock()
 	log.LogWarnf("[reloadDisk] Removed disk record: %s", path)
+
+	for _, partition := range disk.partitionMap {
+		manager.DetachDataPartition(partition.partitionID)
+		partition.Stop()
+		partition.Disk().DetachDataPartition(partition)
+		log.LogWarnf("[reloadDisks] data partition %v is detached", partition.partitionID)
+	}
 
 	diskParams := struct {
 		path        string

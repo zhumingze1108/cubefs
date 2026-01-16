@@ -413,17 +413,4 @@ func TestReloadDisk(t *testing.T) {
 		require.Equal(t, proto.OpIntraGroupNetErr, p.ResultCode)
 		require.Contains(t, string(p.Data), "not exist")
 	})
-
-	t.Run("reload unlost disk", func(t *testing.T) {
-		disk.isLost = false
-		req := &proto.ReloadDiskRequest{DiskPath: testDiskPath}
-		task := &proto.AdminTask{
-			OpCode:  proto.OpReloadDisk,
-			Request: req,
-		}
-		p := newPacketForTest(task)
-		dn.handlePacketToReloadDisk(p)
-		require.Equal(t, proto.OpIntraGroupNetErr, p.ResultCode)
-		require.Contains(t, string(p.Data), "not lost")
-	})
 }

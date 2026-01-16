@@ -95,6 +95,7 @@ const (
 	ConfigKeyLogDir        = "logDir"          // string
 
 	ConfigKeyDiskPath         = "diskPath"            // string
+	ConfigKeyMustMount        = "mustMount"           // bool - require disks to be mount points
 	configNameResolveInterval = "nameResolveInterval" // int
 
 	/*
@@ -191,6 +192,7 @@ type DataNode struct {
 	tickInterval                       int
 	raftRecvBufSize                    int
 	startTime                          int64
+	mustMount                          bool // Require disks to be mount points (true for production, false for dev/test)
 	// localIP         string
 
 	tcpListener net.Listener
@@ -545,10 +547,14 @@ func (s *DataNode) parseConfig(cfg *config.Config) (err error) {
 
 	s.ExtentCacheTtlByMin = cfg.GetIntWithDefault(ConfigExtentCacheTtlByMin, DefaultExtentCacheTtlByMin)
 
+	// Load mustMount configuration, default to false for backward compatibility
+	s.mustMount = cfg.GetBoolWithDefault(ConfigKeyMustMount, false)
+
 	log.LogDebugf("action[parseConfig] load masterAddrs(%v).", MasterClient.Nodes())
 	log.LogDebugf("action[parseConfig] load port(%v).", s.port)
 	log.LogDebugf("action[parseConfig] load zoneName(%v), rack(%v).", s.zoneName, s.rack)
 	log.LogDebugf("action[parseConfig] load mediaType(%v).", s.mediaType)
+	log.LogDebugf("action[parseConfig] load mustMount(%v).", s.mustMount)
 	syslog.Printf("action[parseConfig] load poolId(%d), mediaType(%v), zoneName(%v), rack(%v).", s.poolId, s.mediaType, s.zoneName, s.rack)
 	return
 }
@@ -755,7 +761,8 @@ func (s *DataNode) startSpaceManager(cfg *config.Config) (err error) {
 	wg.Wait()
 
 	for diskPath := range disks {
-		if _, ok := diskReservedSpace[diskPath]; !ok {
+		_, ok := diskReservedSpace[diskPath]
+		if !s.mustMount && !ok {
 			log.LogErrorf("[startSpaceManager] diskPath %v in config is missing", diskPath)
 			continue
 		}
