@@ -777,7 +777,6 @@ func (mp *metaPartition) Snapshot() (snap raftproto.Snapshot, err error) {
 
 func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.SnapIterator) (err error) {
 	var (
-		data          []byte
 		index         int
 		appIndexID    uint64
 		txID          uint64
@@ -938,9 +937,6 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		log.LogErrorf("ApplySnapshot: stop with error: partitionID(%v) err(%v)", mp.config.PartitionId, err)
 	}()
 
-	var leaderSnapFormatVer uint32
-	leaderSnapFormatVer = math.MaxUint32
-
 	var (
 		batchItems = 0
 		batchBytes = 0
@@ -968,20 +964,64 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		return nil
 	}
 
-	for {
-		nextStart := time.Now()
-		data, err = iter.Next()
-		if err != nil {
-			if err != io.EOF {
-				log.LogErrorf("ApplySnapshot: iter.Next failed, partitionID(%v) index(%v) appIndexID(%v) err(%v)",
-					mp.config.PartitionId, index, appIndexID, err)
+	// Use 2-stage pipeline: Producer (iter.Next) -> Consumer (decode + replay)
+	type snapshotItem struct {
+		data  []byte
+		index int
+	}
+
+	const itemChSize = 10
+	itemCh := make(chan *snapshotItem, itemChSize)
+	errCh := make(chan error, 1)
+	leaderSnapFormatVer := uint32(math.MaxUint32)
+
+	// Producer: read from iter and decode
+	go func() {
+		defer close(itemCh)
+		var (
+			idx = 0
+		)
+		for {
+			nextStart := time.Now()
+			data, err := iter.Next()
+			if err != nil {
+				if err != io.EOF {
+					log.LogErrorf("ApplySnapshot: iter.Next failed, partitionID(%v) index(%v) appIndexID(%v) err(%v)",
+						mp.config.PartitionId, idx, appIndexID, err)
+				}
+				errCh <- err
+				return
 			}
-			return
+			nextCost := time.Since(nextStart)
+			if nextCost >= applySnapSlowNextThreshold {
+				log.LogWarnf("ApplySnapshot: iter.Next slow, partitionID(%v) index(%v) appIndexID(%v) cost(%s)",
+					mp.config.PartitionId, idx, appIndexID, nextCost.String())
+			}
+
+			if mp.raftClosed() {
+				log.LogWarnf("ApplySnapshot: partition(%v) is closed, exit now", mp.config.PartitionId)
+				errCh <- fmt.Errorf("partition(%v) is closed", mp.config.PartitionId)
+				return
+			}
+
+			if idx == 0 {
+				appIndexID = binary.BigEndian.Uint64(data)
+				log.LogDebugf("ApplySnapshot: partitionID(%v), temporary uint64 appIndexID:%v", mp.config.PartitionId, appIndexID)
+			}
+
+			item := &snapshotItem{data: data, index: idx}
+			idx++
+			itemCh <- item
 		}
-		nextCost := time.Since(nextStart)
-		if nextCost >= applySnapSlowNextThreshold {
-			log.LogWarnf("ApplySnapshot: iter.Next slow, partitionID(%v) index(%v) appIndexID(%v) cost(%s)",
-				mp.config.PartitionId, index, appIndexID, nextCost.String())
+	}()
+
+	// Consumer: serialize and put
+	for item := range itemCh {
+		// Check for producer error
+		select {
+		case err = <-errCh:
+			return
+		default:
 		}
 
 		if mp.raftClosed() {
@@ -990,11 +1030,8 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 			return
 		}
 
-		if index == 0 {
-			appIndexID = binary.BigEndian.Uint64(data)
-			log.LogDebugf("ApplySnapshot: partitionID(%v), temporary uint64 appIndexID:%v", mp.config.PartitionId, appIndexID)
-		}
-
+		index = item.index
+		data := item.data
 		snap := NewMetaItem(0, nil, nil)
 		if err = snap.UnmarshalBinary(data); err != nil {
 			if index == 0 {
@@ -1002,37 +1039,31 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				// will cause snap.UnmarshalBinary err, then just skip index=0 and continue with the other fields
 				log.LogInfof("ApplySnapshot: snap.UnmarshalBinary failed in index=0, partitionID(%v), assuming snapshot format version_0",
 					mp.config.PartitionId)
-				index++
 				leaderSnapFormatVer = SnapFormatVersion_0
 				continue
 			}
-
-			log.LogInfof("ApplySnapshot: snap.UnmarshalBinary failed, partitionID(%v) index(%v)", mp.config.PartitionId, index)
-			err = errors.New("unmarshal snap data failed")
+			log.LogInfof("ApplySnapshot: snap.UnmarshalBinary failed, partitionID(%v) index(%v) err(%v)", mp.config.PartitionId, index, err)
+			err = fmt.Errorf("unmarshal snap data failed: %w", err)
 			return
 		}
 
 		if index == 0 {
 			if snap.Op != opFSMSnapFormatVersion {
 				// check whether the snapshot format matches, if snap.UnmarshalBinary has no err for index 0, it should be opFSMSnapFormatVersion
-				err = fmt.Errorf("ApplySnapshot: snapshot format not match, partitionID(%v), index:%v, expect snap.Op:%v, actual snap.Op:%v",
+				err = fmt.Errorf("snapshot format not match, partitionID(%v), index:%v, expect snap.Op:%v, actual snap.Op:%v",
 					mp.config.PartitionId, index, opFSMSnapFormatVersion, snap.Op)
-				log.LogWarn(err.Error())
+				log.LogWarnf("ApplySnapshot: %v", err.Error())
 				return
 			}
-
 			// check whether the snapshot format version number matches
 			leaderSnapFormatVer = binary.BigEndian.Uint32(snap.V)
 			if leaderSnapFormatVer != mp.manager.metaNode.raftSyncSnapFormatVersion {
 				log.LogWarnf("ApplySnapshot: snapshot format not match, partitionID(%v), index:%v, expect ver:%v, actual ver:%v",
 					mp.config.PartitionId, index, mp.manager.metaNode.raftSyncSnapFormatVersion, leaderSnapFormatVer)
 			}
-
-			index++
 			continue
 		}
 
-		index++
 		switch snap.Op {
 		case opFSMApplyId:
 			appIndexID = binary.BigEndian.Uint64(snap.V)
@@ -1154,7 +1185,6 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				return
 			}
 			log.LogDebugf("ApplySnapshot: write snap uniqChecker")
-
 		default:
 			if leaderSnapFormatVer != math.MaxUint32 && leaderSnapFormatVer > mp.manager.metaNode.raftSyncSnapFormatVersion {
 				log.LogWarnf("ApplySnapshot: unknown op=%d, leaderSnapFormatVer:%v, mySnapFormatVer:%v, skip it",
@@ -1165,9 +1195,8 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 			}
 		}
 
-		// Batch commit to RocksDB to avoid long stalls between iter.Next() calls.
 		batchItems++
-		batchBytes += len(data)
+		batchBytes += len(snap.K) + len(snap.V)
 
 		needFlush := batchItems >= applySnapBatchMaxItems ||
 			batchBytes >= applySnapBatchMaxBytes
@@ -1176,11 +1205,17 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				return
 			}
 		}
-		nextCost = time.Since(nextStart)
-		if nextCost >= applySnapSlowNextThreshold {
-			log.LogWarnf("ApplySnapshot: write slow, partitionID(%v) index(%v) appIndexID(%v) needFlush(%v) cost(%s)",
-				mp.config.PartitionId, index, appIndexID, needFlush, nextCost.String())
-		}
+	}
+
+	// Check final error from producer
+	select {
+	case err = <-errCh:
+		// err is io.EOF for normal completion
+		return
+	default:
+		// Channel closed without error
+		err = io.EOF
+		return
 	}
 }
 
