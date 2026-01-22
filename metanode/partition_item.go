@@ -132,6 +132,8 @@ const (
 
 	// version since transaction feature, added formatVersion, txId and cursor in MetaItemIterator struct
 	SnapFormatVersion_1
+
+	snapshotDataChBufferSize = 10
 )
 
 // MetaItemIterator defines the iterator of the MetaItem.
@@ -203,7 +205,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		return nil, errors.NewErrorf("get mp[%v] tree snap failed", mp.config.PartitionId)
 	}
 
-	si.dataCh = make(chan interface{})
+	si.dataCh = make(chan interface{}, snapshotDataChBufferSize)
 	si.errorCh = make(chan error, 1)
 	si.closeCh = make(chan struct{})
 
@@ -416,20 +418,29 @@ func (si *MetaItemIterator) Next() (data []byte, err error) {
 		return
 	}
 	var item interface{}
-	var open bool
-	select {
-	case item, open = <-si.dataCh:
-	case err, open = <-si.errorCh:
-	}
-	if item == nil || !open {
-		err, si.err = io.EOF, io.EOF
-		si.Close()
-		return
-	}
-	if err != nil {
-		si.err = err
-		si.Close()
-		return
+	for {
+		var open bool
+		select {
+		case item, open = <-si.dataCh:
+			if item == nil || !open {
+				err, si.err = io.EOF, io.EOF
+				si.Close()
+				return
+			}
+		case err, open = <-si.errorCh:
+			if !open {
+				// Disable error channel after it's closed so remaining dataCh items can drain.
+				si.errorCh = nil
+				continue
+			}
+			if err != nil {
+				si.err = err
+				si.Close()
+				return
+			}
+			continue
+		}
+		break
 	}
 
 	var snap *MetaItem
