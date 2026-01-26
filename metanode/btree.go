@@ -135,6 +135,7 @@ type InodeTree interface {
 	Update(handle interface{}, inode *Inode) error
 	Insert(handle interface{}, inode *Inode) error
 	ReplaceOrInsert(handle interface{}, inode *Inode, replace bool) (*Inode, bool, error)
+	Insert(handle interface{}, inode *Inode) error
 	Delete(handle interface{}, inode *Inode) (bool, error)
 	Range(start, end *Inode, cb func(i *Inode) bool) error
 	Count() uint64
@@ -153,6 +154,7 @@ type DentryTree interface {
 	Put(handle interface{}, dentry *Dentry) error
 	Insert(handle interface{}, dentry *Dentry) error
 	ReplaceOrInsert(handle interface{}, dentry *Dentry, replace bool) (*Dentry, bool, error)
+	Insert(handle interface{}, dentry *Dentry) error
 	Delete(handle interface{}, dentry *Dentry) (bool, error)
 	Range(start, end *Dentry, cb func(d *Dentry) bool) error
 	RangeWithPrefix(prefix, start, end *Dentry, cb func(d *Dentry) bool) error
@@ -169,6 +171,7 @@ type ExtendTree interface {
 	Update(handle interface{}, extend *Extend) error
 	Insert(handle interface{}, ext *Extend) error
 	ReplaceOrInsert(handle interface{}, ext *Extend, replace bool) (*Extend, bool, error)
+	Insert(handle interface{}, extend *Extend) error
 	Delete(handle interface{}, extend *Extend) (bool, error)
 	Range(start, end *Extend, cb func(e *Extend) bool) error
 	RealCount() uint64
@@ -184,6 +187,7 @@ type MultipartTree interface {
 	Update(handle interface{}, mutipart *Multipart) error
 	Insert(handle interface{}, mul *Multipart) error
 	ReplaceOrInsert(handle interface{}, mul *Multipart, replace bool) (*Multipart, bool, error)
+	Insert(handle interface{}, mul *Multipart) error
 	Delete(handle interface{}, mutipart *Multipart) (bool, error)
 	Range(start, end *Multipart, cb func(m *Multipart) bool) error
 	RangeWithPrefix(prefix, start, end *Multipart, cb func(m *Multipart) bool) error
@@ -201,6 +205,7 @@ type TransactionTree interface {
 	Update(handle interface{}, tx *proto.TransactionInfo) error
 	Insert(handle interface{}, tx *proto.TransactionInfo) error
 	ReplaceOrInsert(handle interface{}, tx *proto.TransactionInfo, replace bool) (*proto.TransactionInfo, bool, error)
+	Insert(handle interface{}, tx *proto.TransactionInfo) error
 	Delete(handle interface{}, txId string) (bool, error)
 	Range(start, end *proto.TransactionInfo, cb func(t *proto.TransactionInfo) bool) error
 	RealCount() uint64

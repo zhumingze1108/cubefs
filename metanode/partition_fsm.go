@@ -775,27 +775,30 @@ func (mp *metaPartition) Snapshot() (snap raftproto.Snapshot, err error) {
 	return
 }
 
+const (
+	// Reduce snapshot apply tail-latency by batching RocksDB commits.
+	// This avoids "each record commit" that can block for a long time (flush/compaction),
+	// which in turn can stall iter.Next() and trigger leader-side write timeouts.
+	applySnapBatchMaxItems       = 10000
+	applySnapBatchMaxBytes       = 64 * 1024 * 1024
+	applySnapSlowNextThreshold   = 5 * time.Second
+	applySnapSlowCommitThreshold = 5 * time.Second
+	itemChSize                   = 10
+)
+
 func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.SnapIterator) (err error) {
 	var (
-		index         int
-		appIndexID    uint64
-		txID          uint64
-		uniqID        uint64
-		cursor        uint64
-		uniqChecker   = newUniqChecker()
-		verList       []*proto.VolVersionInfo
-		dbWriteHandle interface{}
+		index       int
+		appIndexID  uint64
+		txID        uint64
+		uniqID      uint64
+		cursor      uint64
+		uniqChecker = newUniqChecker()
+		verList     []*proto.VolVersionInfo
+		batchItems  = 0
+		batchBytes  = 0
 	)
-	const (
-		// Reduce snapshot apply tail-latency by batching RocksDB commits.
-		// This avoids "each record commit" that can block for a long time (flush/compaction),
-		// which in turn can stall iter.Next() and trigger leader-side write timeouts.
-		applySnapBatchMaxItems = 10000
-		applySnapBatchMaxBytes = 64 * 1024 * 1024
 
-		applySnapSlowNextThreshold   = 5 * time.Second
-		applySnapSlowCommitThreshold = 5 * time.Second
-	)
 	// NOTE: clear mp
 	err = mp.Clear()
 	if err != nil {
@@ -804,7 +807,7 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 	}
 
 	// NOTE: open write batch for write
-	dbWriteHandle, err = mp.inodeTree.CreateBatchWriteHandle()
+	dbWriteHandle, err := mp.inodeTree.CreateBatchWriteHandle()
 	if err != nil {
 		log.LogErrorf("ApplySnapshot: metaPartition(%v) create batch write handle failed:%v", mp.config.PartitionId, err)
 		return
@@ -937,11 +940,6 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		log.LogErrorf("ApplySnapshot: stop with error: partitionID(%v) err(%v)", mp.config.PartitionId, err)
 	}()
 
-	var (
-		batchItems = 0
-		batchBytes = 0
-	)
-
 	flushBatch := func(forceCommitApplyID bool) error {
 		start := time.Now()
 		if err := mp.inodeTree.CommitBatchWrite(dbWriteHandle, forceCommitApplyID); err != nil {
@@ -970,7 +968,6 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		index int
 	}
 
-	const itemChSize = 10
 	itemCh := make(chan *snapshotItem, itemChSize)
 	errCh := make(chan error, 1)
 	leaderSnapFormatVer := uint32(math.MaxUint32)
@@ -978,9 +975,7 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 	// Producer: read from iter and decode
 	go func() {
 		defer close(itemCh)
-		var (
-			idx = 0
-		)
+		idx := 0
 		for {
 			nextStart := time.Now()
 			data, err := iter.Next()
@@ -988,8 +983,8 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				if err != io.EOF {
 					log.LogErrorf("ApplySnapshot: iter.Next failed, partitionID(%v) index(%v) appIndexID(%v) err(%v)",
 						mp.config.PartitionId, idx, appIndexID, err)
+					errCh <- err
 				}
-				errCh <- err
 				return
 			}
 			nextCost := time.Since(nextStart)
@@ -1006,7 +1001,9 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 
 			if idx == 0 {
 				appIndexID = binary.BigEndian.Uint64(data)
-				log.LogDebugf("ApplySnapshot: partitionID(%v), temporary uint64 appIndexID:%v", mp.config.PartitionId, appIndexID)
+				if log.EnableDebug() {
+					log.LogDebugf("ApplySnapshot: partitionID(%v), temporary uint64 appIndexID:%v", mp.config.PartitionId, appIndexID)
+				}
 			}
 
 			item := &snapshotItem{data: data, index: idx}
@@ -1067,16 +1064,24 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		switch snap.Op {
 		case opFSMApplyId:
 			appIndexID = binary.BigEndian.Uint64(snap.V)
-			log.LogDebugf("ApplySnapshot: partitionID(%v) appIndexID:%v", mp.config.PartitionId, appIndexID)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: partitionID(%v) appIndexID:%v", mp.config.PartitionId, appIndexID)
+			}
 		case opFSMTxId:
 			txID = binary.BigEndian.Uint64(snap.V)
-			log.LogDebugf("ApplySnapshot: partitionID(%v) txID:%v", mp.config.PartitionId, txID)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: partitionID(%v) txID:%v", mp.config.PartitionId, txID)
+			}
 		case opFSMCursor:
 			cursor = binary.BigEndian.Uint64(snap.V)
-			log.LogDebugf("ApplySnapshot: partitionID(%v) cursor:%v", mp.config.PartitionId, cursor)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: partitionID(%v) cursor:%v", mp.config.PartitionId, cursor)
+			}
 		case opFSMUniqIDSnap:
 			uniqID = binary.BigEndian.Uint64(snap.V)
-			log.LogDebugf("ApplySnapshot: partitionID(%v) uniqId:%v", mp.config.PartitionId, uniqID)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: partitionID(%v) uniqId:%v", mp.config.PartitionId, uniqID)
+			}
 		case opFSMCreateInode:
 			ino := NewInode(0, 0)
 
@@ -1095,7 +1100,9 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				log.LogErrorf("ApplySnapshot: create inode failed, partitionID(%v) inode(%v)", mp.config.PartitionId, ino)
 				return
 			}
-			log.LogDebugf("ApplySnapshot: create inode: partitonID(%v) inode[%v].", mp.config.PartitionId, ino)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: create inode: partitonID(%v) inode[%v].", mp.config.PartitionId, ino)
+			}
 		case opFSMCreateDentry:
 			dentry := &Dentry{}
 			if err = dentry.UnmarshalKey(snap.K); err != nil {
@@ -1109,7 +1116,9 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				log.LogErrorf("ApplySnapshot: create dentry failed, partitionID(%v) dentry(%v) error(%v)", mp.config.PartitionId, dentry, err)
 				return
 			}
-			log.LogDebugf("ApplySnapshot: create dentry: partitionID(%v) dentry(%v)", mp.config.PartitionId, dentry)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: create dentry: partitionID(%v) dentry(%v)", mp.config.PartitionId, dentry)
+			}
 		case opFSMSetXAttr:
 			var extend *Extend
 			if extend, err = NewExtendFromBytes(snap.V); err != nil {
@@ -1120,8 +1129,10 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				log.LogErrorf("ApplySnapshot: create extentd attributes failed, partitionID(%v) extend(%v) error(%v)", mp.config.PartitionId, extend, err)
 				return
 			}
-			log.LogDebugf("ApplySnapshot: set extend attributes: partitionID(%v) extend(%v)",
-				mp.config.PartitionId, extend)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: set extend attributes: partitionID(%v) extend(%v)",
+					mp.config.PartitionId, extend)
+			}
 		case opFSMCreateMultipart:
 			multipart := MultipartFromBytes(snap.V)
 			// multipart decode is inside constructor
@@ -1130,7 +1141,9 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				log.LogErrorf("ApplySnapshot: create multipart failed, partitionID(%v) extend(%v) error(%v)", mp.config.PartitionId, multipart, err)
 				return
 			}
-			log.LogDebugf("ApplySnapshot: create multipart: partitionID(%v) multipart(%v)", mp.config.PartitionId, multipart)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: create multipart: partitionID(%v) multipart(%v)", mp.config.PartitionId, multipart)
+			}
 		case opFSMTxSnapshot:
 			txInfo := proto.NewTransactionInfo(0, proto.TxTypeUndefined)
 			err = txInfo.Unmarshal(snap.V)
@@ -1142,7 +1155,9 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				log.LogErrorf("ApplySnapshot: put tx failed, partitionID(%v) tx(%v) err(%v)", mp.config.PartitionId, txInfo, err)
 				return
 			}
-			log.LogDebugf("ApplySnapshot: create transaction: partitionID(%v) txInfo(%v)", mp.config.PartitionId, txInfo)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: create transaction: partitionID(%v) txInfo(%v)", mp.config.PartitionId, txInfo)
+			}
 		case opFSMTxRbInodeSnapshot:
 			txRbInode := NewTxRollbackInode(nil, []uint32{}, nil, 0)
 			err = txRbInode.Unmarshal(snap.V)
@@ -1154,7 +1169,9 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				log.LogErrorf("ApplySnapshot: put rb inode failed, partitionID(%v) rb inode(%v) err(%v)", mp.config.PartitionId, txRbInode, err)
 				return
 			}
-			log.LogDebugf("ApplySnapshot: create txRbInode: partitionID(%v) txRbinode[%v]", mp.config.PartitionId, txRbInode)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: create txRbInode: partitionID(%v) txRbinode[%v]", mp.config.PartitionId, txRbInode)
+			}
 		case opFSMTxRbDentrySnapshot:
 			txRbDentry := NewTxRollbackDentry(nil, nil, 0)
 			err = txRbDentry.Unmarshal(snap.V)
@@ -1166,10 +1183,14 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				log.LogErrorf("ApplySnapshot: put rb dentry failed, partitionID(%v) rb dentry(%v) err(%v)", mp.config.PartitionId, txRbDentry, err)
 				return
 			}
-			log.LogDebugf("ApplySnapshot: create txRbDentry: partitionID(%v) txRbDentry(%v)", mp.config.PartitionId, txRbDentry)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: create txRbDentry: partitionID(%v) txRbDentry(%v)", mp.config.PartitionId, txRbDentry)
+			}
 		case opFSMVerListSnapShot:
 			json.Unmarshal(snap.V, &verList)
-			log.LogDebugf("ApplySnapshot: create verList: partitionID(%v) snap.V(%v) verList(%v)", mp.config.PartitionId, snap.V, verList)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: create verList: partitionID(%v) snap.V(%v) verList(%v)", mp.config.PartitionId, snap.V, verList)
+			}
 		case opExtentFileSnapshot:
 			fileName := string(snap.K)
 			fileName = path.Join(mp.config.RootDir, fileName)
@@ -1177,14 +1198,18 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				log.LogErrorf("ApplySnapshot: write snap extent delete file fail: partitionID(%v) err(%v)",
 					mp.config.PartitionId, err)
 			}
-			log.LogDebugf("ApplySnapshot: write snap extent delete file: partitonID(%v) filename(%v).",
-				mp.config.PartitionId, fileName)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: write snap extent delete file: partitonID(%v) filename(%v).",
+					mp.config.PartitionId, fileName)
+			}
 		case opFSMUniqCheckerSnap:
 			if err = uniqChecker.UnMarshal(snap.V); err != nil {
 				log.LogErrorf("ApplyUniqChecker: write snap uniqChecker fail")
 				return
 			}
-			log.LogDebugf("ApplySnapshot: write snap uniqChecker")
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: write snap uniqChecker")
+			}
 		default:
 			if leaderSnapFormatVer != math.MaxUint32 && leaderSnapFormatVer > mp.manager.metaNode.raftSyncSnapFormatVersion {
 				log.LogWarnf("ApplySnapshot: unknown op=%d, leaderSnapFormatVer:%v, mySnapFormatVer:%v, skip it",
@@ -1207,13 +1232,10 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		}
 	}
 
-	// Check final error from producer
 	select {
 	case err = <-errCh:
-		// err is io.EOF for normal completion
 		return
 	default:
-		// Channel closed without error
 		err = io.EOF
 		return
 	}

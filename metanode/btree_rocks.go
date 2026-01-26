@@ -1724,7 +1724,7 @@ func (b *InodeRocks) ReplaceOrInsert(handle interface{}, inode *Inode, replace b
 }
 
 // Insert inserts without prior GetBytes, for snapshot replay fast path.
-func (b *InodeRocks) Insert(handle interface{}, inode *Inode) (err error) {
+func (b *InodeRocks) Insert(handle interface{}, inode *Inode) error {
 	keyBuf := b.GetRocksdbNormalKey(byte(InodeTable))
 	defer PutRocksdbNormalKey(keyBuf)
 
@@ -1732,17 +1732,17 @@ func (b *InodeRocks) Insert(handle interface{}, inode *Inode) (err error) {
 	bs, err := inode.Marshal()
 	if err != nil {
 		log.LogErrorf("[InodeRocksCreateSnapshot] marshal error %v, %v", key, err)
-		return
+		return err
 	}
 
 	if err = b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.inodeCnt, key, bs); err != nil {
 		log.LogErrorf("[InodeRocksCreateSnapshot] write error %v, %v", key, err)
-		return
+		return err
 	}
 	if b.baseInfo.cursor < inode.Inode {
 		b.SetCursor(inode.Inode)
 	}
-	return
+	return nil
 }
 
 func (b *DentryRocks) ReplaceOrInsert(handle interface{}, dentry *Dentry, replace bool) (den *Dentry, ok bool, err error) {
@@ -1782,7 +1782,7 @@ func (b *DentryRocks) ReplaceOrInsert(handle interface{}, dentry *Dentry, replac
 }
 
 // Insert inserts without prior GetBytes, for snapshot replay fast path.
-func (b *DentryRocks) Insert(handle interface{}, dentry *Dentry) (err error) {
+func (b *DentryRocks) Insert(handle interface{}, dentry *Dentry) error {
 	keyBuf := b.GetRocksdbLongKey(byte(DentryTable))
 	defer PutRocksdbLongKey(keyBuf)
 
@@ -1790,14 +1790,14 @@ func (b *DentryRocks) Insert(handle interface{}, dentry *Dentry) (err error) {
 	bs, err := dentry.Marshal()
 	if err != nil {
 		log.LogErrorf("[DentryRocksSnapshot] marshal: %v, err: %v", dentry, err)
-		return
+		return err
 	}
 
 	if err = b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.dentryCnt, key, bs); err != nil {
 		log.LogErrorf("[DentryRocksSnapshot] write dentry: %v key: %v, err: %v", dentry, key, err)
-		return
+		return err
 	}
-	return
+	return nil
 }
 
 func (b *ExtendRocks) ReplaceOrInsert(handle interface{}, extend *Extend, replace bool) (ext *Extend, ok bool, err error) {
@@ -1836,7 +1836,7 @@ func (b *ExtendRocks) ReplaceOrInsert(handle interface{}, extend *Extend, replac
 }
 
 // Insert inserts without prior GetBytes, for snapshot replay fast path.
-func (b *ExtendRocks) Insert(handle interface{}, extend *Extend) (err error) {
+func (b *ExtendRocks) Insert(handle interface{}, extend *Extend) error {
 	keyBuf := b.GetRocksdbNormalKey(byte(ExtendTable))
 	defer PutRocksdbNormalKey(keyBuf)
 
@@ -1844,14 +1844,14 @@ func (b *ExtendRocks) Insert(handle interface{}, extend *Extend) (err error) {
 	bs, err := extend.Bytes()
 	if err != nil {
 		log.LogErrorf("[ExtendRocksSnapshot] marshal: %v, err: %v", extend, err)
-		return
+		return err
 	}
 
 	if err = b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.extendCnt, key, bs); err != nil {
 		log.LogErrorf("[ExtendRocksSnapshot] write extend: %v key: %v, err: %v", extend, key, err)
-		return
+		return err
 	}
-	return
+	return nil
 }
 
 func (b *MultipartRocks) ReplaceOrInsert(handle interface{}, mul *Multipart, replace bool) (multipart *Multipart, ok bool, err error) {
@@ -1887,7 +1887,7 @@ func (b *MultipartRocks) ReplaceOrInsert(handle interface{}, mul *Multipart, rep
 }
 
 // Insert inserts without prior GetBytes, for snapshot replay fast path.
-func (b *MultipartRocks) Insert(handle interface{}, mul *Multipart) (err error) {
+func (b *MultipartRocks) Insert(handle interface{}, mul *Multipart) error {
 	keyBuf := b.GetRocksdbLongKey(byte(MultipartTable))
 	defer PutRocksdbLongKey(keyBuf)
 
@@ -1895,14 +1895,14 @@ func (b *MultipartRocks) Insert(handle interface{}, mul *Multipart) (err error) 
 	bs, err := mul.Bytes()
 	if err != nil {
 		log.LogErrorf("[MultipartRocksSnapshot] marshal: %v, err: %v", mul, err)
-		return
+		return err
 	}
 
 	if err = b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.multiCnt, key, bs); err != nil {
 		log.LogErrorf("[MultipartRocksSnapshot] write multipart: %v key: %v, err: %v", mul, key, err)
-		return
+		return err
 	}
-	return
+	return nil
 }
 
 func (b *TransactionRocks) ReplaceOrInsert(handle interface{}, tx *proto.TransactionInfo, replace bool) (transaction *proto.TransactionInfo, ok bool, err error) {
@@ -1941,7 +1941,7 @@ func (b *TransactionRocks) ReplaceOrInsert(handle interface{}, tx *proto.Transac
 }
 
 // Insert inserts without prior GetBytes, for snapshot replay fast path.
-func (b *TransactionRocks) Insert(handle interface{}, tx *proto.TransactionInfo) (err error) {
+func (b *TransactionRocks) Insert(handle interface{}, tx *proto.TransactionInfo) error {
 	keyBuf := b.GetRocksdbLongKey(byte(TransactionTable))
 	defer PutRocksdbLongKey(keyBuf)
 
@@ -1949,14 +1949,14 @@ func (b *TransactionRocks) Insert(handle interface{}, tx *proto.TransactionInfo)
 	bs, err := tx.Marshal()
 	if err != nil {
 		log.LogErrorf("[TransactionRocksSnapshot] marshal: %v, err: %v", tx, err)
-		return
+		return err
 	}
 
 	if err = b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.txCnt, key, bs); err != nil {
 		log.LogErrorf("[TransactionRocksSnapshot] write tx: %v key: %v, err: %v", tx, key, err)
-		return
+		return err
 	}
-	return
+	return nil
 }
 
 func (b *TransactionRollbackInodeRocks) ReplaceOrInsert(handle interface{}, ino *TxRollbackInode, replace bool) (inode *TxRollbackInode, ok bool, err error) {
@@ -1994,7 +1994,7 @@ func (b *TransactionRollbackInodeRocks) ReplaceOrInsert(handle interface{}, ino 
 }
 
 // Insert inserts without prior GetBytes, for snapshot replay fast path.
-func (b *TransactionRollbackInodeRocks) Insert(handle interface{}, ino *TxRollbackInode) (err error) {
+func (b *TransactionRollbackInodeRocks) Insert(handle interface{}, ino *TxRollbackInode) error {
 	keyBuf := b.GetRocksdbNormalKey(byte(TransactionRollbackInodeTable))
 	defer PutRocksdbNormalKey(keyBuf)
 
@@ -2002,14 +2002,14 @@ func (b *TransactionRollbackInodeRocks) Insert(handle interface{}, ino *TxRollba
 	bs, err := ino.Marshal()
 	if err != nil {
 		log.LogErrorf("[TxRbInodeRocksSnapshot] marshal error %v, %v", key, err)
-		return
+		return err
 	}
 
 	if err = b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.txRbInodeCnt, key, bs); err != nil {
 		log.LogErrorf("[TxRbInodeRocksSnapshot] write error %v, %v", key, err)
-		return
+		return err
 	}
-	return
+	return nil
 }
 
 func (b *TransactionRollbackDentryRocks) ReplaceOrInsert(handle interface{}, den *TxRollbackDentry, replace bool) (dentry *TxRollbackDentry, ok bool, err error) {
@@ -2046,7 +2046,7 @@ func (b *TransactionRollbackDentryRocks) ReplaceOrInsert(handle interface{}, den
 }
 
 // Insert inserts without prior GetBytes, for snapshot replay fast path.
-func (b *TransactionRollbackDentryRocks) Insert(handle interface{}, den *TxRollbackDentry) (err error) {
+func (b *TransactionRollbackDentryRocks) Insert(handle interface{}, den *TxRollbackDentry) error {
 	keyBuf := b.GetRocksdbLongKey(byte(TransactionRollbackDentryTable))
 	defer PutRocksdbLongKey(keyBuf)
 
@@ -2054,14 +2054,14 @@ func (b *TransactionRollbackDentryRocks) Insert(handle interface{}, den *TxRollb
 	bs, err := den.Marshal()
 	if err != nil {
 		log.LogErrorf("[TxRbDentryRocksSnapshot] marshal error %v, %v", key, err)
-		return
+		return err
 	}
 
 	if err = b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.txRbDentryCnt, key, bs); err != nil {
 		log.LogErrorf("[TxRbDentryRocksSnapshot] write error %v, %v", key, err)
-		return
+		return err
 	}
-	return
+	return nil
 }
 
 // Delete

@@ -413,12 +413,22 @@ func (i *InodeBTree) ReplaceOrInsert(handle interface{}, inode *Inode, replace b
 	return inode, ok, nil
 }
 
+func (i *InodeBTree) Insert(handle interface{}, inode *Inode) error {
+	i.BTree.Insert(inode)
+	return nil
+}
+
 func (i *DentryBTree) ReplaceOrInsert(handle interface{}, dentry *Dentry, replace bool) (*Dentry, bool, error) {
 	item, ok := i.BTree.ReplaceOrInsert(dentry, replace)
 	if !ok {
 		return item.(*Dentry), ok, nil
 	}
 	return dentry, ok, nil
+}
+
+func (i *DentryBTree) Insert(handle interface{}, dentry *Dentry) error {
+	i.BTree.Insert(dentry)
+	return nil
 }
 
 func (i *ExtendBTree) ReplaceOrInsert(handle interface{}, extend *Extend, replace bool) (*Extend, bool, error) {
@@ -429,12 +439,22 @@ func (i *ExtendBTree) ReplaceOrInsert(handle interface{}, extend *Extend, replac
 	return extend, ok, nil
 }
 
+func (i *ExtendBTree) Insert(handle interface{}, extend *Extend) error {
+	i.BTree.Insert(extend)
+	return nil
+}
+
 func (i *MultipartBTree) ReplaceOrInsert(handle interface{}, mul *Multipart, replace bool) (*Multipart, bool, error) {
 	item, ok := i.BTree.ReplaceOrInsert(mul, replace)
 	if !ok {
 		return item.(*Multipart), ok, nil
 	}
 	return mul, ok, nil
+}
+
+func (i *MultipartBTree) Insert(handle interface{}, mul *Multipart) error {
+	i.BTree.Insert(mul)
+	return nil
 }
 
 func (i *TransactionBTree) ReplaceOrInsert(handle interface{}, tx *proto.TransactionInfo, replace bool) (*proto.TransactionInfo, bool, error) {
@@ -445,6 +465,11 @@ func (i *TransactionBTree) ReplaceOrInsert(handle interface{}, tx *proto.Transac
 	return tx, ok, nil
 }
 
+func (i *TransactionBTree) Insert(handle interface{}, tx *proto.TransactionInfo) error {
+	i.BTree.Insert(tx)
+	return nil
+}
+
 func (i *TransactionRollbackInodeBTree) ReplaceOrInsert(handle interface{}, inode *TxRollbackInode, replace bool) (*TxRollbackInode, bool, error) {
 	item, ok := i.BTree.ReplaceOrInsert(inode, replace)
 	if !ok {
@@ -453,12 +478,22 @@ func (i *TransactionRollbackInodeBTree) ReplaceOrInsert(handle interface{}, inod
 	return inode, ok, nil
 }
 
+func (i *TransactionRollbackInodeBTree) Insert(handle interface{}, inode *TxRollbackInode) error {
+	i.BTree.Insert(inode)
+	return nil
+}
+
 func (i *TransactionRollbackDentryBTree) ReplaceOrInsert(handle interface{}, dentry *TxRollbackDentry, replace bool) (*TxRollbackDentry, bool, error) {
 	item, ok := i.BTree.ReplaceOrInsert(dentry, replace)
 	if !ok {
 		return item.(*TxRollbackDentry), ok, nil
 	}
 	return dentry, ok, nil
+}
+
+func (i *TransactionRollbackDentryBTree) Insert(handle interface{}, dentry *TxRollbackDentry) error {
+	i.BTree.Insert(dentry)
+	return nil
 }
 
 func (i *InodeBTree) Delete(handle interface{}, inode *Inode) (bool, error) {
