@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -783,461 +784,605 @@ const (
 	applySnapBatchMaxBytes       = 64 * 1024 * 1024
 	applySnapSlowNextThreshold   = 5 * time.Second
 	applySnapSlowCommitThreshold = 5 * time.Second
-	itemChSize                   = 10
+	itemChSize                   = 100 // Expanded channel buffer for concurrent consumption
+	applySnapNumWorkers          = 4   // Number of concurrent workers
 )
 
-func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.SnapIterator) (err error) {
-	var (
-		index       int
-		appIndexID  uint64
-		txID        uint64
-		uniqID      uint64
-		cursor      uint64
-		uniqChecker = newUniqChecker()
-		verList     []*proto.VolVersionInfo
-		batchItems  = 0
-		batchBytes  = 0
-	)
+// snapshotItem represents a single snapshot entry with its index
+type snapshotItem struct {
+	data  []byte
+	index int
+}
 
-	// NOTE: clear mp
-	err = mp.Clear()
-	if err != nil {
-		log.LogErrorf("[ApplySnapshot] mp(%v) failed to clear data, err(%v)", mp.config.PartitionId, err)
-		return
+// applySnapshotAggregator aggregates metadata from concurrent workers during snapshot apply
+type applySnapshotAggregator struct {
+	appIndexID uint64
+	txID       uint64
+	cursor     uint64
+	uniqID     uint64
+	verList    []*proto.VolVersionInfo
+	uniqChk    *uniqChecker
+}
+
+func newApplySnapshotAggregator() *applySnapshotAggregator {
+	return &applySnapshotAggregator{
+		uniqChk: newUniqChecker(),
+	}
+}
+
+func (a *applySnapshotAggregator) atomicMaxUint64(addr *uint64, val uint64) {
+	for {
+		old := atomic.LoadUint64(addr)
+		if val <= old {
+			break
+		}
+		if atomic.CompareAndSwapUint64(addr, old, val) {
+			break
+		}
+	}
+}
+
+// applySnapshotProducer reads snapshot entries from iter and pushes them to dataCh
+func (mp *metaPartition) applySnapshotProducer(
+	iter raftproto.SnapIterator,
+	dataCh chan<- *snapshotItem,
+	errCh chan<- error,
+	doneCh <-chan struct{},
+) {
+	defer close(dataCh)
+	idx := 0
+
+	for {
+		// Check stop signal
+		select {
+		case <-doneCh:
+			return
+		default:
+		}
+
+		if mp.raftClosed() {
+			select {
+			case errCh <- fmt.Errorf("partition(%v) is closed", mp.config.PartitionId):
+			default:
+			}
+			return
+		}
+
+		// Read next item
+		nextStart := time.Now()
+		data, err := iter.Next()
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			log.LogErrorf("ApplySnapshot: iter.Next failed, partitionID(%v) index(%v) err(%v)",
+				mp.config.PartitionId, idx, err)
+			select {
+			case errCh <- err:
+			default:
+			}
+			return
+		}
+
+		nextCost := time.Since(nextStart)
+		if nextCost >= applySnapSlowNextThreshold {
+			log.LogWarnf("ApplySnapshot: iter.Next slow, partitionID(%v) index(%v) cost(%s)",
+				mp.config.PartitionId, idx, nextCost.String())
+		}
+
+		// Special handling for index==0 (compatibility: may be uint64 appIndexID)
+		if idx == 0 {
+			appIndexID := binary.BigEndian.Uint64(data)
+			if log.EnableDebug() {
+				log.LogDebugf("ApplySnapshot: partitionID(%v), temporary uint64 appIndexID:%v",
+					mp.config.PartitionId, appIndexID)
+			}
+		}
+
+		// Push to channel
+		select {
+		case dataCh <- &snapshotItem{data: data, index: idx}:
+			idx++
+		case <-doneCh:
+			return
+		}
+	}
+}
+
+// processSnapshotItem processes a single snapshot item based on its operation type
+func (mp *metaPartition) processSnapshotItem(
+	workerID int,
+	snap *MetaItem,
+	agg *applySnapshotAggregator,
+	dbWriteHandle interface{},
+	leaderSnapFormatVer *uint32,
+) error {
+	switch snap.Op {
+	case opFSMApplyId:
+		val := binary.BigEndian.Uint64(snap.V)
+		atomic.StoreUint64(&agg.appIndexID, val)
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) partitionID(%v) appIndexID:%v", workerID, mp.config.PartitionId, val)
+		}
+
+	case opFSMTxId:
+		val := binary.BigEndian.Uint64(snap.V)
+		agg.atomicMaxUint64(&agg.txID, val)
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) partitionID(%v) txID:%v", workerID, mp.config.PartitionId, val)
+		}
+
+	case opFSMCursor:
+		val := binary.BigEndian.Uint64(snap.V)
+		agg.atomicMaxUint64(&agg.cursor, val)
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) partitionID(%v) cursor:%v", workerID, mp.config.PartitionId, val)
+		}
+
+	case opFSMUniqIDSnap:
+		val := binary.BigEndian.Uint64(snap.V)
+		agg.atomicMaxUint64(&agg.uniqID, val)
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) partitionID(%v) uniqId:%v", workerID, mp.config.PartitionId, val)
+		}
+
+	case opFSMCreateInode:
+		ino := NewInode(0, 0)
+		if err := ino.UnmarshalKey(snap.K); err != nil {
+			return err
+		}
+		if err := ino.UnmarshalValue(snap.V); err != nil {
+			return err
+		}
+		agg.atomicMaxUint64(&agg.cursor, ino.Inode)
+		if err := mp.inodeTree.Insert(dbWriteHandle, ino); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) create inode failed, partitionID(%v) inode(%v)",
+				workerID, mp.config.PartitionId, ino)
+			return err
+		}
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) create inode: partitonID(%v) inode[%v].",
+				workerID, mp.config.PartitionId, ino)
+		}
+
+	case opFSMCreateDentry:
+		dentry := &Dentry{}
+		if err := dentry.UnmarshalKey(snap.K); err != nil {
+			return err
+		}
+		if err := dentry.UnmarshalValue(snap.V); err != nil {
+			return err
+		}
+		if err := mp.dentryTree.Insert(dbWriteHandle, dentry); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) create dentry failed, partitionID(%v) dentry(%v) error(%v)",
+				workerID, mp.config.PartitionId, dentry, err)
+			return err
+		}
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) create dentry: partitionID(%v) dentry(%v)",
+				workerID, mp.config.PartitionId, dentry)
+		}
+
+	case opFSMSetXAttr:
+		extend, err := NewExtendFromBytes(snap.V)
+		if err != nil {
+			return err
+		}
+		if err := mp.extendTree.Insert(dbWriteHandle, extend); err != nil {
+			return err
+		}
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) set extend attributes: partitionID(%v) extend(%v)",
+				workerID, mp.config.PartitionId, extend)
+		}
+
+	case opFSMCreateMultipart:
+		multipart := MultipartFromBytes(snap.V)
+		if err := mp.multipartTree.Insert(dbWriteHandle, multipart); err != nil {
+			return err
+		}
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) create multipart: partitionID(%v) multipart(%v)",
+				workerID, mp.config.PartitionId, multipart)
+		}
+
+	case opFSMTxSnapshot:
+		txInfo := proto.NewTransactionInfo(0, proto.TxTypeUndefined)
+		if err := txInfo.Unmarshal(snap.V); err != nil {
+			log.LogErrorf("[ApplySnapshot] worker(%d) mp(%v) failed to unmarshal tx, err(%v)",
+				workerID, mp.config.PartitionId, err)
+			return err
+		}
+		if err := mp.txProcessor.txManager.txTree.Insert(dbWriteHandle, txInfo); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) put tx failed, partitionID(%v) tx(%v) err(%v)",
+				workerID, mp.config.PartitionId, txInfo, err)
+			return err
+		}
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) create transaction: partitionID(%v) txInfo(%v)",
+				workerID, mp.config.PartitionId, txInfo)
+		}
+
+	case opFSMTxRbInodeSnapshot:
+		txRbInode := NewTxRollbackInode(nil, []uint32{}, nil, 0)
+		if err := txRbInode.Unmarshal(snap.V); err != nil {
+			log.LogErrorf("[ApplySnapshot] worker(%d) mp(%v) failed to unmarshal tx rb inode, err(%v)",
+				workerID, mp.config.PartitionId, err)
+			return err
+		}
+		if err := mp.txProcessor.txResource.txRbInodeTree.Insert(dbWriteHandle, txRbInode); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) put rb inode failed, partitionID(%v) rb inode(%v) err(%v)",
+				workerID, mp.config.PartitionId, txRbInode, err)
+			return err
+		}
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) create txRbInode: partitionID(%v) txRbinode[%v]",
+				workerID, mp.config.PartitionId, txRbInode)
+		}
+
+	case opFSMTxRbDentrySnapshot:
+		txRbDentry := NewTxRollbackDentry(nil, nil, 0)
+		if err := txRbDentry.Unmarshal(snap.V); err != nil {
+			log.LogErrorf("[ApplySnapshot] worker(%d) mp(%v) failed to unmarshal tx rb dentry, err(%v)",
+				workerID, mp.config.PartitionId, err)
+			return err
+		}
+		if err := mp.txProcessor.txResource.txRbDentryTree.Insert(dbWriteHandle, txRbDentry); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) put rb dentry failed, partitionID(%v) rb dentry(%v) err(%v)",
+				workerID, mp.config.PartitionId, txRbDentry, err)
+			return err
+		}
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) create txRbDentry: partitionID(%v) txRbDentry(%v)",
+				workerID, mp.config.PartitionId, txRbDentry)
+		}
+
+	case opFSMVerListSnapShot:
+		var verList []*proto.VolVersionInfo
+		json.Unmarshal(snap.V, &verList)
+		agg.verList = verList
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) create verList: partitionID(%v) verList(%v)",
+				workerID, mp.config.PartitionId, verList)
+		}
+
+	case opExtentFileSnapshot:
+		fileName := string(snap.K)
+		fileName = path.Join(mp.config.RootDir, fileName)
+		if err := os.WriteFile(fileName, snap.V, 0o644); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) write snap extent delete file fail: partitionID(%v) err(%v)",
+				workerID, mp.config.PartitionId, err)
+		}
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) write snap extent delete file: partitonID(%v) filename(%v).",
+				workerID, mp.config.PartitionId, fileName)
+		}
+
+	case opFSMUniqCheckerSnap:
+		// Direct unmarshal - only one uniqChecker per snapshot, no lock needed
+		if err := agg.uniqChk.UnMarshal(snap.V); err != nil {
+			log.LogErrorf("ApplyUniqChecker: worker(%d) write snap uniqChecker fail", workerID)
+			return err
+		}
+		if log.EnableDebug() {
+			log.LogDebugf("ApplySnapshot: worker(%d) write snap uniqChecker", workerID)
+		}
+
+	default:
+		ver := atomic.LoadUint32(leaderSnapFormatVer)
+		if ver != math.MaxUint32 && ver > mp.manager.metaNode.raftSyncSnapFormatVersion {
+			log.LogWarnf("ApplySnapshot: worker(%d) unknown op=%d, leaderSnapFormatVer:%v, mySnapFormatVer:%v, skip it",
+				workerID, snap.Op, ver, mp.manager.metaNode.raftSyncSnapFormatVersion)
+		} else {
+			return fmt.Errorf("unknown Op=%d", snap.Op)
+		}
 	}
 
-	// NOTE: open write batch for write
+	return nil
+}
+
+// applySnapshotWorker is a concurrent worker that processes snapshot items
+func (mp *metaPartition) applySnapshotWorker(
+	workerID int,
+	dataCh <-chan *snapshotItem,
+	agg *applySnapshotAggregator,
+	index0Done chan struct{},
+	index0Once *sync.Once,
+	leaderSnapFormatVer *uint32,
+	errCh chan<- error,
+	doneCh <-chan struct{},
+) {
+	// Create independent write batch handle
 	dbWriteHandle, err := mp.inodeTree.CreateBatchWriteHandle()
 	if err != nil {
-		log.LogErrorf("ApplySnapshot: metaPartition(%v) create batch write handle failed:%v", mp.config.PartitionId, err)
+		log.LogErrorf("ApplySnapshot: worker(%d) create batch write handle failed:%v", workerID, err)
+		select {
+		case errCh <- err:
+		default:
+		}
 		return
 	}
 	defer mp.inodeTree.ReleaseBatchWriteHandle(dbWriteHandle)
 
-	blockUntilStoreSnapshot := func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
+	batchItems := 0
+	batchBytes := 0
 
-		log.LogWarnf("ApplySnapshot: start to block until store snapshot to disk, mp[%v], appid %d", mp.config.PartitionId, appIndexID)
+	flushBatch := func() error {
+		if batchItems == 0 {
+			return nil
+		}
 		start := time.Now()
-
-		for {
-			select {
-			case <-ticker.C:
-				if time.Since(start) > time.Minute*20 {
-					msg := fmt.Sprintf("ApplySnapshot: wait store snapshot timeout after 20 minutes, mp %d, appId %d, storeId %d",
-						mp.config.PartitionId, appIndexID, mp.storedApplyId)
-					log.LogErrorf(msg)
-					err = fmt.Errorf(msg)
-					return
-				}
-
-				if mp.raftClosed() {
-					log.LogWarnf("ApplySnapshot-blockUntilStoreSnapshot partition(%v) is closed, exit now", mp.config.PartitionId)
-					err = fmt.Errorf("partition(%v) is closed", mp.config.PartitionId)
-					return
-				}
-
-				msg := fmt.Sprintf("ApplySnapshot: start check storedApplyId, mp %d appId %d, storeAppId %d, cost %s",
-					mp.config.PartitionId, appIndexID, mp.storedApplyId, time.Since(start).String())
-				if time.Since(start) > time.Minute {
-					log.LogWarnf("still block after one minute, msg %s", msg)
-				} else {
-					log.LogInfo(msg)
-				}
-
-				if mp.storedApplyId >= appIndexID {
-					log.LogWarnf("ApplySnapshot: store snapshot success, msg %s", msg)
-					return
-				}
-
-			case <-mp.stopC:
-				log.LogWarnf("ApplySnapshot: revice stop signal, exit now, partition(%d), applyId(%d)", mp.config.PartitionId, mp.applyID)
-				err = errors.New("server has been shutdown when block")
-				return
-			}
-		}
-	}
-
-	log.LogWarnf("ApplySnapshot: start apply snapshot, partition(%v), applyId(%v)", mp.config.PartitionId, appIndexID)
-
-	defer func() {
-		if err != nil && err != io.EOF {
-			if err == ErrRocksdbOperation {
-				log.LogErrorf("[ApplySnapshot] failed to operate rocksdb, err(%v)", err)
-				exporter.WarningRocksdbError(fmt.Sprintf("action[ApplySnapshot] clusterID[%s] volumeName[%s] partitionID[%v]"+
-					" apply base snapshot failed witch rocksdb error", mp.manager.metaNode.clusterId, mp.config.VolName,
-					mp.config.PartitionId))
-			}
-			log.LogErrorf("ApplySnapshot: stop with error: partitionID(%v) err(%v)", mp.config.PartitionId, err)
-			return
-		}
-		if err == io.EOF {
-			log.LogWarnf("ApplySnapshot: apply snapshot success, partition(%v), applyId(%v)", mp.config.PartitionId, appIndexID)
-			mp.applyID = appIndexID
-			mp.inodeTree.SetApplyID(appIndexID)
-			mp.config.UniqId = uniqID
-			mp.txProcessor.txManager.txIdAlloc.setTransactionID(txID)
-			mp.txProcessor.txManager.txTree.SetTxId(txID)
-			mp.config.Cursor = cursor
-			mp.inodeTree.SetCursor(cursor)
-			mp.uniqChecker = uniqChecker
-			mp.multiVersionList.VerList = make([]*proto.VolVersionInfo, len(verList))
-			copy(mp.multiVersionList.VerList, verList)
-			mp.verSeq = mp.multiVersionList.GetLastVer()
-			log.LogInfof("mp[%v] updateVerList (%v) seq [%v]", mp.config.PartitionId, mp.multiVersionList.VerList, mp.verSeq)
-			err = nil
-			// NOTE: store rocksdb metadata
-			// Final commit with applyID. (Previous commits during snapshot apply used needCommitApplyID=false.)
-			err = mp.inodeTree.CommitBatchWrite(dbWriteHandle, true)
-			if err != nil {
-				log.LogErrorf("[ApplySnapshot] mp(%v) failed to write mp metadata", mp.config.PartitionId)
-				return
-			}
-
-			log.LogWarnf("ApplySnapshot: commit batch write success, partition(%v), applyId(%v)", mp.config.PartitionId, appIndexID)
-
-			err = mp.inodeTree.ClearBatchWriteHandle(dbWriteHandle)
-			if err != nil {
-				log.LogErrorf("[ApplySnapshot] mp(%v) failed to clear handle", mp.config.PartitionId)
-				err = nil
-			}
-
-			err = mp.flushAndCheckApplyID(appIndexID)
-			if err != nil {
-				log.LogErrorf("[ApplySnapshot] mp(%v) flush and check apply id failed, err(%v)", mp.config.PartitionId, err)
-				return
-			}
-			log.LogWarnf("ApplySnapshot: flush and check apply id success, partition(%v), applyId(%v)", mp.config.PartitionId, appIndexID)
-
-			// store message
-			var snap Snapshot
-			snap, err = mp.GetSnapShot()
-			if err != nil {
-				log.LogErrorf("[ApplySnapshot]: failed to open snapshot for mp(%v), store(%v), err(%v)", mp.config.PartitionId, mp.config.StoreMode, err)
-				return
-			}
-			mp.storeChan <- &storeMsg{
-				command:      opFSMStoreTick,
-				uniqId:       mp.GetUniqId(),
-				uniqChecker:  uniqChecker.clone(),
-				multiVerList: mp.GetVerList(),
-				snap:         snap,
-				applyIndex:   appIndexID,
-			}
-			select {
-			case <-mp.stopC:
-				log.LogWarnf("ApplySnapshot: revice stop signal, exit now, partition(%d), applyId(%d)", mp.config.PartitionId, mp.applyID)
-				err = errors.New("server has been shutdown")
-				return
-			default:
-				log.LogWarnf("ApplySnapshot: finish with EOF: partitionID(%v) applyID(%v), txID(%v), uniqID(%v), cursor(%v)",
-					mp.config.PartitionId, mp.applyID, mp.txProcessor.txManager.txIdAlloc.getTransactionID(), mp.config.UniqId, mp.config.Cursor)
-				blockUntilStoreSnapshot()
-				return
-			}
-		}
-		log.LogErrorf("ApplySnapshot: stop with error: partitionID(%v) err(%v)", mp.config.PartitionId, err)
-	}()
-
-	flushBatch := func(forceCommitApplyID bool) error {
-		start := time.Now()
-		if err := mp.inodeTree.CommitBatchWrite(dbWriteHandle, forceCommitApplyID); err != nil {
-			log.LogErrorf("ApplySnapshot: commit batch write failed, partitionID(%v) index(%v) forceApplyID(%v) err(%v)",
-				mp.config.PartitionId, index, forceCommitApplyID, err)
+		// Commit without applyID (will be committed once at the end)
+		if err := mp.inodeTree.CommitBatchWrite(dbWriteHandle, false); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) commit batch write failed, err(%v)", workerID, err)
 			return err
 		}
 		if err := mp.inodeTree.ClearBatchWriteHandle(dbWriteHandle); err != nil {
-			log.LogErrorf("ApplySnapshot: clear batch write handle failed, partitionID(%v) index(%v) err(%v)",
-				mp.config.PartitionId, index, err)
+			log.LogErrorf("ApplySnapshot: worker(%d) clear batch write handle failed, err(%v)", workerID, err)
 			return err
 		}
 		cost := time.Since(start)
 		if cost >= applySnapSlowCommitThreshold {
-			log.LogWarnf("ApplySnapshot: slow commit, partitionID(%v) index(%v) items(%d) bytes(%d) cost(%s) forceApplyID(%v)",
-				mp.config.PartitionId, index, batchItems, batchBytes, cost.String(), forceCommitApplyID)
+			log.LogWarnf("ApplySnapshot: worker(%d) slow commit, items(%d) bytes(%d) cost(%s)",
+				workerID, batchItems, batchBytes, cost.String())
 		}
 		batchItems = 0
 		batchBytes = 0
 		return nil
 	}
 
-	// Use 2-stage pipeline: Producer (iter.Next) -> Consumer (decode + replay)
-	type snapshotItem struct {
-		data  []byte
-		index int
+	signalErr := func(e error) {
+		select {
+		case errCh <- e:
+		default:
+		}
 	}
 
-	itemCh := make(chan *snapshotItem, itemChSize)
-	errCh := make(chan error, 1)
-	leaderSnapFormatVer := uint32(math.MaxUint32)
-
-	// Producer: read from iter and decode
-	go func() {
-		defer close(itemCh)
-		idx := 0
-		for {
-			nextStart := time.Now()
-			data, err := iter.Next()
-			if err != nil {
-				if err != io.EOF {
-					log.LogErrorf("ApplySnapshot: iter.Next failed, partitionID(%v) index(%v) appIndexID(%v) err(%v)",
-						mp.config.PartitionId, idx, appIndexID, err)
-					errCh <- err
-				}
-				return
-			}
-			nextCost := time.Since(nextStart)
-			if nextCost >= applySnapSlowNextThreshold {
-				log.LogWarnf("ApplySnapshot: iter.Next slow, partitionID(%v) index(%v) appIndexID(%v) cost(%s)",
-					mp.config.PartitionId, idx, appIndexID, nextCost.String())
-			}
-
-			if mp.raftClosed() {
-				log.LogWarnf("ApplySnapshot: partition(%v) is closed, exit now", mp.config.PartitionId)
-				errCh <- fmt.Errorf("partition(%v) is closed", mp.config.PartitionId)
-				return
-			}
-
-			if idx == 0 {
-				appIndexID = binary.BigEndian.Uint64(data)
-				if log.EnableDebug() {
-					log.LogDebugf("ApplySnapshot: partitionID(%v), temporary uint64 appIndexID:%v", mp.config.PartitionId, appIndexID)
-				}
-			}
-
-			item := &snapshotItem{data: data, index: idx}
-			idx++
-			itemCh <- item
-		}
-	}()
-
-	// Consumer: serialize and put
-	for item := range itemCh {
-		// Check for producer error
+	for item := range dataCh {
+		// Check for errors
 		select {
-		case err = <-errCh:
+		case <-doneCh:
 			return
 		default:
 		}
 
-		if mp.raftClosed() {
-			log.LogWarnf("ApplySnapshot: partition(%v) is closed, exit now", mp.config.PartitionId)
-			err = fmt.Errorf("partition(%v) is closed", mp.config.PartitionId)
-			return
-		}
-
-		index = item.index
+		index := item.index
 		data := item.data
-		snap := NewMetaItem(0, nil, nil)
-		if err = snap.UnmarshalBinary(data); err != nil {
-			if index == 0 {
-				// for compatibility, if leader send snapshot format int version_0, index=0 is applyId in uint64 and
-				// will cause snap.UnmarshalBinary err, then just skip index=0 and continue with the other fields
-				log.LogInfof("ApplySnapshot: snap.UnmarshalBinary failed in index=0, partitionID(%v), assuming snapshot format version_0",
-					mp.config.PartitionId)
-				leaderSnapFormatVer = SnapFormatVersion_0
+
+		// Handle index==0 (format version or compatibility)
+		if index == 0 {
+			var processed bool
+			index0Once.Do(func() {
+				processed = true
+				snap := NewMetaItem(0, nil, nil)
+				if err := snap.UnmarshalBinary(data); err != nil {
+					// Compatibility: old format, index=0 is uint64 appIndexID
+					log.LogInfof("ApplySnapshot: snap.UnmarshalBinary failed in index=0, partitionID(%v), assuming snapshot format version_0",
+						mp.config.PartitionId)
+					atomic.StoreUint32(leaderSnapFormatVer, SnapFormatVersion_0)
+					atomic.StoreUint64(&agg.appIndexID, binary.BigEndian.Uint64(data))
+					close(index0Done)
+					return
+				}
+
+				if snap.Op != opFSMSnapFormatVersion {
+					err := fmt.Errorf("snapshot format not match, partitionID(%v), index:%v, expect snap.Op:%v, actual snap.Op:%v",
+						mp.config.PartitionId, index, opFSMSnapFormatVersion, snap.Op)
+					log.LogWarnf("ApplySnapshot: %v", err.Error())
+					signalErr(err)
+					return
+				}
+				ver := binary.BigEndian.Uint32(snap.V)
+				atomic.StoreUint32(leaderSnapFormatVer, ver)
+				if ver != mp.manager.metaNode.raftSyncSnapFormatVersion {
+					log.LogWarnf("ApplySnapshot: snapshot format not match, partitionID(%v), index:%v, expect ver:%v, actual ver:%v",
+						mp.config.PartitionId, index, mp.manager.metaNode.raftSyncSnapFormatVersion, ver)
+				}
+				close(index0Done)
+			})
+			if processed {
 				continue
 			}
-			log.LogInfof("ApplySnapshot: snap.UnmarshalBinary failed, partitionID(%v) index(%v) err(%v)", mp.config.PartitionId, index, err)
-			err = fmt.Errorf("unmarshal snap data failed: %w", err)
-			return
-		}
-
-		if index == 0 {
-			if snap.Op != opFSMSnapFormatVersion {
-				// check whether the snapshot format matches, if snap.UnmarshalBinary has no err for index 0, it should be opFSMSnapFormatVersion
-				err = fmt.Errorf("snapshot format not match, partitionID(%v), index:%v, expect snap.Op:%v, actual snap.Op:%v",
-					mp.config.PartitionId, index, opFSMSnapFormatVersion, snap.Op)
-				log.LogWarnf("ApplySnapshot: %v", err.Error())
-				return
-			}
-			// check whether the snapshot format version number matches
-			leaderSnapFormatVer = binary.BigEndian.Uint32(snap.V)
-			if leaderSnapFormatVer != mp.manager.metaNode.raftSyncSnapFormatVersion {
-				log.LogWarnf("ApplySnapshot: snapshot format not match, partitionID(%v), index:%v, expect ver:%v, actual ver:%v",
-					mp.config.PartitionId, index, mp.manager.metaNode.raftSyncSnapFormatVersion, leaderSnapFormatVer)
-			}
+			// Other workers skip index==0
 			continue
 		}
 
-		switch snap.Op {
-		case opFSMApplyId:
-			appIndexID = binary.BigEndian.Uint64(snap.V)
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: partitionID(%v) appIndexID:%v", mp.config.PartitionId, appIndexID)
-			}
-		case opFSMTxId:
-			txID = binary.BigEndian.Uint64(snap.V)
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: partitionID(%v) txID:%v", mp.config.PartitionId, txID)
-			}
-		case opFSMCursor:
-			cursor = binary.BigEndian.Uint64(snap.V)
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: partitionID(%v) cursor:%v", mp.config.PartitionId, cursor)
-			}
-		case opFSMUniqIDSnap:
-			uniqID = binary.BigEndian.Uint64(snap.V)
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: partitionID(%v) uniqId:%v", mp.config.PartitionId, uniqID)
-			}
-		case opFSMCreateInode:
-			ino := NewInode(0, 0)
+		// Wait for index==0 processing to complete
+		<-index0Done
 
-			// TODO Unhandled errors
-			if err = ino.UnmarshalKey(snap.K); err != nil {
-				return
-			}
-			if err = ino.UnmarshalValue(snap.V); err != nil {
-				return
-			}
-			if cursor < ino.Inode {
-				cursor = ino.Inode
-			}
-			err = mp.inodeTree.Insert(dbWriteHandle, ino)
-			if err != nil {
-				log.LogErrorf("ApplySnapshot: create inode failed, partitionID(%v) inode(%v)", mp.config.PartitionId, ino)
-				return
-			}
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: create inode: partitonID(%v) inode[%v].", mp.config.PartitionId, ino)
-			}
-		case opFSMCreateDentry:
-			dentry := &Dentry{}
-			if err = dentry.UnmarshalKey(snap.K); err != nil {
-				return
-			}
-			if err = dentry.UnmarshalValue(snap.V); err != nil {
-				return
-			}
-			err = mp.dentryTree.Insert(dbWriteHandle, dentry)
-			if err != nil {
-				log.LogErrorf("ApplySnapshot: create dentry failed, partitionID(%v) dentry(%v) error(%v)", mp.config.PartitionId, dentry, err)
-				return
-			}
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: create dentry: partitionID(%v) dentry(%v)", mp.config.PartitionId, dentry)
-			}
-		case opFSMSetXAttr:
-			var extend *Extend
-			if extend, err = NewExtendFromBytes(snap.V); err != nil {
-				return
-			}
-			err = mp.extendTree.Insert(dbWriteHandle, extend)
-			if err != nil {
-				log.LogErrorf("ApplySnapshot: create extentd attributes failed, partitionID(%v) extend(%v) error(%v)", mp.config.PartitionId, extend, err)
-				return
-			}
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: set extend attributes: partitionID(%v) extend(%v)",
-					mp.config.PartitionId, extend)
-			}
-		case opFSMCreateMultipart:
-			multipart := MultipartFromBytes(snap.V)
-			// multipart decode is inside constructor
-			err = mp.multipartTree.Insert(dbWriteHandle, multipart)
-			if err != nil {
-				log.LogErrorf("ApplySnapshot: create multipart failed, partitionID(%v) extend(%v) error(%v)", mp.config.PartitionId, multipart, err)
-				return
-			}
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: create multipart: partitionID(%v) multipart(%v)", mp.config.PartitionId, multipart)
-			}
-		case opFSMTxSnapshot:
-			txInfo := proto.NewTransactionInfo(0, proto.TxTypeUndefined)
-			err = txInfo.Unmarshal(snap.V)
-			if err != nil {
-				log.LogErrorf("[ApplySnapshot] mp(%v) failed to unmarshal tx, err(%v)", mp.config.PartitionId, err)
-			}
-			err = mp.txProcessor.txManager.txTree.Insert(dbWriteHandle, txInfo)
-			if err != nil {
-				log.LogErrorf("ApplySnapshot: put tx failed, partitionID(%v) tx(%v) err(%v)", mp.config.PartitionId, txInfo, err)
-				return
-			}
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: create transaction: partitionID(%v) txInfo(%v)", mp.config.PartitionId, txInfo)
-			}
-		case opFSMTxRbInodeSnapshot:
-			txRbInode := NewTxRollbackInode(nil, []uint32{}, nil, 0)
-			err = txRbInode.Unmarshal(snap.V)
-			if err != nil {
-				log.LogErrorf("[ApplySnapshot] mp(%v) failed to unmarshal tx rb inode, err(%v)", mp.config.PartitionId, err)
-			}
-			err = mp.txProcessor.txResource.txRbInodeTree.Insert(dbWriteHandle, txRbInode)
-			if err != nil {
-				log.LogErrorf("ApplySnapshot: put rb inode failed, partitionID(%v) rb inode(%v) err(%v)", mp.config.PartitionId, txRbInode, err)
-				return
-			}
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: create txRbInode: partitionID(%v) txRbinode[%v]", mp.config.PartitionId, txRbInode)
-			}
-		case opFSMTxRbDentrySnapshot:
-			txRbDentry := NewTxRollbackDentry(nil, nil, 0)
-			err = txRbDentry.Unmarshal(snap.V)
-			if err != nil {
-				log.LogErrorf("[ApplySnapshot] mp(%v) failed to unmarshal tx rb dentry, err(%v)", mp.config.PartitionId, err)
-			}
-			err = mp.txProcessor.txResource.txRbDentryTree.Insert(dbWriteHandle, txRbDentry)
-			if err != nil {
-				log.LogErrorf("ApplySnapshot: put rb dentry failed, partitionID(%v) rb dentry(%v) err(%v)", mp.config.PartitionId, txRbDentry, err)
-				return
-			}
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: create txRbDentry: partitionID(%v) txRbDentry(%v)", mp.config.PartitionId, txRbDentry)
-			}
-		case opFSMVerListSnapShot:
-			json.Unmarshal(snap.V, &verList)
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: create verList: partitionID(%v) snap.V(%v) verList(%v)", mp.config.PartitionId, snap.V, verList)
-			}
-		case opExtentFileSnapshot:
-			fileName := string(snap.K)
-			fileName = path.Join(mp.config.RootDir, fileName)
-			if err = os.WriteFile(fileName, snap.V, 0o644); err != nil {
-				log.LogErrorf("ApplySnapshot: write snap extent delete file fail: partitionID(%v) err(%v)",
-					mp.config.PartitionId, err)
-			}
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: write snap extent delete file: partitonID(%v) filename(%v).",
-					mp.config.PartitionId, fileName)
-			}
-		case opFSMUniqCheckerSnap:
-			if err = uniqChecker.UnMarshal(snap.V); err != nil {
-				log.LogErrorf("ApplyUniqChecker: write snap uniqChecker fail")
-				return
-			}
-			if log.EnableDebug() {
-				log.LogDebugf("ApplySnapshot: write snap uniqChecker")
-			}
-		default:
-			if leaderSnapFormatVer != math.MaxUint32 && leaderSnapFormatVer > mp.manager.metaNode.raftSyncSnapFormatVersion {
-				log.LogWarnf("ApplySnapshot: unknown op=%d, leaderSnapFormatVer:%v, mySnapFormatVer:%v, skip it",
-					snap.Op, leaderSnapFormatVer, mp.manager.metaNode.raftSyncSnapFormatVersion)
-			} else {
-				err = fmt.Errorf("unknown Op=%d", snap.Op)
-				return
-			}
+		// Decode snapshot item
+		snap := NewMetaItem(0, nil, nil)
+		if err := snap.UnmarshalBinary(data); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) unmarshal failed, partitionID(%v) index(%v) err(%v)",
+				workerID, mp.config.PartitionId, index, err)
+			signalErr(fmt.Errorf("unmarshal snap data failed: %w", err))
+			return
+		}
+
+		// Process snapshot item
+		if err := mp.processSnapshotItem(workerID, snap, agg, dbWriteHandle, leaderSnapFormatVer); err != nil {
+			signalErr(err)
+			return
 		}
 
 		batchItems++
 		batchBytes += len(snap.K) + len(snap.V)
 
-		needFlush := batchItems >= applySnapBatchMaxItems ||
-			batchBytes >= applySnapBatchMaxBytes
+		needFlush := batchItems >= applySnapBatchMaxItems || batchBytes >= applySnapBatchMaxBytes
 		if needFlush {
-			if err = flushBatch(false); err != nil {
+			if err := flushBatch(); err != nil {
+				signalErr(err)
 				return
 			}
 		}
 	}
 
+	// Flush remaining batch
+	if err := flushBatch(); err != nil {
+		signalErr(err)
+		return
+	}
+}
+
+func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.SnapIterator) (err error) {
+	// Clear partition data
+	err = mp.Clear()
+	if err != nil {
+		log.LogErrorf("[ApplySnapshot] mp(%v) failed to clear data, err(%v)", mp.config.PartitionId, err)
+		return
+	}
+
+	log.LogWarnf("ApplySnapshot: start apply snapshot, partition(%v)", mp.config.PartitionId)
+
+	// Initialize aggregator and channels
+	agg := newApplySnapshotAggregator()
+	dataCh := make(chan *snapshotItem, itemChSize)
+	errCh := make(chan error, 1)
+	doneCh := make(chan struct{})
+	index0Done := make(chan struct{})
+	var index0Once sync.Once
+	leaderSnapFormatVer := uint32(math.MaxUint32)
+
+	// Start producer
+	go mp.applySnapshotProducer(iter, dataCh, errCh, doneCh)
+
+	// Start workers
+	var wg sync.WaitGroup
+	for workerID := 0; workerID < applySnapNumWorkers; workerID++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			mp.applySnapshotWorker(id, dataCh, agg, index0Done, &index0Once, &leaderSnapFormatVer, errCh, doneCh)
+		}(workerID)
+	}
+
+	// Wait for all workers to complete
+	wg.Wait()
+
+	// Check for errors
 	select {
 	case err = <-errCh:
-		return
+		log.LogErrorf("ApplySnapshot: stop with error: partitionID(%v) err(%v)", mp.config.PartitionId, err)
+		return err
 	default:
-		err = io.EOF
-		return
+	}
+
+	// Apply aggregated metadata
+	return mp.finalizeApplySnapshot(agg)
+}
+
+// finalizeApplySnapshot applies aggregated metadata and commits final state
+func (mp *metaPartition) finalizeApplySnapshot(agg *applySnapshotAggregator) error {
+	appIndexID := atomic.LoadUint64(&agg.appIndexID)
+	txID := atomic.LoadUint64(&agg.txID)
+	cursor := atomic.LoadUint64(&agg.cursor)
+	uniqID := atomic.LoadUint64(&agg.uniqID)
+
+	verList := agg.verList
+	uniqChecker := agg.uniqChk
+
+	log.LogWarnf("ApplySnapshot: apply snapshot success, partition(%v), applyId(%v)", mp.config.PartitionId, appIndexID)
+
+	// Update partition metadata
+	mp.applyID = appIndexID
+	mp.inodeTree.SetApplyID(appIndexID)
+	mp.config.UniqId = uniqID
+	mp.txProcessor.txManager.txIdAlloc.setTransactionID(txID)
+	mp.txProcessor.txManager.txTree.SetTxId(txID)
+	mp.config.Cursor = cursor
+	mp.inodeTree.SetCursor(cursor)
+	mp.uniqChecker = uniqChecker
+	mp.multiVersionList.VerList = make([]*proto.VolVersionInfo, len(verList))
+	copy(mp.multiVersionList.VerList, verList)
+	mp.verSeq = mp.multiVersionList.GetLastVer()
+	log.LogInfof("mp[%v] updateVerList (%v) seq [%v]", mp.config.PartitionId, mp.multiVersionList.VerList, mp.verSeq)
+
+	// Final commit with applyID
+	finalHandle, err := mp.inodeTree.CreateBatchWriteHandle()
+	if err != nil {
+		log.LogErrorf("[ApplySnapshot] mp(%v) failed to create final write handle", mp.config.PartitionId)
+		return err
+	}
+	defer mp.inodeTree.ReleaseBatchWriteHandle(finalHandle)
+
+	err = mp.inodeTree.CommitBatchWrite(finalHandle, true)
+	if err != nil {
+		log.LogErrorf("[ApplySnapshot] mp(%v) failed to write mp metadata", mp.config.PartitionId)
+		return err
+	}
+	log.LogWarnf("ApplySnapshot: commit batch write success, partition(%v), applyId(%v)", mp.config.PartitionId, appIndexID)
+
+	err = mp.inodeTree.ClearBatchWriteHandle(finalHandle)
+	if err != nil {
+		log.LogErrorf("[ApplySnapshot] mp(%v) failed to clear handle", mp.config.PartitionId)
+		// Continue despite error
+	}
+
+	err = mp.flushAndCheckApplyID(appIndexID)
+	if err != nil {
+		log.LogErrorf("[ApplySnapshot] mp(%v) flush and check apply id failed, err(%v)", mp.config.PartitionId, err)
+		return err
+	}
+	log.LogWarnf("ApplySnapshot: flush and check apply id success, partition(%v), applyId(%v)", mp.config.PartitionId, appIndexID)
+
+	// Store snapshot
+	snap, err := mp.GetSnapShot()
+	if err != nil {
+		log.LogErrorf("[ApplySnapshot]: failed to open snapshot for mp(%v), store(%v), err(%v)", mp.config.PartitionId, mp.config.StoreMode, err)
+		return err
+	}
+	mp.storeChan <- &storeMsg{
+		command:      opFSMStoreTick,
+		uniqId:       mp.GetUniqId(),
+		uniqChecker:  uniqChecker.clone(),
+		multiVerList: mp.GetVerList(),
+		snap:         snap,
+	}
+
+	// Block until store snapshot completes
+	return mp.blockUntilStoreSnapshot(appIndexID)
+}
+
+// blockUntilStoreSnapshot waits for snapshot to be persisted to disk
+func (mp *metaPartition) blockUntilStoreSnapshot(appIndexID uint64) error {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	log.LogWarnf("ApplySnapshot: start to block until store snapshot to disk, mp[%v], appid %d", mp.config.PartitionId, appIndexID)
+	start := time.Now()
+
+	for {
+		select {
+		case <-ticker.C:
+			if time.Since(start) > time.Minute*20 {
+				msg := fmt.Sprintf("ApplySnapshot: wait store snapshot timeout after 20 minutes, mp %d, appId %d, storeId %d",
+					mp.config.PartitionId, appIndexID, mp.storedApplyId)
+				log.LogErrorf(msg)
+				return fmt.Errorf(msg)
+			}
+
+			if mp.raftClosed() {
+				log.LogWarnf("ApplySnapshot-blockUntilStoreSnapshot partition(%v) is closed, exit now", mp.config.PartitionId)
+				return fmt.Errorf("partition(%v) is closed", mp.config.PartitionId)
+			}
+
+			msg := fmt.Sprintf("ApplySnapshot: start check storedApplyId, mp %d appId %d, storeAppId %d, cost %s",
+				mp.config.PartitionId, appIndexID, mp.storedApplyId, time.Since(start).String())
+			if time.Since(start) > time.Minute {
+				log.LogWarnf("still block after one minute, msg %s", msg)
+			} else {
+				log.LogInfo(msg)
+			}
+
+			if mp.storedApplyId >= appIndexID {
+				log.LogWarnf("ApplySnapshot: store snapshot success, msg %s", msg)
+				return nil
+			}
+
+		case <-mp.stopC:
+			log.LogWarnf("ApplySnapshot: revice stop signal, exit now, partition(%d), applyId(%d)", mp.config.PartitionId, mp.applyID)
+			return errors.New("server has been shutdown when block")
+		}
 	}
 }
 
