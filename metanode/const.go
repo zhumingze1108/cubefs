@@ -199,6 +199,15 @@ const (
 	opFSMExtentSplit       = 75
 	opFSMSentToChanWithVer = 76
 
+	// Raw data operations (zero-copy snapshot)
+	opFSMRawInodeData      = 77
+	opFSMRawDentryData     = 78
+	opFSMRawExtendData     = 79
+	opFSMRawMultipartData  = 80
+	opFSMRawTxData         = 81
+	opFSMRawTxRbInodeData  = 82
+	opFSMRawTxRbDentryData = 83
+
 	// Hybrid cloud operations
 	opFSMRenewalForbiddenMigration                = 87
 	opFSMUpdateExtentKeyAfterMigration            = 88

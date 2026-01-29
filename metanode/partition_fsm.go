@@ -1068,6 +1068,72 @@ func (mp *metaPartition) processSnapshotItem(
 			log.LogDebugf("ApplySnapshot: worker(%d) write snap uniqChecker", workerID)
 		}
 
+	// Zero-copy raw data operations
+	case opFSMRawInodeData:
+		// PutRaw will handle unmarshaling for memory mode or direct write for RocksDB mode
+		if err := mp.inodeTree.PutRaw(dbWriteHandle, snap.K, snap.V); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) put raw inode failed, partitionID(%v) err(%v)",
+				workerID, mp.config.PartitionId, err)
+			return err
+		}
+		// Extract inode ID from key for cursor tracking
+		var inodeID uint64
+		if len(snap.K) == 17 && snap.K[8] == byte(InodeTable) {
+			// RocksDB full format: partitionId (8) + tableType (1) + inode_id (8)
+			inodeID = binary.BigEndian.Uint64(snap.K[9:17])
+			agg.atomicMaxUint64(&agg.cursor, inodeID)
+		} else {
+			return errors.New("invalid inode key")
+		}
+
+	case opFSMRawDentryData:
+		// PutRaw will handle unmarshaling for memory mode or direct write for RocksDB mode
+		if err := mp.dentryTree.PutRaw(dbWriteHandle, snap.K, snap.V); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) put raw dentry failed, partitionID(%v) err(%v)",
+				workerID, mp.config.PartitionId, err)
+			return err
+		}
+
+	case opFSMRawExtendData:
+		// PutRaw will handle unmarshaling for memory mode or direct write for RocksDB mode
+		if err := mp.extendTree.PutRaw(dbWriteHandle, snap.K, snap.V); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) put raw extend failed, partitionID(%v) err(%v)",
+				workerID, mp.config.PartitionId, err)
+			return err
+		}
+
+	case opFSMRawMultipartData:
+		// PutRaw will handle unmarshaling for memory mode or direct write for RocksDB mode
+		if err := mp.multipartTree.PutRaw(dbWriteHandle, snap.K, snap.V); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) put raw multipart failed, partitionID(%v) err(%v)",
+				workerID, mp.config.PartitionId, err)
+			return err
+		}
+
+	case opFSMRawTxData:
+		// PutRaw will handle unmarshaling for memory mode or direct write for RocksDB mode
+		if err := mp.txProcessor.txManager.txTree.PutRaw(dbWriteHandle, snap.K, snap.V); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) put raw tx failed, partitionID(%v) err(%v)",
+				workerID, mp.config.PartitionId, err)
+			return err
+		}
+
+	case opFSMRawTxRbInodeData:
+		// PutRaw will handle unmarshaling for memory mode or direct write for RocksDB mode
+		if err := mp.txProcessor.txResource.txRbInodeTree.PutRaw(dbWriteHandle, snap.K, snap.V); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) put raw tx rb inode failed, partitionID(%v) err(%v)",
+				workerID, mp.config.PartitionId, err)
+			return err
+		}
+
+	case opFSMRawTxRbDentryData:
+		// PutRaw will handle unmarshaling for memory mode or direct write for RocksDB mode
+		if err := mp.txProcessor.txResource.txRbDentryTree.PutRaw(dbWriteHandle, snap.K, snap.V); err != nil {
+			log.LogErrorf("ApplySnapshot: worker(%d) put raw tx rb dentry failed, partitionID(%v) err(%v)",
+				workerID, mp.config.PartitionId, err)
+			return err
+		}
+
 	default:
 		ver := atomic.LoadUint32(leaderSnapFormatVer)
 		if ver != math.MaxUint32 && ver > mp.manager.metaNode.raftSyncSnapFormatVersion {

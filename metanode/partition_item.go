@@ -121,6 +121,12 @@ func NewMetaItem(op uint32, key, value []byte) *MetaItem {
 	}
 }
 
+// RawMetaItem represents raw key-value data from RocksDB without unmarshaling (zero-copy)
+type RawMetaItem struct {
+	TableType byte   // Table type identifier
+	Key       []byte // Raw key bytes
+	Value     []byte // Raw value bytes
+}
 type fileData struct {
 	filename string
 	data     []byte
@@ -133,7 +139,7 @@ const (
 	// version since transaction feature, added formatVersion, txId and cursor in MetaItemIterator struct
 	SnapFormatVersion_1
 
-	snapshotDataChBufferSize = 10
+	snapshotDataChBufferSize = 100
 )
 
 // MetaItemIterator defines the iterator of the MetaItem.
@@ -296,79 +302,222 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 
 		// NOTE: if using rocksdb, send base
 		// process inodes
-		if err = iter.treeSnap.Range(InodeType, func(v interface{}) bool {
-			log.LogDebugf("[newMetaItemIterator] send inode")
-			return produceItem(v.(*Inode))
-		}); err != nil {
-			produceError(err)
-			return
+		log.LogDebugf("[newMetaItemIterator] start producing inodes, partitionID(%v)", mp.config.PartitionId)
+		if mp.inodeTree.GetStoreMode() == proto.StoreModeMem {
+			// Memory leader: use Range, send opFSMCreateInode
+			if err = iter.treeSnap.Range(InodeType, func(item interface{}) bool {
+				return produceItem(item.(*Inode))
+			}); err != nil {
+				produceError(err)
+				return
+			}
+		} else {
+			// RocksDB leader: use RangeRaw, send opFSMRawInodeData
+			if err = iter.treeSnap.RangeRaw(InodeType, func(key, value []byte) bool {
+				keyCopy := make([]byte, len(key))
+				valueCopy := make([]byte, len(value))
+				copy(keyCopy, key)
+				copy(valueCopy, value)
+				rawItem := &RawMetaItem{
+					TableType: byte(InodeTable),
+					Key:       keyCopy,
+					Value:     valueCopy,
+				}
+				return produceItem(rawItem)
+			}); err != nil {
+				produceError(err)
+				return
+			}
 		}
 		if checkClose() {
 			return
 		}
 		// process dentries
-		if err = iter.treeSnap.Range(DentryType, func(v interface{}) bool {
-			log.LogDebugf("[newMetaItemIterator] send dentries")
-			return produceItem(v.(*Dentry))
-		}); err != nil {
-			produceError(err)
-			return
+		log.LogDebugf("[newMetaItemIterator] start producing dentries, partitionID(%v)", mp.config.PartitionId)
+		if mp.dentryTree.GetStoreMode() == proto.StoreModeMem {
+			// Memory leader: use Range, send opFSMCreateDentry
+			if err = iter.treeSnap.Range(DentryType, func(item interface{}) bool {
+				return produceItem(item.(*Dentry))
+			}); err != nil {
+				produceError(err)
+				return
+			}
+		} else {
+			// RocksDB leader: use RangeRaw, send opFSMRawDentryData
+			if err = iter.treeSnap.RangeRaw(DentryType, func(key, value []byte) bool {
+				keyCopy := make([]byte, len(key))
+				valueCopy := make([]byte, len(value))
+				copy(keyCopy, key)
+				copy(valueCopy, value)
+				rawItem := &RawMetaItem{
+					TableType: byte(DentryTable),
+					Key:       keyCopy,
+					Value:     valueCopy,
+				}
+				return produceItem(rawItem)
+			}); err != nil {
+				produceError(err)
+				return
+			}
 		}
 		if checkClose() {
 			return
 		}
 		// process extends
-		if err = iter.treeSnap.Range(ExtendType, func(v interface{}) bool {
-			log.LogDebugf("[newMetaItemIterator] send extends")
-			return produceItem(v.(*Extend))
-		}); err != nil {
-			produceError(err)
-			return
+		log.LogDebugf("[newMetaItemIterator] start producing extends, partitionID(%v)", mp.config.PartitionId)
+		if mp.extendTree.GetStoreMode() == proto.StoreModeMem {
+			// Memory leader: use Range, send opFSMSetXAttr
+			if err = iter.treeSnap.Range(ExtendType, func(item interface{}) bool {
+				return produceItem(item.(*Extend))
+			}); err != nil {
+				produceError(err)
+				return
+			}
+		} else {
+			// RocksDB leader: use RangeRaw, send opFSMRawExtendData
+			if err = iter.treeSnap.RangeRaw(ExtendType, func(key, value []byte) bool {
+				keyCopy := make([]byte, len(key))
+				valueCopy := make([]byte, len(value))
+				copy(keyCopy, key)
+				copy(valueCopy, value)
+				rawItem := &RawMetaItem{
+					TableType: byte(ExtendTable),
+					Key:       keyCopy,
+					Value:     valueCopy,
+				}
+				return produceItem(rawItem)
+			}); err != nil {
+				produceError(err)
+				return
+			}
 		}
 		if checkClose() {
 			return
 		}
-		// process multiparts
-		if err = iter.treeSnap.Range(MultipartType, func(v interface{}) bool {
-			log.LogDebugf("[newMetaItemIterator] send multi parts")
-			return produceItem(v.(*Multipart))
-		}); err != nil {
-			produceError(err)
-			return
+
+		log.LogDebugf("ApplySnapshot: start producing multiparts, partitionID(%v)", mp.config.PartitionId)
+		if mp.multipartTree.GetStoreMode() == proto.StoreModeMem {
+			// Memory leader: use Range, send opFSMCreateMultipart
+			if err = iter.treeSnap.Range(MultipartType, func(item interface{}) bool {
+				return produceItem(item.(*Multipart))
+			}); err != nil {
+				produceError(err)
+				return
+			}
+		} else {
+			// RocksDB leader: use RangeRaw, send opFSMRawMultipartData
+			if err = iter.treeSnap.RangeRaw(MultipartType, func(key, value []byte) bool {
+				keyCopy := make([]byte, len(key))
+				valueCopy := make([]byte, len(value))
+				copy(keyCopy, key)
+				copy(valueCopy, value)
+				rawItem := &RawMetaItem{
+					TableType: byte(MultipartTable),
+					Key:       keyCopy,
+					Value:     valueCopy,
+				}
+				return produceItem(rawItem)
+			}); err != nil {
+				produceError(err)
+				return
+			}
 		}
 		if checkClose() {
 			return
 		}
 
 		if si.SnapFormatVersion == SnapFormatVersion_1 {
-			if err = iter.treeSnap.Range(TransactionType, func(i interface{}) bool {
-				log.LogDebugf("[newMetaItemIterator] send transaction")
-				return produceItem(i)
-			}); err != nil {
-				produceError(err)
-				return
+			// Process transactions (single threaded, usually small)
+			log.LogDebugf("ApplySnapshot: start producing transactions, partitionID(%v)", mp.config.PartitionId)
+			if mp.txProcessor.txManager.txTree.GetStoreMode() == proto.StoreModeMem {
+				// Memory leader: use Range, send opFSMTxSnapshot
+				if err = iter.treeSnap.Range(TransactionType, func(item interface{}) bool {
+					return produceItem(item.(*proto.TransactionInfo))
+				}); err != nil {
+					produceError(err)
+					return
+				}
+			} else {
+				// RocksDB leader: use RangeRaw, send opFSMRawTxData
+				if err = iter.treeSnap.RangeRaw(TransactionType, func(key, value []byte) bool {
+					keyCopy := make([]byte, len(key))
+					valueCopy := make([]byte, len(value))
+					copy(keyCopy, key)
+					copy(valueCopy, value)
+					rawItem := &RawMetaItem{
+						TableType: byte(TransactionTable),
+						Key:       keyCopy,
+						Value:     valueCopy,
+					}
+					return produceItem(rawItem)
+				}); err != nil {
+					produceError(err)
+					return
+				}
 			}
 			if checkClose() {
 				return
 			}
 
-			if err = iter.treeSnap.Range(TransactionRollbackInodeType, func(i interface{}) bool {
-				log.LogDebugf("[newMetaItemIterator] send rb inodes")
-				return produceItem(i)
-			}); err != nil {
-				produceError(err)
-				return
+			// Process transaction rollback inodes (single threaded, usually small)
+			log.LogDebugf("ApplySnapshot: start producing tx rb inodes, partitionID(%v)", mp.config.PartitionId)
+			if mp.txProcessor.txResource.txRbInodeTree.GetStoreMode() == proto.StoreModeMem {
+				// Memory leader: use Range, send opFSMTxRbInodeSnapshot
+				if err = iter.treeSnap.Range(TransactionRollbackInodeType, func(item interface{}) bool {
+					return produceItem(item.(*TxRollbackInode))
+				}); err != nil {
+					produceError(err)
+					return
+				}
+			} else {
+				// RocksDB leader: use RangeRaw, send opFSMRawTxRbInodeData
+				if err = iter.treeSnap.RangeRaw(TransactionRollbackInodeType, func(key, value []byte) bool {
+					keyCopy := make([]byte, len(key))
+					valueCopy := make([]byte, len(value))
+					copy(keyCopy, key)
+					copy(valueCopy, value)
+					rawItem := &RawMetaItem{
+						TableType: byte(TransactionRollbackInodeTable),
+						Key:       keyCopy,
+						Value:     valueCopy,
+					}
+					return produceItem(rawItem)
+				}); err != nil {
+					produceError(err)
+					return
+				}
 			}
 			if checkClose() {
 				return
 			}
 
-			if err = iter.treeSnap.Range(TransactionRollbackDentryType, func(i interface{}) bool {
-				log.LogDebugf("[newMetaItemIterator] send rb dentries")
-				return produceItem(i)
-			}); err != nil {
-				produceError(err)
-				return
+			// Process transaction rollback dentries (single threaded, usually small)
+			log.LogDebugf("ApplySnapshot: start producing tx rb dentries, partitionID(%v)", mp.config.PartitionId)
+			if mp.txProcessor.txResource.txRbDentryTree.GetStoreMode() == proto.StoreModeMem {
+				// Memory leader: use Range, send opFSMTxRbDentrySnapshot
+				if err = iter.treeSnap.Range(TransactionRollbackDentryType, func(item interface{}) bool {
+					return produceItem(item.(*TxRollbackDentry))
+				}); err != nil {
+					produceError(err)
+					return
+				}
+			} else {
+				// RocksDB leader: use RangeRaw, send opFSMRawTxRbDentryData
+				if err = iter.treeSnap.RangeRaw(TransactionRollbackDentryType, func(key, value []byte) bool {
+					keyCopy := make([]byte, len(key))
+					valueCopy := make([]byte, len(value))
+					copy(keyCopy, key)
+					copy(valueCopy, value)
+					rawItem := &RawMetaItem{
+						TableType: byte(TransactionRollbackDentryTable),
+						Key:       keyCopy,
+						Value:     valueCopy,
+					}
+					return produceItem(rawItem)
+				}); err != nil {
+					produceError(err)
+					return
+				}
 			}
 			if checkClose() {
 				return
@@ -450,6 +599,31 @@ func (si *MetaItemIterator) Next() (data []byte, err error) {
 		binary.BigEndian.PutUint64(applyIDBuf, si.applyID)
 		data = applyIDBuf
 		return
+	case *RawMetaItem:
+		// Zero-copy path: directly use raw data with appropriate op code
+		var opCode uint32
+		switch typedItem.TableType {
+		case byte(InodeTable):
+			opCode = opFSMRawInodeData
+		case byte(DentryTable):
+			opCode = opFSMRawDentryData
+		case byte(ExtendTable):
+			opCode = opFSMRawExtendData
+		case byte(MultipartTable):
+			opCode = opFSMRawMultipartData
+		case byte(TransactionTable):
+			opCode = opFSMRawTxData
+		case byte(TransactionRollbackInodeTable):
+			opCode = opFSMRawTxRbInodeData
+		case byte(TransactionRollbackDentryTable):
+			opCode = opFSMRawTxRbDentryData
+		default:
+			err = fmt.Errorf("unknown table type: %d", typedItem.TableType)
+			si.err = err
+			si.Close()
+			return
+		}
+		snap = NewMetaItem(opCode, typedItem.Key, typedItem.Value)
 	case SnapItemWrapper:
 		if typedItem.key == SiwKeySnapFormatVer {
 			snapFormatVerBuf := make([]byte, 8)

@@ -1745,6 +1745,15 @@ func (b *InodeRocks) Insert(handle interface{}, inode *Inode) error {
 	return nil
 }
 
+// PutRaw writes raw key-value data directly to RocksDB without unmarshaling (zero-copy)
+func (b *InodeRocks) PutRaw(handle interface{}, key, value []byte) error {
+	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.inodeCnt, key, value); err != nil {
+		log.LogErrorf("[InodeRocksPutRaw] write error key_len(%d) value_len(%d) err(%v)", len(key), len(value), err)
+		return err
+	}
+	return nil
+}
+
 func (b *DentryRocks) ReplaceOrInsert(handle interface{}, dentry *Dentry, replace bool) (den *Dentry, ok bool, err error) {
 	var key, bs, v []byte
 
@@ -1795,6 +1804,15 @@ func (b *DentryRocks) Insert(handle interface{}, dentry *Dentry) error {
 
 	if err = b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.dentryCnt, key, bs); err != nil {
 		log.LogErrorf("[DentryRocksSnapshot] write dentry: %v key: %v, err: %v", dentry, key, err)
+		return err
+	}
+	return nil
+}
+
+// PutRaw writes raw key-value data directly to RocksDB without unmarshaling (zero-copy)
+func (b *DentryRocks) PutRaw(handle interface{}, key, value []byte) error {
+	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.dentryCnt, key, value); err != nil {
+		log.LogErrorf("[DentryRocksPutRaw] write error key_len(%d) value_len(%d) err(%v)", len(key), len(value), err)
 		return err
 	}
 	return nil
@@ -1854,6 +1872,15 @@ func (b *ExtendRocks) Insert(handle interface{}, extend *Extend) error {
 	return nil
 }
 
+// PutRaw writes raw key-value data directly to RocksDB without unmarshaling (zero-copy)
+func (b *ExtendRocks) PutRaw(handle interface{}, key, value []byte) error {
+	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.extendCnt, key, value); err != nil {
+		log.LogErrorf("[ExtendRocksPutRaw] write error key_len(%d) value_len(%d) err(%v)", len(key), len(value), err)
+		return err
+	}
+	return nil
+}
+
 func (b *MultipartRocks) ReplaceOrInsert(handle interface{}, mul *Multipart, replace bool) (multipart *Multipart, ok bool, err error) {
 	var key, bs, v []byte
 
@@ -1900,6 +1927,15 @@ func (b *MultipartRocks) Insert(handle interface{}, mul *Multipart) error {
 
 	if err = b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.multiCnt, key, bs); err != nil {
 		log.LogErrorf("[MultipartRocksSnapshot] write multipart: %v key: %v, err: %v", mul, key, err)
+		return err
+	}
+	return nil
+}
+
+// PutRaw writes raw key-value data directly to RocksDB without unmarshaling (zero-copy)
+func (b *MultipartRocks) PutRaw(handle interface{}, key, value []byte) error {
+	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.multiCnt, key, value); err != nil {
+		log.LogErrorf("[MultipartRocksPutRaw] write error key_len(%d) value_len(%d) err(%v)", len(key), len(value), err)
 		return err
 	}
 	return nil
@@ -1959,6 +1995,15 @@ func (b *TransactionRocks) Insert(handle interface{}, tx *proto.TransactionInfo)
 	return nil
 }
 
+// PutRaw writes raw key-value data directly to RocksDB without unmarshaling (zero-copy)
+func (b *TransactionRocks) PutRaw(handle interface{}, key, value []byte) error {
+	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.txCnt, key, value); err != nil {
+		log.LogErrorf("[TransactionRocksPutRaw] write error key_len(%d) value_len(%d) err(%v)", len(key), len(value), err)
+		return err
+	}
+	return nil
+}
+
 func (b *TransactionRollbackInodeRocks) ReplaceOrInsert(handle interface{}, ino *TxRollbackInode, replace bool) (inode *TxRollbackInode, ok bool, err error) {
 	var key, bs, v []byte
 
@@ -2012,6 +2057,15 @@ func (b *TransactionRollbackInodeRocks) Insert(handle interface{}, ino *TxRollba
 	return nil
 }
 
+// PutRaw writes raw key-value data directly to RocksDB without unmarshaling (zero-copy)
+func (b *TransactionRollbackInodeRocks) PutRaw(handle interface{}, key, value []byte) error {
+	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.txRbInodeCnt, key, value); err != nil {
+		log.LogErrorf("[TxRbInodeRocksPutRaw] write error key_len(%d) value_len(%d) err(%v)", len(key), len(value), err)
+		return err
+	}
+	return nil
+}
+
 func (b *TransactionRollbackDentryRocks) ReplaceOrInsert(handle interface{}, den *TxRollbackDentry, replace bool) (dentry *TxRollbackDentry, ok bool, err error) {
 	var key, bs, v []byte
 
@@ -2059,6 +2113,15 @@ func (b *TransactionRollbackDentryRocks) Insert(handle interface{}, den *TxRollb
 
 	if err = b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.txRbDentryCnt, key, bs); err != nil {
 		log.LogErrorf("[TxRbDentryRocksSnapshot] write error %v, %v", key, err)
+		return err
+	}
+	return nil
+}
+
+// PutRaw writes raw key-value data directly to RocksDB without unmarshaling (zero-copy)
+func (b *TransactionRollbackDentryRocks) PutRaw(handle interface{}, key, value []byte) error {
+	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.txRbDentryCnt, key, value); err != nil {
+		log.LogErrorf("[TxRbDentryRocksPutRaw] write error key_len(%d) value_len(%d) err(%v)", len(key), len(value), err)
 		return err
 	}
 	return nil
@@ -2692,6 +2755,22 @@ func (r *RocksSnapShot) RangeReuseDentry(cb func(item *Dentry) bool) error {
 	startBuf := r.tree.GetRocksdbNormalKey(byte(DentryTable))
 	defer PutRocksdbNormalKey(startBuf)
 	endBuf := r.tree.GetRocksdbNormalKey(byte(DentryTable) + 1)
+	defer PutRocksdbNormalKey(endBuf)
+	startBytes := startBuf.Bytes()
+	endBytes := endBuf.Bytes()
+
+	return r.tree.RangeWithSnap(startBytes, endBytes, r.snap, callbackFunc)
+}
+
+// RangeRaw iterates over raw key-value pairs without unmarshaling (zero-copy)
+func (r *RocksSnapShot) RangeRaw(tp TreeType, cb func(key, value []byte) bool) error {
+	tableType := getTableTypeKey(tp)
+	callbackFunc := func(k, v []byte) (bool, error) {
+		return cb(k, v), nil
+	}
+	startBuf := r.tree.GetRocksdbNormalKey(byte(tableType))
+	defer PutRocksdbNormalKey(startBuf)
+	endBuf := r.tree.GetRocksdbNormalKey(byte(tableType) + 1)
 	defer PutRocksdbNormalKey(endBuf)
 	startBytes := startBuf.Bytes()
 	endBytes := endBuf.Bytes()

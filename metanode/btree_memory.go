@@ -15,6 +15,8 @@
 package metanode
 
 import (
+	"encoding/binary"
+	"fmt"
 	"sync"
 
 	"github.com/cubefs/cubefs/proto"
@@ -92,6 +94,51 @@ func (b *MemSnapShot) RangeReuseInode(cb func(item *Inode) bool) error {
 
 func (b *MemSnapShot) RangeReuseDentry(cb func(item *Dentry) bool) error {
 	return b.dentry.Range(nil, nil, cb)
+}
+
+// RangeRaw for memory mode - marshal items to bytes
+func (b *MemSnapShot) RangeRaw(tp TreeType, cb func(key, value []byte) bool) error {
+	return b.Range(tp, func(item interface{}) bool {
+		// For memory mode, we need to marshal the item
+		// This is not truly zero-copy, but maintains interface compatibility
+		var key, value []byte
+		switch tp {
+		case InodeType:
+			inode := item.(*Inode)
+			key = inode.MarshalKey()
+			value = inode.MarshalValue()
+		case DentryType:
+			dentry := item.(*Dentry)
+			key = dentry.MarshalKey()
+			value = dentry.MarshalValue()
+		case ExtendType:
+			extend := item.(*Extend)
+			if bs, err := extend.Bytes(); err == nil {
+				value = bs
+			}
+		case MultipartType:
+			multipart := item.(*Multipart)
+			if bs, err := multipart.Bytes(); err == nil {
+				value = bs
+			}
+		case TransactionType:
+			tx := item.(*proto.TransactionInfo)
+			if bs, err := tx.Marshal(); err == nil {
+				value = bs
+			}
+		case TransactionRollbackInodeType:
+			rbInode := item.(*TxRollbackInode)
+			if bs, err := rbInode.Marshal(); err == nil {
+				value = bs
+			}
+		case TransactionRollbackDentryType:
+			rbDentry := item.(*TxRollbackDentry)
+			if bs, err := rbDentry.Marshal(); err == nil {
+				value = bs
+			}
+		}
+		return cb(key, value)
+	})
 }
 
 func (b *MemSnapShot) Close() {}
@@ -418,6 +465,32 @@ func (i *InodeBTree) Insert(handle interface{}, inode *Inode) error {
 	return nil
 }
 
+// PutRaw for memory mode: unmarshal key and value, then insert
+// This is called when receiving opFSMRawInodeData from RocksDB leader
+func (i *InodeBTree) PutRaw(handle interface{}, key, value []byte) error {
+	ino := NewInode(0, 0)
+
+	// Handle key format: RocksDB stores partitionId (8 bytes) + table_type (1 byte) + inode_id (8 bytes) = 17 bytes
+	var keyData []byte
+	if len(key) < 17 || key[8] != byte(InodeTable) {
+		return fmt.Errorf("invalid inode key")
+	}
+	keyData = key[9:17]
+
+	if err := ino.UnmarshalKey(keyData); err != nil {
+		return fmt.Errorf("unmarshal inode key failed: %w", err)
+	}
+
+	// Handle value format: RocksDB stores full Marshal() data (keyLen + key + valLen + value)
+	if err := ino.Unmarshal(value); err != nil {
+		return fmt.Errorf("unmarshal inode (RocksDB format) failed: %w", err)
+	}
+
+	// Insert into memory tree
+	i.BTree.Insert(ino)
+	return nil
+}
+
 func (i *DentryBTree) ReplaceOrInsert(handle interface{}, dentry *Dentry, replace bool) (*Dentry, bool, error) {
 	item, ok := i.BTree.ReplaceOrInsert(dentry, replace)
 	if !ok {
@@ -427,6 +500,32 @@ func (i *DentryBTree) ReplaceOrInsert(handle interface{}, dentry *Dentry, replac
 }
 
 func (i *DentryBTree) Insert(handle interface{}, dentry *Dentry) error {
+	i.BTree.Insert(dentry)
+	return nil
+}
+
+// PutRaw for memory mode: unmarshal key and value, then insert
+// This is called when receiving opFSMRawDentryData from RocksDB leader
+func (i *DentryBTree) PutRaw(handle interface{}, key, value []byte) error {
+	dentry := &Dentry{}
+
+	// Handle key format: RocksDB stores partitionId (8 bytes) + table_type (1 byte) + actual_key
+	var keyData []byte
+	if len(key) <= 9 || key[8] != byte(DentryTable) {
+		return fmt.Errorf("invalid dentry key")
+	}
+	keyData = key[9:]
+
+	if err := dentry.UnmarshalKey(keyData); err != nil {
+		return fmt.Errorf("unmarshal dentry key failed: %w", err)
+	}
+
+	// Handle value format: RocksDB stores full Marshal() data (keyLen + key + valLen + value)
+	if err := dentry.Unmarshal(value); err != nil {
+		return fmt.Errorf("unmarshal dentry (RocksDB format) failed: %w", err)
+	}
+
+	// Insert into memory tree
 	i.BTree.Insert(dentry)
 	return nil
 }
@@ -444,6 +543,26 @@ func (i *ExtendBTree) Insert(handle interface{}, extend *Extend) error {
 	return nil
 }
 
+// PutRaw for memory mode: unmarshal key and value, then insert
+// This is called when receiving opFSMRawExtendData from RocksDB leader
+func (i *ExtendBTree) PutRaw(handle interface{}, key, value []byte) error {
+	// Handle key format: RocksDB stores partitionId (8 bytes) + table_type (1 byte) + inode_id (8 bytes) = 17 bytes
+	if len(key) < 17 || key[8] != byte(ExtendTable) {
+		return fmt.Errorf("invalid extend key")
+	}
+	inodeID := binary.BigEndian.Uint64(key[9:17])
+
+	extend, err := NewExtendFromBytes(value)
+	if err != nil {
+		return fmt.Errorf("unmarshal extend failed: %w", err)
+	}
+	extend.inode = inodeID
+
+	// Insert into memory tree
+	i.BTree.Insert(extend)
+	return nil
+}
+
 func (i *MultipartBTree) ReplaceOrInsert(handle interface{}, mul *Multipart, replace bool) (*Multipart, bool, error) {
 	item, ok := i.BTree.ReplaceOrInsert(mul, replace)
 	if !ok {
@@ -454,6 +573,19 @@ func (i *MultipartBTree) ReplaceOrInsert(handle interface{}, mul *Multipart, rep
 
 func (i *MultipartBTree) Insert(handle interface{}, mul *Multipart) error {
 	i.BTree.Insert(mul)
+	return nil
+}
+
+// PutRaw for memory mode: unmarshal value, then insert
+// This is called when receiving opFSMRawMultipartData from RocksDB leader
+func (i *MultipartBTree) PutRaw(handle interface{}, key, value []byte) error {
+	multipart := MultipartFromBytes(value)
+	if multipart == nil {
+		return fmt.Errorf("failed to unmarshal multipart from bytes")
+	}
+
+	// Insert into memory tree
+	i.BTree.Insert(multipart)
 	return nil
 }
 
@@ -470,6 +602,19 @@ func (i *TransactionBTree) Insert(handle interface{}, tx *proto.TransactionInfo)
 	return nil
 }
 
+// PutRaw for memory mode: unmarshal value, then insert
+// This is called when receiving opFSMRawTxData from RocksDB leader
+func (i *TransactionBTree) PutRaw(handle interface{}, key, value []byte) error {
+	txInfo := proto.NewTransactionInfo(0, proto.TxTypeUndefined)
+	if err := txInfo.Unmarshal(value); err != nil {
+		return fmt.Errorf("unmarshal transaction failed: %w", err)
+	}
+
+	// Insert into memory tree
+	i.BTree.Insert(txInfo)
+	return nil
+}
+
 func (i *TransactionRollbackInodeBTree) ReplaceOrInsert(handle interface{}, inode *TxRollbackInode, replace bool) (*TxRollbackInode, bool, error) {
 	item, ok := i.BTree.ReplaceOrInsert(inode, replace)
 	if !ok {
@@ -483,6 +628,19 @@ func (i *TransactionRollbackInodeBTree) Insert(handle interface{}, inode *TxRoll
 	return nil
 }
 
+// PutRaw for memory mode: unmarshal value, then insert
+// This is called when receiving opFSMRawTxRbInodeData from RocksDB leader
+func (i *TransactionRollbackInodeBTree) PutRaw(handle interface{}, key, value []byte) error {
+	txRbInode := NewTxRollbackInode(nil, []uint32{}, nil, 0)
+	if err := txRbInode.Unmarshal(value); err != nil {
+		return fmt.Errorf("unmarshal tx rollback inode failed: %w", err)
+	}
+
+	// Insert into memory tree
+	i.BTree.Insert(txRbInode)
+	return nil
+}
+
 func (i *TransactionRollbackDentryBTree) ReplaceOrInsert(handle interface{}, dentry *TxRollbackDentry, replace bool) (*TxRollbackDentry, bool, error) {
 	item, ok := i.BTree.ReplaceOrInsert(dentry, replace)
 	if !ok {
@@ -493,6 +651,19 @@ func (i *TransactionRollbackDentryBTree) ReplaceOrInsert(handle interface{}, den
 
 func (i *TransactionRollbackDentryBTree) Insert(handle interface{}, dentry *TxRollbackDentry) error {
 	i.BTree.Insert(dentry)
+	return nil
+}
+
+// PutRaw for memory mode: unmarshal value, then insert
+// This is called when receiving opFSMRawTxRbDentryData from RocksDB leader
+func (i *TransactionRollbackDentryBTree) PutRaw(handle interface{}, key, value []byte) error {
+	txRbDentry := NewTxRollbackDentry(nil, nil, 0)
+	if err := txRbDentry.Unmarshal(value); err != nil {
+		return fmt.Errorf("unmarshal tx rollback dentry failed: %w", err)
+	}
+
+	// Insert into memory tree
+	i.BTree.Insert(txRbDentry)
 	return nil
 }
 
