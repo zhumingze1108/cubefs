@@ -22,7 +22,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"reflect"
 	"strings"
 	"sync"
 
@@ -52,24 +51,22 @@ func (s *MetaItem) MarshalJson() ([]byte, error) {
 //	| byte | 4  |  4   | LenK |  4   | LenV |
 //	+------+----+------+------+------+------+
 func (s *MetaItem) MarshalBinary() (result []byte, err error) {
-	buff := bytes.NewBuffer(make([]byte, 0))
-	buff.Grow(4 + len(s.K) + len(s.V))
-	if err = binary.Write(buff, binary.BigEndian, s.Op); err != nil {
-		return
-	}
-	if err = binary.Write(buff, binary.BigEndian, uint32(len(s.K))); err != nil {
-		return
-	}
-	if _, err = buff.Write(s.K); err != nil {
-		return
-	}
-	if err = binary.Write(buff, binary.BigEndian, uint32(len(s.V))); err != nil {
-		return
-	}
-	if _, err = buff.Write(s.V); err != nil {
-		return
-	}
-	result = buff.Bytes()
+	keyLen := len(s.K)
+	valLen := len(s.V)
+	result = make([]byte, 4+4+keyLen+4+valLen)
+
+	offset := 0
+	binary.BigEndian.PutUint32(result[offset:], s.Op)
+	offset += 4
+
+	binary.BigEndian.PutUint32(result[offset:], uint32(keyLen))
+	offset += 4
+	copy(result[offset:], s.K)
+	offset += keyLen
+
+	binary.BigEndian.PutUint32(result[offset:], uint32(valLen))
+	offset += 4
+	copy(result[offset:], s.V)
 	return
 }
 
@@ -112,6 +109,23 @@ func (s *MetaItem) UnmarshalBinary(raw []byte) (err error) {
 	return
 }
 
+func marshalMetaItem(op uint32, key, value []byte) []byte {
+	keyLen := len(key)
+	valLen := len(value)
+	result := make([]byte, 4+4+keyLen+4+valLen)
+	offset := 0
+	binary.BigEndian.PutUint32(result[offset:], op)
+	offset += 4
+	binary.BigEndian.PutUint32(result[offset:], uint32(keyLen))
+	offset += 4
+	copy(result[offset:], key)
+	offset += keyLen
+	binary.BigEndian.PutUint32(result[offset:], uint32(valLen))
+	offset += 4
+	copy(result[offset:], value)
+	return result
+}
+
 // NewMetaItem returns a new MetaItem.
 func NewMetaItem(op uint32, key, value []byte) *MetaItem {
 	return &MetaItem{
@@ -119,17 +133,6 @@ func NewMetaItem(op uint32, key, value []byte) *MetaItem {
 		K:  key,
 		V:  value,
 	}
-}
-
-// RawMetaItem represents raw key-value data from RocksDB without unmarshaling (zero-copy)
-type RawMetaItem struct {
-	TableType byte   // Table type identifier
-	Key       []byte // Raw key bytes
-	Value     []byte // Raw value bytes
-}
-type fileData struct {
-	filename string
-	data     []byte
 }
 
 const (
@@ -156,7 +159,7 @@ type MetaItemIterator struct {
 
 	filenames []string
 
-	dataCh    chan interface{}
+	dataCh    chan []byte
 	errorCh   chan error
 	err       error
 	closeCh   chan struct{}
@@ -211,7 +214,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		return nil, errors.NewErrorf("get mp[%v] tree snap failed", mp.config.PartitionId)
 	}
 
-	si.dataCh = make(chan interface{}, snapshotDataChBufferSize)
+	si.dataCh = make(chan []byte, snapshotDataChBufferSize)
 	si.errorCh = make(chan error, 1)
 	si.closeCh = make(chan struct{})
 
@@ -240,9 +243,9 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			close(iter.errorCh)
 			si.treeSnap.Close()
 		}()
-		produceItem := func(item interface{}) (success bool) {
+		produceItem := func(data []byte) (success bool) {
 			select {
-			case iter.dataCh <- item:
+			case iter.dataCh <- data:
 				return true
 			case <-iter.closeCh:
 				return false
@@ -265,36 +268,53 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 
 		if si.SnapFormatVersion == SnapFormatVersion_0 {
 			// process index ID
-			produceItem(si.applyID)
+			applyIDBuf := make([]byte, 8)
+			binary.BigEndian.PutUint64(applyIDBuf, si.applyID)
+			produceItem(applyIDBuf)
 			log.LogDebugf("newMetaItemIterator: SnapFormatVersion_0, partitionId(%v), applyID(%v)",
 				mp.config.PartitionId, si.applyID)
 		} else if si.SnapFormatVersion == SnapFormatVersion_1 {
 			// process snapshot format version
-			snapFormatVerWrapper := SnapItemWrapper{SiwKeySnapFormatVer, si.SnapFormatVersion}
-			produceItem(snapFormatVerWrapper)
+			snapFormatVerKey := (&SnapItemWrapper{key: SiwKeySnapFormatVer}).MarshalKey()
+			snapFormatVerBuf := make([]byte, 8)
+			binary.BigEndian.PutUint32(snapFormatVerBuf, si.SnapFormatVersion)
+			produceItem(marshalMetaItem(opFSMSnapFormatVersion, snapFormatVerKey, snapFormatVerBuf))
 
 			// process apply index ID
-			applyIdWrapper := SnapItemWrapper{SiwKeyApplyId, si.applyID}
-			produceItem(applyIdWrapper)
+			applyIdKey := (&SnapItemWrapper{key: SiwKeyApplyId}).MarshalKey()
+			applyIDBuf := make([]byte, 8)
+			binary.BigEndian.PutUint64(applyIDBuf, si.applyID)
+			produceItem(marshalMetaItem(opFSMApplyId, applyIdKey, applyIDBuf))
 
 			// process txId
-			txIdWrapper := SnapItemWrapper{SiwKeyTxId, si.txId}
-			produceItem(txIdWrapper)
+			txIdKey := (&SnapItemWrapper{key: SiwKeyTxId}).MarshalKey()
+			txIDBuf := make([]byte, 8)
+			binary.BigEndian.PutUint64(txIDBuf, si.txId)
+			produceItem(marshalMetaItem(opFSMTxId, txIdKey, txIDBuf))
 
 			// process cursor
-			cursorWrapper := SnapItemWrapper{SiwKeyCursor, si.cursor}
-			produceItem(cursorWrapper)
+			cursorKey := (&SnapItemWrapper{key: SiwKeyCursor}).MarshalKey()
+			cursorBuf := make([]byte, 8)
+			binary.BigEndian.PutUint64(cursorBuf, si.cursor)
+			produceItem(marshalMetaItem(opFSMCursor, cursorKey, cursorBuf))
 
-			verListWrapper := SnapItemWrapper{SiwKeyVerList, si.verList}
-			produceItem(verListWrapper)
+			verListKey := (&SnapItemWrapper{key: SiwKeyVerList}).MarshalKey()
+			verListBuf, err := json.Marshal(si.verList)
+			if err != nil {
+				produceError(err)
+				return
+			}
+			produceItem(marshalMetaItem(opFSMVerListSnapShot, verListKey, verListBuf))
 
 			log.LogDebugf("newMetaItemIterator: SnapFormatVersion_1, partitionId(%v) applyID(%v) txId(%v) cursor(%v) uniqID(%v) verList(%v)",
 				mp.config.PartitionId, si.applyID, si.txId, si.cursor, si.uniqID, si.verList)
 
 			if si.uniqID != 0 {
 				// process uniqId
-				uniqIdWrapper := SnapItemWrapper{SiwKeyUniqId, si.uniqID}
-				produceItem(uniqIdWrapper)
+				uniqIdKey := (&SnapItemWrapper{key: SiwKeyUniqId}).MarshalKey()
+				uniqIdBuf := make([]byte, 8)
+				binary.BigEndian.PutUint64(uniqIdBuf, si.uniqID)
+				produceItem(marshalMetaItem(opFSMUniqIDSnap, uniqIdKey, uniqIdBuf))
 			}
 		} else {
 			panic(fmt.Sprintf("invalid raftSyncSnapFormatVersione: %v", si.SnapFormatVersion))
@@ -306,7 +326,8 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		if mp.inodeTree.GetStoreMode() == proto.StoreModeMem {
 			// Memory leader: use Range, send opFSMCreateInode
 			if err = iter.treeSnap.Range(InodeType, func(item interface{}) bool {
-				return produceItem(item.(*Inode))
+				inode := item.(*Inode)
+				return produceItem(marshalMetaItem(opFSMCreateInode, inode.MarshalKey(), inode.MarshalValue()))
 			}); err != nil {
 				produceError(err)
 				return
@@ -314,16 +335,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		} else {
 			// RocksDB leader: use RangeRaw, send opFSMRawInodeData
 			if err = iter.treeSnap.RangeRaw(InodeType, func(key, value []byte) bool {
-				keyCopy := make([]byte, len(key))
-				valueCopy := make([]byte, len(value))
-				copy(keyCopy, key)
-				copy(valueCopy, value)
-				rawItem := &RawMetaItem{
-					TableType: byte(InodeTable),
-					Key:       keyCopy,
-					Value:     valueCopy,
-				}
-				return produceItem(rawItem)
+				return produceItem(marshalMetaItem(opFSMRawInodeData, key, value))
 			}); err != nil {
 				produceError(err)
 				return
@@ -337,7 +349,8 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		if mp.dentryTree.GetStoreMode() == proto.StoreModeMem {
 			// Memory leader: use Range, send opFSMCreateDentry
 			if err = iter.treeSnap.Range(DentryType, func(item interface{}) bool {
-				return produceItem(item.(*Dentry))
+				dentry := item.(*Dentry)
+				return produceItem(marshalMetaItem(opFSMCreateDentry, dentry.MarshalKey(), dentry.MarshalValue()))
 			}); err != nil {
 				produceError(err)
 				return
@@ -345,16 +358,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		} else {
 			// RocksDB leader: use RangeRaw, send opFSMRawDentryData
 			if err = iter.treeSnap.RangeRaw(DentryType, func(key, value []byte) bool {
-				keyCopy := make([]byte, len(key))
-				valueCopy := make([]byte, len(value))
-				copy(keyCopy, key)
-				copy(valueCopy, value)
-				rawItem := &RawMetaItem{
-					TableType: byte(DentryTable),
-					Key:       keyCopy,
-					Value:     valueCopy,
-				}
-				return produceItem(rawItem)
+				return produceItem(marshalMetaItem(opFSMRawDentryData, key, value))
 			}); err != nil {
 				produceError(err)
 				return
@@ -368,7 +372,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		if mp.extendTree.GetStoreMode() == proto.StoreModeMem {
 			// Memory leader: use Range, send opFSMSetXAttr
 			if err = iter.treeSnap.Range(ExtendType, func(item interface{}) bool {
-				return produceItem(item.(*Extend))
+				extend := item.(*Extend)
+				raw, err := extend.Bytes()
+				if err != nil {
+					produceError(err)
+					return false
+				}
+				return produceItem(marshalMetaItem(opFSMSetXAttr, nil, raw))
 			}); err != nil {
 				produceError(err)
 				return
@@ -376,16 +386,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		} else {
 			// RocksDB leader: use RangeRaw, send opFSMRawExtendData
 			if err = iter.treeSnap.RangeRaw(ExtendType, func(key, value []byte) bool {
-				keyCopy := make([]byte, len(key))
-				valueCopy := make([]byte, len(value))
-				copy(keyCopy, key)
-				copy(valueCopy, value)
-				rawItem := &RawMetaItem{
-					TableType: byte(ExtendTable),
-					Key:       keyCopy,
-					Value:     valueCopy,
-				}
-				return produceItem(rawItem)
+				return produceItem(marshalMetaItem(opFSMRawExtendData, key, value))
 			}); err != nil {
 				produceError(err)
 				return
@@ -399,7 +400,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		if mp.multipartTree.GetStoreMode() == proto.StoreModeMem {
 			// Memory leader: use Range, send opFSMCreateMultipart
 			if err = iter.treeSnap.Range(MultipartType, func(item interface{}) bool {
-				return produceItem(item.(*Multipart))
+				multipart := item.(*Multipart)
+				raw, err := multipart.Bytes()
+				if err != nil {
+					produceError(err)
+					return false
+				}
+				return produceItem(marshalMetaItem(opFSMCreateMultipart, nil, raw))
 			}); err != nil {
 				produceError(err)
 				return
@@ -407,16 +414,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		} else {
 			// RocksDB leader: use RangeRaw, send opFSMRawMultipartData
 			if err = iter.treeSnap.RangeRaw(MultipartType, func(key, value []byte) bool {
-				keyCopy := make([]byte, len(key))
-				valueCopy := make([]byte, len(value))
-				copy(keyCopy, key)
-				copy(valueCopy, value)
-				rawItem := &RawMetaItem{
-					TableType: byte(MultipartTable),
-					Key:       keyCopy,
-					Value:     valueCopy,
-				}
-				return produceItem(rawItem)
+				return produceItem(marshalMetaItem(opFSMRawMultipartData, key, value))
 			}); err != nil {
 				produceError(err)
 				return
@@ -432,7 +430,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			if mp.txProcessor.txManager.txTree.GetStoreMode() == proto.StoreModeMem {
 				// Memory leader: use Range, send opFSMTxSnapshot
 				if err = iter.treeSnap.Range(TransactionType, func(item interface{}) bool {
-					return produceItem(item.(*proto.TransactionInfo))
+					txInfo := item.(*proto.TransactionInfo)
+					val, err := txInfo.Marshal()
+					if err != nil {
+						produceError(err)
+						return false
+					}
+					return produceItem(marshalMetaItem(opFSMTxSnapshot, []byte(txInfo.TxID), val))
 				}); err != nil {
 					produceError(err)
 					return
@@ -440,16 +444,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			} else {
 				// RocksDB leader: use RangeRaw, send opFSMRawTxData
 				if err = iter.treeSnap.RangeRaw(TransactionType, func(key, value []byte) bool {
-					keyCopy := make([]byte, len(key))
-					valueCopy := make([]byte, len(value))
-					copy(keyCopy, key)
-					copy(valueCopy, value)
-					rawItem := &RawMetaItem{
-						TableType: byte(TransactionTable),
-						Key:       keyCopy,
-						Value:     valueCopy,
-					}
-					return produceItem(rawItem)
+					return produceItem(marshalMetaItem(opFSMRawTxData, key, value))
 				}); err != nil {
 					produceError(err)
 					return
@@ -464,7 +459,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			if mp.txProcessor.txResource.txRbInodeTree.GetStoreMode() == proto.StoreModeMem {
 				// Memory leader: use Range, send opFSMTxRbInodeSnapshot
 				if err = iter.treeSnap.Range(TransactionRollbackInodeType, func(item interface{}) bool {
-					return produceItem(item.(*TxRollbackInode))
+					txRbInode := item.(*TxRollbackInode)
+					val, err := txRbInode.Marshal()
+					if err != nil {
+						produceError(err)
+						return false
+					}
+					return produceItem(marshalMetaItem(opFSMTxRbInodeSnapshot, txRbInode.inode.MarshalKey(), val))
 				}); err != nil {
 					produceError(err)
 					return
@@ -472,16 +473,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			} else {
 				// RocksDB leader: use RangeRaw, send opFSMRawTxRbInodeData
 				if err = iter.treeSnap.RangeRaw(TransactionRollbackInodeType, func(key, value []byte) bool {
-					keyCopy := make([]byte, len(key))
-					valueCopy := make([]byte, len(value))
-					copy(keyCopy, key)
-					copy(valueCopy, value)
-					rawItem := &RawMetaItem{
-						TableType: byte(TransactionRollbackInodeTable),
-						Key:       keyCopy,
-						Value:     valueCopy,
-					}
-					return produceItem(rawItem)
+					return produceItem(marshalMetaItem(opFSMRawTxRbInodeData, key, value))
 				}); err != nil {
 					produceError(err)
 					return
@@ -496,7 +488,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			if mp.txProcessor.txResource.txRbDentryTree.GetStoreMode() == proto.StoreModeMem {
 				// Memory leader: use Range, send opFSMTxRbDentrySnapshot
 				if err = iter.treeSnap.Range(TransactionRollbackDentryType, func(item interface{}) bool {
-					return produceItem(item.(*TxRollbackDentry))
+					txRbDentry := item.(*TxRollbackDentry)
+					val, err := txRbDentry.Marshal()
+					if err != nil {
+						produceError(err)
+						return false
+					}
+					return produceItem(marshalMetaItem(opFSMTxRbDentrySnapshot, []byte(txRbDentry.txDentryInfo.GetKey()), val))
 				}); err != nil {
 					produceError(err)
 					return
@@ -504,16 +502,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			} else {
 				// RocksDB leader: use RangeRaw, send opFSMRawTxRbDentryData
 				if err = iter.treeSnap.RangeRaw(TransactionRollbackDentryType, func(key, value []byte) bool {
-					keyCopy := make([]byte, len(key))
-					valueCopy := make([]byte, len(value))
-					copy(keyCopy, key)
-					copy(valueCopy, value)
-					rawItem := &RawMetaItem{
-						TableType: byte(TransactionRollbackDentryTable),
-						Key:       keyCopy,
-						Value:     valueCopy,
-					}
-					return produceItem(rawItem)
+					return produceItem(marshalMetaItem(opFSMRawTxRbDentryData, key, value))
 				}); err != nil {
 					produceError(err)
 					return
@@ -524,7 +513,12 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			}
 
 			if si.uniqID != 0 {
-				produceItem(si.uniqChecker)
+				raw, _, err := si.uniqChecker.Marshal(checkerVersionV1)
+				if err != nil {
+					produceError(err)
+					return
+				}
+				produceItem(marshalMetaItem(opFSMUniqCheckerSnap, nil, raw))
 				if checkClose() {
 					return
 				}
@@ -539,7 +533,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 				produceError(err)
 				return
 			}
-			if !produceItem(&fileData{filename: filename, data: raw}) {
+			if !produceItem(marshalMetaItem(opExtentFileSnapshot, []byte(filename), raw)) {
 				return
 			}
 		}
@@ -566,12 +560,11 @@ func (si *MetaItemIterator) Next() (data []byte, err error) {
 		err = si.err
 		return
 	}
-	var item interface{}
 	for {
 		var open bool
 		select {
-		case item, open = <-si.dataCh:
-			if item == nil || !open {
+		case data, open = <-si.dataCh:
+			if data == nil || !open {
 				err, si.err = io.EOF, io.EOF
 				si.Close()
 				return
@@ -590,143 +583,6 @@ func (si *MetaItemIterator) Next() (data []byte, err error) {
 			continue
 		}
 		break
-	}
-
-	var snap *MetaItem
-	switch typedItem := item.(type) {
-	case uint64:
-		applyIDBuf := make([]byte, 8)
-		binary.BigEndian.PutUint64(applyIDBuf, si.applyID)
-		data = applyIDBuf
-		return
-	case *RawMetaItem:
-		// Zero-copy path: directly use raw data with appropriate op code
-		var opCode uint32
-		switch typedItem.TableType {
-		case byte(InodeTable):
-			opCode = opFSMRawInodeData
-		case byte(DentryTable):
-			opCode = opFSMRawDentryData
-		case byte(ExtendTable):
-			opCode = opFSMRawExtendData
-		case byte(MultipartTable):
-			opCode = opFSMRawMultipartData
-		case byte(TransactionTable):
-			opCode = opFSMRawTxData
-		case byte(TransactionRollbackInodeTable):
-			opCode = opFSMRawTxRbInodeData
-		case byte(TransactionRollbackDentryTable):
-			opCode = opFSMRawTxRbDentryData
-		default:
-			err = fmt.Errorf("unknown table type: %d", typedItem.TableType)
-			si.err = err
-			si.Close()
-			return
-		}
-		snap = NewMetaItem(opCode, typedItem.Key, typedItem.Value)
-	case SnapItemWrapper:
-		if typedItem.key == SiwKeySnapFormatVer {
-			snapFormatVerBuf := make([]byte, 8)
-			binary.BigEndian.PutUint32(snapFormatVerBuf, si.SnapFormatVersion)
-			snap = NewMetaItem(opFSMSnapFormatVersion, typedItem.MarshalKey(), snapFormatVerBuf)
-		} else if typedItem.key == SiwKeyApplyId {
-			applyIDBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(applyIDBuf, si.applyID)
-			snap = NewMetaItem(opFSMApplyId, typedItem.MarshalKey(), applyIDBuf)
-		} else if typedItem.key == SiwKeyTxId {
-			txIDBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(txIDBuf, si.txId)
-			snap = NewMetaItem(opFSMTxId, typedItem.MarshalKey(), txIDBuf)
-		} else if typedItem.key == SiwKeyCursor {
-			cursor := typedItem.value.(uint64)
-			cursorBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(cursorBuf, cursor)
-			snap = NewMetaItem(opFSMCursor, typedItem.MarshalKey(), cursorBuf)
-		} else if typedItem.key == SiwKeyUniqId {
-			uniqId := typedItem.value.(uint64)
-			uniqIdBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(uniqIdBuf, uniqId)
-			snap = NewMetaItem(opFSMUniqIDSnap, typedItem.MarshalKey(), uniqIdBuf)
-		} else if typedItem.key == SiwKeyVerList {
-			var verListBuf []byte
-			if verListBuf, err = json.Marshal(typedItem.value.([]*proto.VolVersionInfo)); err != nil {
-				return
-			}
-			snap = NewMetaItem(opFSMVerListSnapShot, typedItem.MarshalKey(), verListBuf)
-			log.LogInfof("snapshot.fileRootDir %v verList %v", si.fileRootDir, verListBuf)
-		} else {
-			panic(fmt.Sprintf("MetaItemIterator.Next: unknown SnapItemWrapper key: %v", typedItem.key))
-		}
-	case *Inode:
-		snap = NewMetaItem(opFSMCreateInode, typedItem.MarshalKey(), typedItem.MarshalValue())
-	case *Dentry:
-		snap = NewMetaItem(opFSMCreateDentry, typedItem.MarshalKey(), typedItem.MarshalValue())
-	case *Extend:
-		var raw []byte
-		if raw, err = typedItem.Bytes(); err != nil {
-			si.err = err
-			si.Close()
-			return
-		}
-		snap = NewMetaItem(opFSMSetXAttr, nil, raw)
-	case *Multipart:
-		var raw []byte
-		if raw, err = typedItem.Bytes(); err != nil {
-			si.err = err
-			si.Close()
-			return
-		}
-		snap = NewMetaItem(opFSMCreateMultipart, nil, raw)
-	case *proto.TransactionInfo:
-		var val []byte
-		val, err = typedItem.Marshal()
-		if err != nil {
-			si.err = err
-			si.Close()
-			return
-		}
-		snap = NewMetaItem(opFSMTxSnapshot, []byte(typedItem.TxID), val)
-	case *TxRollbackInode:
-		var val []byte
-		val, err = typedItem.Marshal()
-		if err != nil {
-			si.err = err
-			si.Close()
-			return
-		}
-		snap = NewMetaItem(opFSMTxRbInodeSnapshot, typedItem.inode.MarshalKey(), val)
-	case *TxRollbackDentry:
-		var val []byte
-		val, err = typedItem.Marshal()
-		if err != nil {
-			si.err = err
-			si.Close()
-			return
-		}
-		snap = NewMetaItem(opFSMTxRbDentrySnapshot, []byte(typedItem.txDentryInfo.GetKey()), val)
-	case *fileData:
-		snap = NewMetaItem(opExtentFileSnapshot, []byte(typedItem.filename), typedItem.data)
-	case *uniqChecker:
-		var raw []byte
-		/*
-			In order to support software update from v1 to v2, we need to use the checkerVersionV1 here.
-			For snapshot, it is not necessary to use the checkerVersionV2.
-			All the raft fsm apply id will larger than current value. So it is safe to use the checkerVersionV1 here.
-		*/
-		if raw, _, err = typedItem.Marshal(checkerVersionV1); err != nil {
-			si.err = err
-			si.Close()
-			return
-		}
-		snap = NewMetaItem(opFSMUniqCheckerSnap, nil, raw)
-	default:
-		panic(fmt.Sprintf("unknown item type: %v", reflect.TypeOf(item).Name()))
-	}
-
-	if data, err = snap.MarshalBinary(); err != nil {
-		si.err = err
-		si.Close()
-		return
 	}
 	return
 }
