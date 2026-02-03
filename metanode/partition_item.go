@@ -320,208 +320,234 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			panic(fmt.Sprintf("invalid raftSyncSnapFormatVersione: %v", si.SnapFormatVersion))
 		}
 
-		// NOTE: if using rocksdb, send base
-		// process inodes
-		log.LogDebugf("[newMetaItemIterator] start producing inodes, partitionID(%v)", mp.config.PartitionId)
-		if mp.inodeTree.GetStoreMode() == proto.StoreModeMem {
-			// Memory leader: use Range, send opFSMCreateInode
-			if err = iter.treeSnap.Range(InodeType, func(item interface{}) bool {
-				inode := item.(*Inode)
-				return produceItem(marshalMetaItem(opFSMCreateInode, inode.MarshalKey(), inode.MarshalValue()))
-			}); err != nil {
+		var wg sync.WaitGroup
+		var errOnce sync.Once
+		signalErr := func(err error) {
+			errOnce.Do(func() {
 				produceError(err)
-				return
-			}
-		} else {
-			// RocksDB leader: use RangeRaw, send opFSMRawInodeData
-			if err = iter.treeSnap.RangeRaw(InodeType, func(key, value []byte) bool {
-				return produceItem(marshalMetaItem(opFSMRawInodeData, key, value))
-			}); err != nil {
-				produceError(err)
-				return
-			}
+				iter.Close()
+			})
 		}
-		if checkClose() {
-			return
-		}
-		// process dentries
-		log.LogDebugf("[newMetaItemIterator] start producing dentries, partitionID(%v)", mp.config.PartitionId)
-		if mp.dentryTree.GetStoreMode() == proto.StoreModeMem {
-			// Memory leader: use Range, send opFSMCreateDentry
-			if err = iter.treeSnap.Range(DentryType, func(item interface{}) bool {
-				dentry := item.(*Dentry)
-				return produceItem(marshalMetaItem(opFSMCreateDentry, dentry.MarshalKey(), dentry.MarshalValue()))
-			}); err != nil {
-				produceError(err)
-				return
-			}
-		} else {
-			// RocksDB leader: use RangeRaw, send opFSMRawDentryData
-			if err = iter.treeSnap.RangeRaw(DentryType, func(key, value []byte) bool {
-				return produceItem(marshalMetaItem(opFSMRawDentryData, key, value))
-			}); err != nil {
-				produceError(err)
-				return
-			}
-		}
-		if checkClose() {
-			return
-		}
-		// process extends
-		log.LogDebugf("[newMetaItemIterator] start producing extends, partitionID(%v)", mp.config.PartitionId)
-		if mp.extendTree.GetStoreMode() == proto.StoreModeMem {
-			// Memory leader: use Range, send opFSMSetXAttr
-			if err = iter.treeSnap.Range(ExtendType, func(item interface{}) bool {
-				extend := item.(*Extend)
-				raw, err := extend.Bytes()
-				if err != nil {
-					produceError(err)
-					return false
-				}
-				return produceItem(marshalMetaItem(opFSMSetXAttr, nil, raw))
-			}); err != nil {
-				produceError(err)
-				return
-			}
-		} else {
-			// RocksDB leader: use RangeRaw, send opFSMRawExtendData
-			if err = iter.treeSnap.RangeRaw(ExtendType, func(key, value []byte) bool {
-				return produceItem(marshalMetaItem(opFSMRawExtendData, key, value))
-			}); err != nil {
-				produceError(err)
-				return
-			}
-		}
-		if checkClose() {
-			return
-		}
-
-		log.LogDebugf("ApplySnapshot: start producing multiparts, partitionID(%v)", mp.config.PartitionId)
-		if mp.multipartTree.GetStoreMode() == proto.StoreModeMem {
-			// Memory leader: use Range, send opFSMCreateMultipart
-			if err = iter.treeSnap.Range(MultipartType, func(item interface{}) bool {
-				multipart := item.(*Multipart)
-				raw, err := multipart.Bytes()
-				if err != nil {
-					produceError(err)
-					return false
-				}
-				return produceItem(marshalMetaItem(opFSMCreateMultipart, nil, raw))
-			}); err != nil {
-				produceError(err)
-				return
-			}
-		} else {
-			// RocksDB leader: use RangeRaw, send opFSMRawMultipartData
-			if err = iter.treeSnap.RangeRaw(MultipartType, func(key, value []byte) bool {
-				return produceItem(marshalMetaItem(opFSMRawMultipartData, key, value))
-			}); err != nil {
-				produceError(err)
-				return
-			}
-		}
-		if checkClose() {
-			return
-		}
-
-		if si.SnapFormatVersion == SnapFormatVersion_1 {
-			// Process transactions (single threaded, usually small)
-			log.LogDebugf("ApplySnapshot: start producing transactions, partitionID(%v)", mp.config.PartitionId)
-			if mp.txProcessor.txManager.txTree.GetStoreMode() == proto.StoreModeMem {
-				// Memory leader: use Range, send opFSMTxSnapshot
-				if err = iter.treeSnap.Range(TransactionType, func(item interface{}) bool {
-					txInfo := item.(*proto.TransactionInfo)
-					val, err := txInfo.Marshal()
-					if err != nil {
-						produceError(err)
-						return false
-					}
-					return produceItem(marshalMetaItem(opFSMTxSnapshot, []byte(txInfo.TxID), val))
-				}); err != nil {
-					produceError(err)
-					return
-				}
-			} else {
-				// RocksDB leader: use RangeRaw, send opFSMRawTxData
-				if err = iter.treeSnap.RangeRaw(TransactionType, func(key, value []byte) bool {
-					return produceItem(marshalMetaItem(opFSMRawTxData, key, value))
-				}); err != nil {
-					produceError(err)
-					return
-				}
-			}
-			if checkClose() {
-				return
-			}
-
-			// Process transaction rollback inodes (single threaded, usually small)
-			log.LogDebugf("ApplySnapshot: start producing tx rb inodes, partitionID(%v)", mp.config.PartitionId)
-			if mp.txProcessor.txResource.txRbInodeTree.GetStoreMode() == proto.StoreModeMem {
-				// Memory leader: use Range, send opFSMTxRbInodeSnapshot
-				if err = iter.treeSnap.Range(TransactionRollbackInodeType, func(item interface{}) bool {
-					txRbInode := item.(*TxRollbackInode)
-					val, err := txRbInode.Marshal()
-					if err != nil {
-						produceError(err)
-						return false
-					}
-					return produceItem(marshalMetaItem(opFSMTxRbInodeSnapshot, txRbInode.inode.MarshalKey(), val))
-				}); err != nil {
-					produceError(err)
-					return
-				}
-			} else {
-				// RocksDB leader: use RangeRaw, send opFSMRawTxRbInodeData
-				if err = iter.treeSnap.RangeRaw(TransactionRollbackInodeType, func(key, value []byte) bool {
-					return produceItem(marshalMetaItem(opFSMRawTxRbInodeData, key, value))
-				}); err != nil {
-					produceError(err)
-					return
-				}
-			}
-			if checkClose() {
-				return
-			}
-
-			// Process transaction rollback dentries (single threaded, usually small)
-			log.LogDebugf("ApplySnapshot: start producing tx rb dentries, partitionID(%v)", mp.config.PartitionId)
-			if mp.txProcessor.txResource.txRbDentryTree.GetStoreMode() == proto.StoreModeMem {
-				// Memory leader: use Range, send opFSMTxRbDentrySnapshot
-				if err = iter.treeSnap.Range(TransactionRollbackDentryType, func(item interface{}) bool {
-					txRbDentry := item.(*TxRollbackDentry)
-					val, err := txRbDentry.Marshal()
-					if err != nil {
-						produceError(err)
-						return false
-					}
-					return produceItem(marshalMetaItem(opFSMTxRbDentrySnapshot, []byte(txRbDentry.txDentryInfo.GetKey()), val))
-				}); err != nil {
-					produceError(err)
-					return
-				}
-			} else {
-				// RocksDB leader: use RangeRaw, send opFSMRawTxRbDentryData
-				if err = iter.treeSnap.RangeRaw(TransactionRollbackDentryType, func(key, value []byte) bool {
-					return produceItem(marshalMetaItem(opFSMRawTxRbDentryData, key, value))
-				}); err != nil {
-					produceError(err)
-					return
-				}
-			}
-			if checkClose() {
-				return
-			}
-
-			if si.uniqID != 0 {
-				raw, _, err := si.uniqChecker.Marshal(checkerVersionV1)
-				if err != nil {
-					produceError(err)
-					return
-				}
-				produceItem(marshalMetaItem(opFSMUniqCheckerSnap, nil, raw))
+		startProducer := func(fn func() error) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
 				if checkClose() {
 					return
 				}
+				if err := fn(); err != nil {
+					signalErr(err)
+				}
+			}()
+		}
+
+		// NOTE: if using rocksdb, send base
+		// process inodes
+		startProducer(func() error {
+			log.LogDebugf("[newMetaItemIterator] start producing inodes, partitionID(%v)", mp.config.PartitionId)
+			if mp.inodeTree.GetStoreMode() == proto.StoreModeMem {
+				return iter.treeSnap.Range(InodeType, func(item interface{}) bool {
+					if checkClose() {
+						return false
+					}
+					inode := item.(*Inode)
+					return produceItem(marshalMetaItem(opFSMCreateInode, inode.MarshalKey(), inode.MarshalValue()))
+				})
+			}
+			return iter.treeSnap.RangeRaw(InodeType, func(key, value []byte) bool {
+				if checkClose() {
+					return false
+				}
+				return produceItem(marshalMetaItem(opFSMRawInodeData, key, value))
+			})
+		})
+
+		// process dentries
+		startProducer(func() error {
+			log.LogDebugf("[newMetaItemIterator] start producing dentries, partitionID(%v)", mp.config.PartitionId)
+			if mp.dentryTree.GetStoreMode() == proto.StoreModeMem {
+				return iter.treeSnap.Range(DentryType, func(item interface{}) bool {
+					if checkClose() {
+						return false
+					}
+					dentry := item.(*Dentry)
+					return produceItem(marshalMetaItem(opFSMCreateDentry, dentry.MarshalKey(), dentry.MarshalValue()))
+				})
+			}
+			return iter.treeSnap.RangeRaw(DentryType, func(key, value []byte) bool {
+				if checkClose() {
+					return false
+				}
+				return produceItem(marshalMetaItem(opFSMRawDentryData, key, value))
+			})
+		})
+
+		// process extends
+		startProducer(func() error {
+			log.LogDebugf("[newMetaItemIterator] start producing extends, partitionID(%v)", mp.config.PartitionId)
+			if mp.extendTree.GetStoreMode() == proto.StoreModeMem {
+				var callbackErr error
+				rangeErr := iter.treeSnap.Range(ExtendType, func(item interface{}) bool {
+					if checkClose() {
+						return false
+					}
+					extend := item.(*Extend)
+					raw, err := extend.Bytes()
+					if err != nil {
+						callbackErr = err
+						return false
+					}
+					return produceItem(marshalMetaItem(opFSMSetXAttr, nil, raw))
+				})
+				if callbackErr != nil {
+					return callbackErr
+				}
+				return rangeErr
+			}
+			return iter.treeSnap.RangeRaw(ExtendType, func(key, value []byte) bool {
+				if checkClose() {
+					return false
+				}
+				return produceItem(marshalMetaItem(opFSMRawExtendData, key, value))
+			})
+		})
+
+		// process multiparts
+		startProducer(func() error {
+			log.LogDebugf("ApplySnapshot: start producing multiparts, partitionID(%v)", mp.config.PartitionId)
+			if mp.multipartTree.GetStoreMode() == proto.StoreModeMem {
+				var callbackErr error
+				rangeErr := iter.treeSnap.Range(MultipartType, func(item interface{}) bool {
+					if checkClose() {
+						return false
+					}
+					multipart := item.(*Multipart)
+					raw, err := multipart.Bytes()
+					if err != nil {
+						callbackErr = err
+						return false
+					}
+					return produceItem(marshalMetaItem(opFSMCreateMultipart, nil, raw))
+				})
+				if callbackErr != nil {
+					return callbackErr
+				}
+				return rangeErr
+			}
+			return iter.treeSnap.RangeRaw(MultipartType, func(key, value []byte) bool {
+				if checkClose() {
+					return false
+				}
+				return produceItem(marshalMetaItem(opFSMRawMultipartData, key, value))
+			})
+		})
+
+		if si.SnapFormatVersion == SnapFormatVersion_1 {
+			// Process transactions
+			startProducer(func() error {
+				log.LogDebugf("ApplySnapshot: start producing transactions, partitionID(%v)", mp.config.PartitionId)
+				if mp.txProcessor.txManager.txTree.GetStoreMode() == proto.StoreModeMem {
+					var callbackErr error
+					rangeErr := iter.treeSnap.Range(TransactionType, func(item interface{}) bool {
+						if checkClose() {
+							return false
+						}
+						txInfo := item.(*proto.TransactionInfo)
+						val, err := txInfo.Marshal()
+						if err != nil {
+							callbackErr = err
+							return false
+						}
+						return produceItem(marshalMetaItem(opFSMTxSnapshot, []byte(txInfo.TxID), val))
+					})
+					if callbackErr != nil {
+						return callbackErr
+					}
+					return rangeErr
+				}
+				return iter.treeSnap.RangeRaw(TransactionType, func(key, value []byte) bool {
+					if checkClose() {
+						return false
+					}
+					return produceItem(marshalMetaItem(opFSMRawTxData, key, value))
+				})
+			})
+
+			// Process transaction rollback inodes
+			startProducer(func() error {
+				log.LogDebugf("ApplySnapshot: start producing tx rb inodes, partitionID(%v)", mp.config.PartitionId)
+				if mp.txProcessor.txResource.txRbInodeTree.GetStoreMode() == proto.StoreModeMem {
+					var callbackErr error
+					rangeErr := iter.treeSnap.Range(TransactionRollbackInodeType, func(item interface{}) bool {
+						if checkClose() {
+							return false
+						}
+						txRbInode := item.(*TxRollbackInode)
+						val, err := txRbInode.Marshal()
+						if err != nil {
+							callbackErr = err
+							return false
+						}
+						return produceItem(marshalMetaItem(opFSMTxRbInodeSnapshot, txRbInode.inode.MarshalKey(), val))
+					})
+					if callbackErr != nil {
+						return callbackErr
+					}
+					return rangeErr
+				}
+				return iter.treeSnap.RangeRaw(TransactionRollbackInodeType, func(key, value []byte) bool {
+					if checkClose() {
+						return false
+					}
+					return produceItem(marshalMetaItem(opFSMRawTxRbInodeData, key, value))
+				})
+			})
+
+			// Process transaction rollback dentries
+			startProducer(func() error {
+				log.LogDebugf("ApplySnapshot: start producing tx rb dentries, partitionID(%v)", mp.config.PartitionId)
+				if mp.txProcessor.txResource.txRbDentryTree.GetStoreMode() == proto.StoreModeMem {
+					var callbackErr error
+					rangeErr := iter.treeSnap.Range(TransactionRollbackDentryType, func(item interface{}) bool {
+						if checkClose() {
+							return false
+						}
+						txRbDentry := item.(*TxRollbackDentry)
+						val, err := txRbDentry.Marshal()
+						if err != nil {
+							callbackErr = err
+							return false
+						}
+						return produceItem(marshalMetaItem(opFSMTxRbDentrySnapshot, []byte(txRbDentry.txDentryInfo.GetKey()), val))
+					})
+					if callbackErr != nil {
+						return callbackErr
+					}
+					return rangeErr
+				}
+				return iter.treeSnap.RangeRaw(TransactionRollbackDentryType, func(key, value []byte) bool {
+					if checkClose() {
+						return false
+					}
+					return produceItem(marshalMetaItem(opFSMRawTxRbDentryData, key, value))
+				})
+			})
+		}
+
+		wg.Wait()
+		if checkClose() {
+			return
+		}
+
+		if si.SnapFormatVersion == SnapFormatVersion_1 && si.uniqID != 0 {
+			raw, _, err := si.uniqChecker.Marshal(checkerVersionV1)
+			if err != nil {
+				produceError(err)
+				return
+			}
+			produceItem(marshalMetaItem(opFSMUniqCheckerSnap, nil, raw))
+			if checkClose() {
+				return
 			}
 		}
 
