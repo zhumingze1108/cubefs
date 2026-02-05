@@ -1300,6 +1300,13 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 
 	log.LogWarnf("ApplySnapshot: start apply snapshot, partition(%v)", mp.config.PartitionId)
 
+	// Start pipeline for memory mode (only for memory mode, managed directly here)
+	var pipelinesStarted bool
+	if mp.inodeTree.GetStoreMode() == proto.StoreModeMem {
+		mp.startSnapshotPipelines()
+		pipelinesStarted = true
+	}
+
 	// Initialize aggregator and channels
 	agg := newApplySnapshotAggregator()
 	dataCh := make(chan *snapshotItem, itemChSize)
@@ -1325,6 +1332,12 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 	// Wait for all workers to complete
 	wg.Wait()
 
+	// Stop pipelines before checking errors to ensure all data is inserted
+	// This is critical because finalizeApplySnapshot may read from BTree (e.g., GetSnapShot)
+	if pipelinesStarted {
+		mp.stopSnapshotPipelines()
+	}
+
 	// Check for errors
 	select {
 	case err = <-errCh:
@@ -1335,6 +1348,66 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 
 	// Apply aggregated metadata
 	return mp.finalizeApplySnapshot(agg)
+}
+
+// startSnapshotPipelines starts insert pipelines for all BTree instances in memory mode
+func (mp *metaPartition) startSnapshotPipelines() {
+	if mp.inodeTree.GetStoreMode() != proto.StoreModeMem {
+		return
+	}
+
+	// Start pipeline for each BTree that will be used during snapshot apply
+	if inodeBTree, ok := mp.inodeTree.(*InodeBTree); ok {
+		inodeBTree.BTree.startPipelineForSnapshot()
+	}
+	if dentryBTree, ok := mp.dentryTree.(*DentryBTree); ok {
+		dentryBTree.BTree.startPipelineForSnapshot()
+	}
+	if extendBTree, ok := mp.extendTree.(*ExtendBTree); ok {
+		extendBTree.BTree.startPipelineForSnapshot()
+	}
+	if multipartBTree, ok := mp.multipartTree.(*MultipartBTree); ok {
+		multipartBTree.BTree.startPipelineForSnapshot()
+	}
+	if txTree, ok := mp.txProcessor.txManager.txTree.(*TransactionBTree); ok {
+		txTree.BTree.startPipelineForSnapshot()
+	}
+	if txRbInodeTree, ok := mp.txProcessor.txResource.txRbInodeTree.(*TransactionRollbackInodeBTree); ok {
+		txRbInodeTree.BTree.startPipelineForSnapshot()
+	}
+	if txRbDentryTree, ok := mp.txProcessor.txResource.txRbDentryTree.(*TransactionRollbackDentryBTree); ok {
+		txRbDentryTree.BTree.startPipelineForSnapshot()
+	}
+}
+
+// stopSnapshotPipelines stops all insert pipelines and waits for completion
+func (mp *metaPartition) stopSnapshotPipelines() {
+	if mp.inodeTree.GetStoreMode() != proto.StoreModeMem {
+		return
+	}
+
+	// Stop pipeline for each BTree
+	if inodeBTree, ok := mp.inodeTree.(*InodeBTree); ok {
+		inodeBTree.BTree.stopPipelineForSnapshot()
+	}
+	if dentryBTree, ok := mp.dentryTree.(*DentryBTree); ok {
+		dentryBTree.BTree.stopPipelineForSnapshot()
+	}
+	if extendBTree, ok := mp.extendTree.(*ExtendBTree); ok {
+		extendBTree.BTree.stopPipelineForSnapshot()
+	}
+	if multipartBTree, ok := mp.multipartTree.(*MultipartBTree); ok {
+		multipartBTree.BTree.stopPipelineForSnapshot()
+	}
+	if txTree, ok := mp.txProcessor.txManager.txTree.(*TransactionBTree); ok {
+		txTree.BTree.stopPipelineForSnapshot()
+	}
+	if txRbInodeTree, ok := mp.txProcessor.txResource.txRbInodeTree.(*TransactionRollbackInodeBTree); ok {
+		txRbInodeTree.BTree.stopPipelineForSnapshot()
+	}
+	if txRbDentryTree, ok := mp.txProcessor.txResource.txRbDentryTree.(*TransactionRollbackDentryBTree); ok {
+		txRbDentryTree.BTree.stopPipelineForSnapshot()
+	}
 }
 
 // finalizeApplySnapshot applies aggregated metadata and commits final state

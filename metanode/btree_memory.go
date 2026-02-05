@@ -30,6 +30,15 @@ type (
 	BtreeItem = btree.Item
 )
 
+var (
+	// batchInsertChannels stores insert channels for each BTree instance (for pipeline insert)
+	// Key: *BTree pointer, Value: chan BtreeItem
+	// Only used during ApplySnapshot, managed directly in ApplySnapshot function
+	batchInsertChannels sync.Map
+	// batchInsertWaitGroups stores wait groups for each BTree instance to wait for insert completion
+	batchInsertWaitGroups sync.Map
+)
+
 var _ Snapshot = &MemSnapShot{}
 
 type MemSnapShot struct {
@@ -461,6 +470,12 @@ func (i *InodeBTree) ReplaceOrInsert(handle interface{}, inode *Inode, replace b
 }
 
 func (i *InodeBTree) Insert(handle interface{}, inode *Inode) error {
+	// Check if pipeline is active (managed in ApplySnapshot)
+	if _, ok := batchInsertChannels.Load(i.BTree); ok {
+		// Pipeline mode: send to channel
+		return i.BTree.sendToPipeline(inode)
+	}
+	// Immediate insert mode
 	i.BTree.Insert(inode)
 	return nil
 }
@@ -487,8 +502,7 @@ func (i *InodeBTree) PutRaw(handle interface{}, key, value []byte) error {
 	}
 
 	// Insert into memory tree
-	i.BTree.Insert(ino)
-	return nil
+	return i.Insert(handle, ino)
 }
 
 func (i *DentryBTree) ReplaceOrInsert(handle interface{}, dentry *Dentry, replace bool) (*Dentry, bool, error) {
@@ -500,6 +514,11 @@ func (i *DentryBTree) ReplaceOrInsert(handle interface{}, dentry *Dentry, replac
 }
 
 func (i *DentryBTree) Insert(handle interface{}, dentry *Dentry) error {
+	if _, ok := batchInsertChannels.Load(i.BTree); ok {
+		// Pipeline mode: send to channel
+		return i.BTree.sendToPipeline(dentry)
+	}
+	// Immediate insert mode
 	i.BTree.Insert(dentry)
 	return nil
 }
@@ -526,8 +545,7 @@ func (i *DentryBTree) PutRaw(handle interface{}, key, value []byte) error {
 	}
 
 	// Insert into memory tree
-	i.BTree.Insert(dentry)
-	return nil
+	return i.Insert(handle, dentry)
 }
 
 func (i *ExtendBTree) ReplaceOrInsert(handle interface{}, extend *Extend, replace bool) (*Extend, bool, error) {
@@ -539,6 +557,11 @@ func (i *ExtendBTree) ReplaceOrInsert(handle interface{}, extend *Extend, replac
 }
 
 func (i *ExtendBTree) Insert(handle interface{}, extend *Extend) error {
+	if _, ok := batchInsertChannels.Load(i.BTree); ok {
+		// Pipeline mode: send to channel
+		return i.BTree.sendToPipeline(extend)
+	}
+	// Immediate insert mode
 	i.BTree.Insert(extend)
 	return nil
 }
@@ -559,8 +582,7 @@ func (i *ExtendBTree) PutRaw(handle interface{}, key, value []byte) error {
 	extend.inode = inodeID
 
 	// Insert into memory tree
-	i.BTree.Insert(extend)
-	return nil
+	return i.Insert(handle, extend)
 }
 
 func (i *MultipartBTree) ReplaceOrInsert(handle interface{}, mul *Multipart, replace bool) (*Multipart, bool, error) {
@@ -572,6 +594,11 @@ func (i *MultipartBTree) ReplaceOrInsert(handle interface{}, mul *Multipart, rep
 }
 
 func (i *MultipartBTree) Insert(handle interface{}, mul *Multipart) error {
+	if _, ok := batchInsertChannels.Load(i.BTree); ok {
+		// Pipeline mode: send to channel
+		return i.BTree.sendToPipeline(mul)
+	}
+	// Immediate insert mode
 	i.BTree.Insert(mul)
 	return nil
 }
@@ -585,8 +612,7 @@ func (i *MultipartBTree) PutRaw(handle interface{}, key, value []byte) error {
 	}
 
 	// Insert into memory tree
-	i.BTree.Insert(multipart)
-	return nil
+	return i.Insert(handle, multipart)
 }
 
 func (i *TransactionBTree) ReplaceOrInsert(handle interface{}, tx *proto.TransactionInfo, replace bool) (*proto.TransactionInfo, bool, error) {
@@ -598,6 +624,11 @@ func (i *TransactionBTree) ReplaceOrInsert(handle interface{}, tx *proto.Transac
 }
 
 func (i *TransactionBTree) Insert(handle interface{}, tx *proto.TransactionInfo) error {
+	if _, ok := batchInsertChannels.Load(i.BTree); ok {
+		// Pipeline mode: send to channel
+		return i.BTree.sendToPipeline(tx)
+	}
+	// Immediate insert mode
 	i.BTree.Insert(tx)
 	return nil
 }
@@ -611,8 +642,7 @@ func (i *TransactionBTree) PutRaw(handle interface{}, key, value []byte) error {
 	}
 
 	// Insert into memory tree
-	i.BTree.Insert(txInfo)
-	return nil
+	return i.Insert(handle, txInfo)
 }
 
 func (i *TransactionRollbackInodeBTree) ReplaceOrInsert(handle interface{}, inode *TxRollbackInode, replace bool) (*TxRollbackInode, bool, error) {
@@ -624,6 +654,11 @@ func (i *TransactionRollbackInodeBTree) ReplaceOrInsert(handle interface{}, inod
 }
 
 func (i *TransactionRollbackInodeBTree) Insert(handle interface{}, inode *TxRollbackInode) error {
+	if _, ok := batchInsertChannels.Load(i.BTree); ok {
+		// Pipeline mode: send to channel
+		return i.BTree.sendToPipeline(inode)
+	}
+	// Immediate insert mode
 	i.BTree.Insert(inode)
 	return nil
 }
@@ -637,8 +672,7 @@ func (i *TransactionRollbackInodeBTree) PutRaw(handle interface{}, key, value []
 	}
 
 	// Insert into memory tree
-	i.BTree.Insert(txRbInode)
-	return nil
+	return i.Insert(handle, txRbInode)
 }
 
 func (i *TransactionRollbackDentryBTree) ReplaceOrInsert(handle interface{}, dentry *TxRollbackDentry, replace bool) (*TxRollbackDentry, bool, error) {
@@ -650,6 +684,11 @@ func (i *TransactionRollbackDentryBTree) ReplaceOrInsert(handle interface{}, den
 }
 
 func (i *TransactionRollbackDentryBTree) Insert(handle interface{}, dentry *TxRollbackDentry) error {
+	if _, ok := batchInsertChannels.Load(i.BTree); ok {
+		// Pipeline mode: send to channel
+		return i.BTree.sendToPipeline(dentry)
+	}
+	// Immediate insert mode
 	i.BTree.Insert(dentry)
 	return nil
 }
@@ -663,8 +702,7 @@ func (i *TransactionRollbackDentryBTree) PutRaw(handle interface{}, key, value [
 	}
 
 	// Insert into memory tree
-	i.BTree.Insert(txRbDentry)
-	return nil
+	return i.Insert(handle, txRbDentry)
 }
 
 func (i *InodeBTree) Delete(handle interface{}, inode *Inode) (bool, error) {
@@ -964,6 +1002,86 @@ func (b *BTree) Insert(key BtreeItem) {
 	b.Lock()
 	b.tree.ReplaceOrInsert(key)
 	b.Unlock()
+}
+
+// startInsertPipeline starts a goroutine that consumes items from channel and inserts them sequentially
+// Uses batch insertion to reduce lock acquire/release overhead
+func (b *BTree) startInsertPipeline(ch chan BtreeItem, wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		const batchSize = 100 // Batch size for reducing lock overhead
+		batch := make([]BtreeItem, 0, batchSize)
+
+		flushBatch := func() {
+			if len(batch) == 0 {
+				return
+			}
+			// Hold lock once for entire batch
+			b.Lock()
+			for _, item := range batch {
+				b.tree.ReplaceOrInsert(item)
+			}
+			b.Unlock()
+			batch = batch[:0] // Reset batch
+		}
+
+		for item := range ch {
+			batch = append(batch, item)
+			if len(batch) >= batchSize {
+				flushBatch()
+			}
+		}
+		// Flush remaining items
+		flushBatch()
+	}()
+}
+
+// startPipelineForSnapshot starts pipeline for a BTree instance (used in ApplySnapshot)
+func (b *BTree) startPipelineForSnapshot() {
+	ch := make(chan BtreeItem, 500)
+	wg := &sync.WaitGroup{}
+
+	// Start pipeline goroutine for sequential insert
+	b.startInsertPipeline(ch, wg)
+
+	// Store channel and wait group
+	batchInsertChannels.Store(b, ch)
+	batchInsertWaitGroups.Store(b, wg)
+}
+
+// stopPipelineForSnapshot stops pipeline for a BTree instance (used in ApplySnapshot)
+func (b *BTree) stopPipelineForSnapshot() {
+	ch, ok := batchInsertChannels.LoadAndDelete(b)
+	if !ok {
+		return
+	}
+
+	wg, _ := batchInsertWaitGroups.LoadAndDelete(b)
+
+	// Close channel to signal no more items
+	close(ch.(chan BtreeItem))
+
+	// Wait for all pending inserts to complete
+	if wg != nil {
+		wg.(*sync.WaitGroup).Wait()
+	}
+}
+
+// sendToPipeline sends an item to the insert pipeline channel if pipeline is active
+// Blocks if channel is full to maintain pipeline ordering and avoid lock contention
+func (b *BTree) sendToPipeline(item BtreeItem) error {
+	ch, ok := batchInsertChannels.Load(b)
+	if !ok {
+		// No pipeline channel, fall back to immediate insert
+		b.Insert(item)
+		return nil
+	}
+
+	// Block until item is sent to maintain pipeline ordering
+	// This ensures all inserts go through pipeline, avoiding lock contention
+	ch.(chan BtreeItem) <- item
+	return nil
 }
 
 // Ascend is the wrapper of the google's btree Ascend.
