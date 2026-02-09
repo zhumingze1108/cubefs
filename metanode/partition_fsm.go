@@ -927,6 +927,27 @@ func (mp *metaPartition) processSnapshotItem(
 		}
 
 	case opFSMCreateInode:
+		// Extract inode ID for cursor tracking
+		inodeID := binary.BigEndian.Uint64(snap.K)
+		agg.atomicMaxUint64(&agg.cursor, inodeID)
+
+		// For RocksDB follower receiving from memory leader, use zero-copy path
+		if mp.inodeTree.GetStoreMode() == proto.StoreModeRocksDb {
+			if inodeRocks, ok := mp.inodeTree.(*InodeRocks); ok {
+				if err := inodeRocks.InsertForMemoryToRocksbSnapshot(dbWriteHandle, snap.K, snap.V); err != nil {
+					log.LogErrorf("ApplySnapshot: worker(%d) create inode failed, partitionID(%v) inodeID(%v) err(%v)",
+						workerID, mp.config.PartitionId, inodeID, err)
+					return err
+				}
+				if log.EnableDebug() {
+					log.LogDebugf("ApplySnapshot: worker(%d) create inode: partitonID(%v) inodeID[%v].",
+						workerID, mp.config.PartitionId, inodeID)
+				}
+				return nil
+			}
+		}
+
+		// Fallback to unmarshal path for memory mode or if type assertion fails
 		ino := NewInode(0, 0)
 		if err := ino.UnmarshalKey(snap.K); err != nil {
 			return err
@@ -934,7 +955,6 @@ func (mp *metaPartition) processSnapshotItem(
 		if err := ino.UnmarshalValue(snap.V); err != nil {
 			return err
 		}
-		agg.atomicMaxUint64(&agg.cursor, ino.Inode)
 		if err := mp.inodeTree.Insert(dbWriteHandle, ino); err != nil {
 			log.LogErrorf("ApplySnapshot: worker(%d) create inode failed, partitionID(%v) inode(%v)",
 				workerID, mp.config.PartitionId, ino)
@@ -946,6 +966,23 @@ func (mp *metaPartition) processSnapshotItem(
 		}
 
 	case opFSMCreateDentry:
+		// For RocksDB follower receiving from memory leader, use zero-copy path
+		if mp.dentryTree.GetStoreMode() == proto.StoreModeRocksDb {
+			if dentryRocks, ok := mp.dentryTree.(*DentryRocks); ok {
+				if err := dentryRocks.InsertForMemoryToRocksbSnapshot(dbWriteHandle, snap.K, snap.V); err != nil {
+					log.LogErrorf("ApplySnapshot: worker(%d) create dentry failed, partitionID(%v) err(%v)",
+						workerID, mp.config.PartitionId, err)
+					return err
+				}
+				if log.EnableDebug() {
+					log.LogDebugf("ApplySnapshot: worker(%d) create dentry: partitionID(%v)",
+						workerID, mp.config.PartitionId)
+				}
+				return nil
+			}
+		}
+
+		// Fallback to unmarshal path for memory mode or if type assertion fails
 		dentry := &Dentry{}
 		if err := dentry.UnmarshalKey(snap.K); err != nil {
 			return err

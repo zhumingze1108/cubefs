@@ -1739,9 +1739,6 @@ func (b *InodeRocks) Insert(handle interface{}, inode *Inode) error {
 		log.LogErrorf("[InodeRocksCreateSnapshot] write error %v, %v", key, err)
 		return err
 	}
-	if b.baseInfo.cursor < inode.Inode {
-		b.SetCursor(inode.Inode)
-	}
 	return nil
 }
 
@@ -1749,6 +1746,32 @@ func (b *InodeRocks) Insert(handle interface{}, inode *Inode) error {
 func (b *InodeRocks) PutRaw(handle interface{}, key, value []byte) error {
 	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.inodeCnt, key, value); err != nil {
 		log.LogErrorf("[InodeRocksPutRaw] write error key_len(%d) value_len(%d) err(%v)", len(key), len(value), err)
+		return err
+	}
+	return nil
+}
+
+// InsertForMemoryToRocksbSnapshot directly builds RocksDB format from memory leader snapshot without unmarshaling
+// Memory leader sends: snap.K = inodeID(8 bytes), snap.V = MarshalValue() result
+// RocksDB needs: key = partitionId(8) + tableType(1) + inodeID(8), value = keyLen(4) + keyData(8) + valLen(4) + valueData
+func (b *InodeRocks) InsertForMemoryToRocksbSnapshot(handle interface{}, snapK, snapV []byte) error {
+	// Build RocksDB key: partitionId(8) + tableType(1) + inodeID(8)
+	rocksKey := make([]byte, 8+1+8)
+	binary.BigEndian.PutUint64(rocksKey[0:8], b.RocksTree.partitionId)
+	rocksKey[8] = byte(InodeTable)
+	copy(rocksKey[9:], snapK)
+
+	// Build RocksDB value: keyLen(4) + keyData(8) + valLen(4) + valueData
+	keyDataLen := uint32(8)
+	valDataLen := uint32(len(snapV))
+	rocksValue := make([]byte, 4+8+4+len(snapV))
+	binary.BigEndian.PutUint32(rocksValue[0:4], keyDataLen)
+	copy(rocksValue[4:12], snapK)
+	binary.BigEndian.PutUint32(rocksValue[12:16], valDataLen)
+	copy(rocksValue[16:], snapV)
+
+	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.inodeCnt, rocksKey, rocksValue); err != nil {
+		log.LogErrorf("[InodeRocksInsertForMemoryToRocksbSnapshot] write error key_len(%d) value_len(%d) err(%v)", len(rocksKey), len(rocksValue), err)
 		return err
 	}
 	return nil
@@ -1813,6 +1836,37 @@ func (b *DentryRocks) Insert(handle interface{}, dentry *Dentry) error {
 func (b *DentryRocks) PutRaw(handle interface{}, key, value []byte) error {
 	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.dentryCnt, key, value); err != nil {
 		log.LogErrorf("[DentryRocksPutRaw] write error key_len(%d) value_len(%d) err(%v)", len(key), len(value), err)
+		return err
+	}
+	return nil
+}
+
+// InsertForMemoryToRocksbSnapshot directly builds RocksDB format from memory leader snapshot without unmarshaling
+// Memory leader sends: snap.K = parentId(8) + name (no separator), snap.V = Marshal() result
+// RocksDB needs: key = partitionId(8) + tableType(1) + parentId(8) + "\x00" + name, value = keyLen(4) + keyData + valLen(4) + valueData
+func (b *DentryRocks) InsertForMemoryToRocksbSnapshot(handle interface{}, snapK, snapV []byte) error {
+	// Build RocksDB key: partitionId(8) + tableType(1) + parentId(8) + "\x00" + name
+	parentId := binary.BigEndian.Uint64(snapK[0:8])
+	nameLen := len(snapK) - 8
+	rocksKey := make([]byte, 8+1+8+1+nameLen)
+	binary.BigEndian.PutUint64(rocksKey[0:8], b.RocksTree.partitionId)
+	rocksKey[8] = byte(DentryTable)
+	binary.BigEndian.PutUint64(rocksKey[9:17], parentId)
+	rocksKey[17] = 0
+	copy(rocksKey[18:], snapK[8:])
+
+	// Build RocksDB value: keyLen(4) + keyData + valLen(4) + valueData
+	keyDataWithSep := rocksKey[9:] // Skip partitionId(8) + tableType(1)
+	keyDataLen := uint32(len(keyDataWithSep))
+	valDataLen := uint32(len(snapV))
+	rocksValue := make([]byte, 4+len(keyDataWithSep)+4+len(snapV))
+	binary.BigEndian.PutUint32(rocksValue[0:4], keyDataLen)
+	copy(rocksValue[4:4+len(keyDataWithSep)], keyDataWithSep)
+	binary.BigEndian.PutUint32(rocksValue[4+len(keyDataWithSep):4+len(keyDataWithSep)+4], valDataLen)
+	copy(rocksValue[4+len(keyDataWithSep)+4:], snapV)
+
+	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.dentryCnt, rocksKey, rocksValue); err != nil {
+		log.LogErrorf("[DentryRocksInsertForMemoryToRocksbSnapshot] write error key_len(%d) value_len(%d) err(%v)", len(rocksKey), len(rocksValue), err)
 		return err
 	}
 	return nil
