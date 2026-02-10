@@ -42,34 +42,6 @@ func (s *MetaItem) MarshalJson() ([]byte, error) {
 	return json.Marshal(s)
 }
 
-// MarshalBinary marshals MetaItem to binary data.
-// Binary frame structure:
-//
-//	+------+----+------+------+------+------+
-//	| Item | Op | LenK |   K  | LenV |   V  |
-//	+------+----+------+------+------+------+
-//	| byte | 4  |  4   | LenK |  4   | LenV |
-//	+------+----+------+------+------+------+
-func (s *MetaItem) MarshalBinary() (result []byte, err error) {
-	keyLen := len(s.K)
-	valLen := len(s.V)
-	result = make([]byte, 4+4+keyLen+4+valLen)
-
-	offset := 0
-	binary.BigEndian.PutUint32(result[offset:], s.Op)
-	offset += 4
-
-	binary.BigEndian.PutUint32(result[offset:], uint32(keyLen))
-	offset += 4
-	copy(result[offset:], s.K)
-	offset += keyLen
-
-	binary.BigEndian.PutUint32(result[offset:], uint32(valLen))
-	offset += 4
-	copy(result[offset:], s.V)
-	return
-}
-
 // UnmarshalJson unmarshals binary data to MetaItem.
 func (s *MetaItem) UnmarshalJson(data []byte) error {
 	return json.Unmarshal(data, s)
@@ -109,6 +81,14 @@ func (s *MetaItem) UnmarshalBinary(raw []byte) (err error) {
 	return
 }
 
+// marshalMetaItem marshals MetaItem to binary data.
+// Binary frame structure:
+//
+//	+------+----+------+------+------+------+
+//	| Item | Op | LenK |   K  | LenV |   V  |
+//	+------+----+------+------+------+------+
+//	| byte | 4  |  4   | LenK |  4   | LenV |
+//	+------+----+------+------+------+------+
 func marshalMetaItem(op uint32, key, value []byte) []byte {
 	keyLen := len(key)
 	valLen := len(value)
@@ -176,20 +156,10 @@ const (
 	SiwKeyVerList
 )
 
-type SnapItemWrapper struct {
-	key   uint32
-	value interface{}
-}
-
-func (siw *SnapItemWrapper) MarshalKey() (k []byte) {
-	k = make([]byte, 8)
-	binary.BigEndian.PutUint32(k, siw.key)
-	return
-}
-
-func (siw *SnapItemWrapper) UnmarshalKey(k []byte) (err error) {
-	siw.key = binary.BigEndian.Uint32(k)
-	return
+func snapItemKey(key uint32) []byte {
+	k := make([]byte, 8)
+	binary.BigEndian.PutUint32(k, key)
+	return k
 }
 
 // newMetaItemIterator returns a new MetaItemIterator.
@@ -275,30 +245,30 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 				mp.config.PartitionId, si.applyID)
 		} else if si.SnapFormatVersion == SnapFormatVersion_1 {
 			// process snapshot format version
-			snapFormatVerKey := (&SnapItemWrapper{key: SiwKeySnapFormatVer}).MarshalKey()
+			snapFormatVerKey := snapItemKey(SiwKeySnapFormatVer)
 			snapFormatVerBuf := make([]byte, 8)
 			binary.BigEndian.PutUint32(snapFormatVerBuf, si.SnapFormatVersion)
 			produceItem(marshalMetaItem(opFSMSnapFormatVersion, snapFormatVerKey, snapFormatVerBuf))
 
 			// process apply index ID
-			applyIdKey := (&SnapItemWrapper{key: SiwKeyApplyId}).MarshalKey()
+			applyIdKey := snapItemKey(SiwKeyApplyId)
 			applyIDBuf := make([]byte, 8)
 			binary.BigEndian.PutUint64(applyIDBuf, si.applyID)
 			produceItem(marshalMetaItem(opFSMApplyId, applyIdKey, applyIDBuf))
 
 			// process txId
-			txIdKey := (&SnapItemWrapper{key: SiwKeyTxId}).MarshalKey()
+			txIdKey := snapItemKey(SiwKeyTxId)
 			txIDBuf := make([]byte, 8)
 			binary.BigEndian.PutUint64(txIDBuf, si.txId)
 			produceItem(marshalMetaItem(opFSMTxId, txIdKey, txIDBuf))
 
 			// process cursor
-			cursorKey := (&SnapItemWrapper{key: SiwKeyCursor}).MarshalKey()
+			cursorKey := snapItemKey(SiwKeyCursor)
 			cursorBuf := make([]byte, 8)
 			binary.BigEndian.PutUint64(cursorBuf, si.cursor)
 			produceItem(marshalMetaItem(opFSMCursor, cursorKey, cursorBuf))
 
-			verListKey := (&SnapItemWrapper{key: SiwKeyVerList}).MarshalKey()
+			verListKey := snapItemKey(SiwKeyVerList)
 			verListBuf, err := json.Marshal(si.verList)
 			if err != nil {
 				produceError(err)
@@ -311,7 +281,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 
 			if si.uniqID != 0 {
 				// process uniqId
-				uniqIdKey := (&SnapItemWrapper{key: SiwKeyUniqId}).MarshalKey()
+				uniqIdKey := snapItemKey(SiwKeyUniqId)
 				uniqIdBuf := make([]byte, 8)
 				binary.BigEndian.PutUint64(uniqIdBuf, si.uniqID)
 				produceItem(marshalMetaItem(opFSMUniqIDSnap, uniqIdKey, uniqIdBuf))
