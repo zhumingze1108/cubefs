@@ -828,6 +828,7 @@ func (mp *metaPartition) applySnapshotProducer(
 	dataCh chan<- *snapshotItem,
 	errCh chan<- error,
 	doneCh <-chan struct{},
+	cancel func(),
 ) {
 	defer close(dataCh)
 	idx := 0
@@ -845,6 +846,7 @@ func (mp *metaPartition) applySnapshotProducer(
 			case errCh <- fmt.Errorf("partition(%v) is closed", mp.config.PartitionId):
 			default:
 			}
+			cancel()
 			return
 		}
 
@@ -861,6 +863,7 @@ func (mp *metaPartition) applySnapshotProducer(
 			case errCh <- err:
 			default:
 			}
+			cancel()
 			return
 		}
 
@@ -1194,6 +1197,7 @@ func (mp *metaPartition) applySnapshotWorker(
 	leaderSnapFormatVer *uint32,
 	errCh chan<- error,
 	doneCh <-chan struct{},
+	cancel func(),
 ) {
 	// Create independent write batch handle
 	dbWriteHandle, err := mp.inodeTree.CreateBatchWriteHandle()
@@ -1203,6 +1207,7 @@ func (mp *metaPartition) applySnapshotWorker(
 		case errCh <- err:
 		default:
 		}
+		cancel()
 		return
 	}
 	defer mp.inodeTree.ReleaseBatchWriteHandle(dbWriteHandle)
@@ -1239,87 +1244,94 @@ func (mp *metaPartition) applySnapshotWorker(
 		case errCh <- e:
 		default:
 		}
+		cancel()
 	}
 
-	for item := range dataCh {
-		// Check for errors
+	for {
 		select {
 		case <-doneCh:
 			return
-		default:
-		}
+		case item, ok := <-dataCh:
+			if !ok {
+				goto out
+			}
 
-		index := item.index
-		data := item.data
+			index := item.index
+			data := item.data
 
-		// Handle index==0 (format version or compatibility)
-		if index == 0 {
-			var processed bool
-			index0Once.Do(func() {
-				processed = true
-				snap := NewMetaItem(0, nil, nil)
-				if err := snap.UnmarshalBinary(data); err != nil {
-					// Compatibility: old format, index=0 is uint64 appIndexID
-					log.LogInfof("ApplySnapshot: snap.UnmarshalBinary failed in index=0, partitionID(%v), assuming snapshot format version_0",
-						mp.config.PartitionId)
-					atomic.StoreUint32(leaderSnapFormatVer, SnapFormatVersion_0)
-					atomic.StoreUint64(&agg.appIndexID, binary.BigEndian.Uint64(data))
-					close(index0Done)
-					return
+			// Handle index==0 (format version or compatibility)
+			if index == 0 {
+				var processed bool
+				index0Once.Do(func() {
+					processed = true
+					defer close(index0Done)
+					snap := NewMetaItem(0, nil, nil)
+					if err := snap.UnmarshalBinary(data); err != nil {
+						// Compatibility: old format, index=0 is uint64 appIndexID
+						log.LogInfof("ApplySnapshot: snap.UnmarshalBinary failed in index=0, partitionID(%v), assuming snapshot format version_0",
+							mp.config.PartitionId)
+						atomic.StoreUint32(leaderSnapFormatVer, SnapFormatVersion_0)
+						atomic.StoreUint64(&agg.appIndexID, binary.BigEndian.Uint64(data))
+						return
+					}
+
+					if snap.Op != opFSMSnapFormatVersion {
+						err := fmt.Errorf("snapshot format not match, partitionID(%v), index:%v, expect snap.Op:%v, actual snap.Op:%v",
+							mp.config.PartitionId, index, opFSMSnapFormatVersion, snap.Op)
+						log.LogWarnf("ApplySnapshot: %v", err.Error())
+						signalErr(err)
+						return
+					}
+					ver := binary.BigEndian.Uint32(snap.V)
+					atomic.StoreUint32(leaderSnapFormatVer, ver)
+					if ver != mp.manager.metaNode.raftSyncSnapFormatVersion {
+						log.LogWarnf("ApplySnapshot: snapshot format not match, partitionID(%v), index:%v, expect ver:%v, actual ver:%v",
+							mp.config.PartitionId, index, mp.manager.metaNode.raftSyncSnapFormatVersion, ver)
+					}
+				})
+				if processed {
+					continue
 				}
+				// Other workers skip index==0
+				continue
+			}
 
-				if snap.Op != opFSMSnapFormatVersion {
-					err := fmt.Errorf("snapshot format not match, partitionID(%v), index:%v, expect snap.Op:%v, actual snap.Op:%v",
-						mp.config.PartitionId, index, opFSMSnapFormatVersion, snap.Op)
-					log.LogWarnf("ApplySnapshot: %v", err.Error())
+			// Wait for index==0 processing to complete
+			select {
+			case <-index0Done:
+			case <-doneCh:
+				return
+			}
+
+			// Decode snapshot item
+			snap := NewMetaItem(0, nil, nil)
+			if err := snap.UnmarshalBinary(data); err != nil {
+				log.LogErrorf("ApplySnapshot: worker(%d) unmarshal failed, partitionID(%v) index(%v) err(%v)",
+					workerID, mp.config.PartitionId, index, err)
+				signalErr(fmt.Errorf("unmarshal snap data failed: %w", err))
+				return
+			}
+
+			// Process snapshot item
+			if err := mp.processSnapshotItem(workerID, snap, agg, dbWriteHandle, leaderSnapFormatVer); err != nil {
+				signalErr(err)
+				return
+			}
+
+			batchItems++
+			batchBytes += len(snap.K) + len(snap.V)
+
+			needFlush := batchItems >= applySnapBatchMaxItems || batchBytes >= applySnapBatchMaxBytes
+			if needFlush {
+				if err := flushBatch(); err != nil {
 					signalErr(err)
 					return
 				}
-				ver := binary.BigEndian.Uint32(snap.V)
-				atomic.StoreUint32(leaderSnapFormatVer, ver)
-				if ver != mp.manager.metaNode.raftSyncSnapFormatVersion {
-					log.LogWarnf("ApplySnapshot: snapshot format not match, partitionID(%v), index:%v, expect ver:%v, actual ver:%v",
-						mp.config.PartitionId, index, mp.manager.metaNode.raftSyncSnapFormatVersion, ver)
-				}
-				close(index0Done)
-			})
-			if processed {
-				continue
-			}
-			// Other workers skip index==0
-			continue
-		}
-
-		// Wait for index==0 processing to complete
-		<-index0Done
-
-		// Decode snapshot item
-		snap := NewMetaItem(0, nil, nil)
-		if err := snap.UnmarshalBinary(data); err != nil {
-			log.LogErrorf("ApplySnapshot: worker(%d) unmarshal failed, partitionID(%v) index(%v) err(%v)",
-				workerID, mp.config.PartitionId, index, err)
-			signalErr(fmt.Errorf("unmarshal snap data failed: %w", err))
-			return
-		}
-
-		// Process snapshot item
-		if err := mp.processSnapshotItem(workerID, snap, agg, dbWriteHandle, leaderSnapFormatVer); err != nil {
-			signalErr(err)
-			return
-		}
-
-		batchItems++
-		batchBytes += len(snap.K) + len(snap.V)
-
-		needFlush := batchItems >= applySnapBatchMaxItems || batchBytes >= applySnapBatchMaxBytes
-		if needFlush {
-			if err := flushBatch(); err != nil {
-				signalErr(err)
-				return
 			}
 		}
 	}
 
+out:
 	// Flush remaining batch
 	if err := flushBatch(); err != nil {
 		signalErr(err)
@@ -1349,12 +1361,19 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 	dataCh := make(chan *snapshotItem, itemChSize)
 	errCh := make(chan error, 1)
 	doneCh := make(chan struct{})
+	var cancelOnce sync.Once
+	cancel := func() {
+		cancelOnce.Do(func() {
+			close(doneCh)
+		})
+	}
+	defer cancel()
 	index0Done := make(chan struct{})
 	var index0Once sync.Once
 	leaderSnapFormatVer := uint32(math.MaxUint32)
 
 	// Start producer
-	go mp.applySnapshotProducer(iter, dataCh, errCh, doneCh)
+	go mp.applySnapshotProducer(iter, dataCh, errCh, doneCh, cancel)
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -1362,7 +1381,7 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			mp.applySnapshotWorker(id, dataCh, agg, index0Done, &index0Once, &leaderSnapFormatVer, errCh, doneCh)
+			mp.applySnapshotWorker(id, dataCh, agg, index0Done, &index0Once, &leaderSnapFormatVer, errCh, doneCh, cancel)
 		}(workerID)
 	}
 
