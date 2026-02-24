@@ -668,7 +668,10 @@ func (i *Inode) MarshalToJSON() ([]byte, error) {
 }
 
 func (i *Inode) MarshalV2(buff *buf.ByteBufExt) (err error) {
-	keyBytes := i.MarshalKey()
+	keyBuf := GetInodeBuf()
+	defer PutInodeBuf(keyBuf)
+	i.MarshalKeyV2(keyBuf)
+	keyBytes := keyBuf.Bytes()
 
 	tmpBuf := GetInodeBuf()
 	defer PutInodeBuf(tmpBuf)
@@ -809,6 +812,12 @@ func (i *Inode) MarshalKey() (k []byte) {
 	k = make([]byte, 8)
 	binary.BigEndian.PutUint64(k, i.Inode)
 	return
+}
+
+func (i *Inode) MarshalKeyV2(buff *buf.ByteBufExt) {
+	if err := buff.PutUint64(i.Inode); err != nil {
+		panic(err)
+	}
 }
 
 // UnmarshalKey unmarshals the exporterKey from bytes.

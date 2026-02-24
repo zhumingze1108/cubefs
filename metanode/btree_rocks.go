@@ -22,6 +22,9 @@ const (
 	RocksdbNormalKeySize = 32
 	RocksdbLongKeySize   = 1024
 	RocksdbTypeIndex     = 8
+
+	RocksdbValueInitSize = 4 * 1024
+	RocksdbValueMaxKeep  = 1 * 1024 * 1024
 )
 
 var ErrInvalidRocksdbValueLen = fmt.Errorf("invalid value len")
@@ -57,6 +60,12 @@ var RocksdbLongKeyPool = sync.Pool{
 	},
 }
 
+var RocksdbValuePool = sync.Pool{
+	New: func() interface{} {
+		return buf.NewByteBufEx(RocksdbValueInitSize)
+	},
+}
+
 func GetRocksdbNormalKey() *buf.ByteBufExt {
 	return RocksdbNormalKeyPool.Get().(*buf.ByteBufExt)
 }
@@ -73,6 +82,22 @@ func GetRocksdbLongKey() *buf.ByteBufExt {
 func PutRocksdbLongKey(buf *buf.ByteBufExt) {
 	buf.Reset()
 	RocksdbLongKeyPool.Put(buf)
+}
+
+func GetRocksdbValueBuf() *buf.ByteBufExt {
+	return RocksdbValuePool.Get().(*buf.ByteBufExt)
+}
+
+func PutRocksdbValueBuf(b *buf.ByteBufExt) {
+	if b == nil {
+		return
+	}
+	// Avoid pool bloat due to sporadic huge values.
+	if b.Cap() > RocksdbValueMaxKeep {
+		return
+	}
+	b.Reset()
+	RocksdbValuePool.Put(b)
 }
 
 func (info *RocksBaseInfo) MarshalV0() (result []byte, err error) {
@@ -1751,30 +1776,61 @@ func (b *InodeRocks) PutRaw(handle interface{}, key, value []byte) error {
 	return nil
 }
 
-// InsertForMemoryToRocksbSnapshot directly builds RocksDB format from memory leader snapshot without unmarshaling
-// Memory leader sends: snap.K = inodeID(8 bytes), snap.V = MarshalValue() result
-// RocksDB needs: key = partitionId(8) + tableType(1) + inodeID(8), value = keyLen(4) + keyData(8) + valLen(4) + valueData
+// InsertForMemoryToRocksbSnapshot is a snapshot replay fast-path for the case:
+// - leader uses memory store and sends snapshot items as (snapK, snapV) where:
+//   - snapK is the inode key bytes (8 bytes inodeID, i.e. Inode.MarshalKeyV2 output)
+//   - snapV is the inode value bytes (i.e. Inode.MarshalValueV2 output)
+//
+// We avoid unmarshaling snapK/snapV into an Inode object. Instead we re-frame them into RocksDB format:
+// - rocksKey   = partitionId(8) + tableType(1) + inodeID(8)
+// - rocksValue = keyLen(4) + keyData(8) + valLen(4) + valueData
+//
+// Note: rocksKey/rocksValue are backed by pooled buffers. It's safe to return buffers to pools
+// after CreateWithoutGet because gorocksdb.WriteBatch.Put copies key/value into the batch.
 func (b *InodeRocks) InsertForMemoryToRocksbSnapshot(handle interface{}, snapK, snapV []byte) error {
-	// Build RocksDB key: partitionId(8) + tableType(1) + inodeID(8)
-	rocksKey := make([]byte, 8+1+8)
-	binary.BigEndian.PutUint64(rocksKey[0:8], b.RocksTree.partitionId)
-	rocksKey[8] = byte(InodeTable)
-	copy(rocksKey[9:], snapK)
+	keyBuf := GetRocksdbNormalKey()
+	defer PutRocksdbNormalKey(keyBuf)
+	valBuf := GetRocksdbValueBuf()
+	defer PutRocksdbValueBuf(valBuf)
 
-	// Build RocksDB value: keyLen(4) + keyData(8) + valLen(4) + valueData
-	keyDataLen := uint32(8)
-	valDataLen := uint32(len(snapV))
-	rocksValue := make([]byte, 4+8+4+len(snapV))
-	binary.BigEndian.PutUint32(rocksValue[0:4], keyDataLen)
-	copy(rocksValue[4:12], snapK)
-	binary.BigEndian.PutUint32(rocksValue[12:16], valDataLen)
-	copy(rocksValue[16:], snapV)
+	rocksKey, rocksValue := inodeRocksKVFromMemorySnapshot(b.RocksTree.partitionId, keyBuf, valBuf, snapK, snapV)
 
 	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.inodeCnt, rocksKey, rocksValue); err != nil {
 		log.LogErrorf("[InodeRocksInsertForMemoryToRocksbSnapshot] write error key_len(%d) value_len(%d) err(%v)", len(rocksKey), len(rocksValue), err)
 		return err
 	}
 	return nil
+}
+
+func inodeRocksKVFromMemorySnapshot(partitionId uint64, keyBuf, valBuf *buf.ByteBufExt, snapK, snapV []byte) (rocksKey, rocksValue []byte) {
+	// rocksKey = partitionId(8) + tableType(1) + inodeID(8)
+	keyBuf.Reset()
+	if err := keyBuf.PutUint64(partitionId); err != nil {
+		panic(err)
+	}
+	if err := keyBuf.WriteByte(byte(InodeTable)); err != nil {
+		panic(err)
+	}
+	if _, err := keyBuf.Write(snapK); err != nil {
+		panic(err)
+	}
+
+	// rocksValue = keyLen(4) + keyData(8) + valLen(4) + valueData
+	valBuf.Reset()
+	if err := valBuf.PutUint32(uint32(8)); err != nil {
+		panic(err)
+	}
+	if _, err := valBuf.Write(snapK); err != nil {
+		panic(err)
+	}
+	if err := valBuf.PutUint32(uint32(len(snapV))); err != nil {
+		panic(err)
+	}
+	if _, err := valBuf.Write(snapV); err != nil {
+		panic(err)
+	}
+
+	return keyBuf.Bytes(), valBuf.Bytes()
 }
 
 func (b *DentryRocks) ReplaceOrInsert(handle interface{}, dentry *Dentry, replace bool) (den *Dentry, ok bool, err error) {
@@ -1841,35 +1897,73 @@ func (b *DentryRocks) PutRaw(handle interface{}, key, value []byte) error {
 	return nil
 }
 
-// InsertForMemoryToRocksbSnapshot directly builds RocksDB format from memory leader snapshot without unmarshaling
-// Memory leader sends: snap.K = parentId(8) + name (no separator), snap.V = Marshal() result
-// RocksDB needs: key = partitionId(8) + tableType(1) + parentId(8) + "\x00" + name, value = keyLen(4) + keyData + valLen(4) + valueData
+// InsertForMemoryToRocksbSnapshot is a snapshot replay fast-path for the case:
+// - leader uses memory store and sends snapshot items as (snapK, snapV) where:
+//   - snapK is the dentry key bytes: parentId(8) + name (no separator), i.e. Dentry.MarshalKeyV2 output
+//   - snapV is the dentry value bytes, i.e. Dentry.MarshalValueV2 output
+//
+// We avoid unmarshaling snapK/snapV into a Dentry object. Instead we re-frame them into RocksDB format:
+// - rocksKey   = partitionId(8) + tableType(1) + parentId(8) + \"\\x00\" + name
+// - rocksValue = keyLen(4) + keyData(with separator) + valLen(4) + valueData
+//
+// Note: rocksKey/rocksValue are backed by pooled buffers. It's safe to return buffers to pools
+// after CreateWithoutGet because gorocksdb.WriteBatch.Put copies key/value into the batch.
 func (b *DentryRocks) InsertForMemoryToRocksbSnapshot(handle interface{}, snapK, snapV []byte) error {
-	// Build RocksDB key: partitionId(8) + tableType(1) + parentId(8) + "\x00" + name
-	parentId := binary.BigEndian.Uint64(snapK[0:8])
-	nameLen := len(snapK) - 8
-	rocksKey := make([]byte, 8+1+8+1+nameLen)
-	binary.BigEndian.PutUint64(rocksKey[0:8], b.RocksTree.partitionId)
-	rocksKey[8] = byte(DentryTable)
-	binary.BigEndian.PutUint64(rocksKey[9:17], parentId)
-	rocksKey[17] = 0
-	copy(rocksKey[18:], snapK[8:])
+	keyBuf := GetRocksdbLongKey()
+	defer PutRocksdbLongKey(keyBuf)
+	valBuf := GetRocksdbValueBuf()
+	defer PutRocksdbValueBuf(valBuf)
 
-	// Build RocksDB value: keyLen(4) + keyData + valLen(4) + valueData
-	keyDataWithSep := rocksKey[9:] // Skip partitionId(8) + tableType(1)
-	keyDataLen := uint32(len(keyDataWithSep))
-	valDataLen := uint32(len(snapV))
-	rocksValue := make([]byte, 4+len(keyDataWithSep)+4+len(snapV))
-	binary.BigEndian.PutUint32(rocksValue[0:4], keyDataLen)
-	copy(rocksValue[4:4+len(keyDataWithSep)], keyDataWithSep)
-	binary.BigEndian.PutUint32(rocksValue[4+len(keyDataWithSep):4+len(keyDataWithSep)+4], valDataLen)
-	copy(rocksValue[4+len(keyDataWithSep)+4:], snapV)
+	rocksKey, rocksValue := dentryRocksKVFromMemorySnapshot(b.RocksTree.partitionId, keyBuf, valBuf, snapK, snapV)
 
 	if err := b.RocksTree.CreateWithoutGet(handle, &b.baseInfo.dentryCnt, rocksKey, rocksValue); err != nil {
 		log.LogErrorf("[DentryRocksInsertForMemoryToRocksbSnapshot] write error key_len(%d) value_len(%d) err(%v)", len(rocksKey), len(rocksValue), err)
 		return err
 	}
 	return nil
+}
+
+func dentryRocksKVFromMemorySnapshot(partitionId uint64, keyBuf, valBuf *buf.ByteBufExt, snapK, snapV []byte) (rocksKey, rocksValue []byte) {
+	// snapK = parentId(8) + name(no separator)
+	parentId := binary.BigEndian.Uint64(snapK[0:8])
+
+	// rocksKey = partitionId(8) + tableType(1) + parentId(8) + "\x00" + name
+	keyBuf.Reset()
+	if err := keyBuf.PutUint64(partitionId); err != nil {
+		panic(err)
+	}
+	if err := keyBuf.WriteByte(byte(DentryTable)); err != nil {
+		panic(err)
+	}
+	if err := keyBuf.PutUint64(parentId); err != nil {
+		panic(err)
+	}
+	if err := keyBuf.WriteByte(0); err != nil {
+		panic(err)
+	}
+	if _, err := keyBuf.Write(snapK[8:]); err != nil {
+		panic(err)
+	}
+	rocksKey = keyBuf.Bytes()
+
+	// rocksValue = keyLen(4) + keyData(with separator) + valLen(4) + valueData
+	keyDataWithSep := rocksKey[9:] // Skip partitionId(8) + tableType(1)
+	valBuf.Reset()
+	if err := valBuf.PutUint32(uint32(len(keyDataWithSep))); err != nil {
+		panic(err)
+	}
+	if _, err := valBuf.Write(keyDataWithSep); err != nil {
+		panic(err)
+	}
+	if err := valBuf.PutUint32(uint32(len(snapV))); err != nil {
+		panic(err)
+	}
+	if _, err := valBuf.Write(snapV); err != nil {
+		panic(err)
+	}
+	rocksValue = valBuf.Bytes()
+
+	return rocksKey, rocksValue
 }
 
 func (b *ExtendRocks) ReplaceOrInsert(handle interface{}, extend *Extend, replace bool) (ext *Extend, ok bool, err error) {

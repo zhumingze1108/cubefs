@@ -26,6 +26,7 @@ import (
 	"sync"
 
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/util/buf"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/log"
 )
@@ -89,21 +90,23 @@ func (s *MetaItem) UnmarshalBinary(raw []byte) (err error) {
 //	+------+----+------+------+------+------+
 //	| byte | 4  |  4   | LenK |  4   | LenV |
 //	+------+----+------+------+------+------+
-func marshalMetaItem(op uint32, key, value []byte) []byte {
-	keyLen := len(key)
-	valLen := len(value)
-	result := make([]byte, 4+4+keyLen+4+valLen)
-	offset := 0
-	binary.BigEndian.PutUint32(result[offset:], op)
-	offset += 4
-	binary.BigEndian.PutUint32(result[offset:], uint32(keyLen))
-	offset += 4
-	copy(result[offset:], key)
-	offset += keyLen
-	binary.BigEndian.PutUint32(result[offset:], uint32(valLen))
-	offset += 4
-	copy(result[offset:], value)
-	return result
+func marshalMetaItemToBuf(b *buf.ByteBufExt, op uint32, key, value []byte) {
+	b.Reset()
+	if err := b.PutUint32(op); err != nil {
+		panic(err)
+	}
+	if err := b.PutUint32(uint32(len(key))); err != nil {
+		panic(err)
+	}
+	if _, err := b.Write(key); err != nil {
+		panic(err)
+	}
+	if err := b.PutUint32(uint32(len(value))); err != nil {
+		panic(err)
+	}
+	if _, err := b.Write(value); err != nil {
+		panic(err)
+	}
 }
 
 // NewMetaItem returns a new MetaItem.
@@ -139,11 +142,12 @@ type MetaItemIterator struct {
 
 	filenames []string
 
-	dataCh    chan []byte
+	dataCh    chan *buf.ByteBufExt
 	errorCh   chan error
 	err       error
 	closeCh   chan struct{}
 	closeOnce sync.Once
+	lastBuf   *buf.ByteBufExt
 }
 
 // SnapItemWrapper key definition
@@ -184,7 +188,7 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 		return nil, errors.NewErrorf("get mp[%v] tree snap failed", mp.config.PartitionId)
 	}
 
-	si.dataCh = make(chan []byte, snapshotDataChBufferSize)
+	si.dataCh = make(chan *buf.ByteBufExt, snapshotDataChBufferSize)
 	si.errorCh = make(chan error, 1)
 	si.closeCh = make(chan struct{})
 
@@ -213,9 +217,9 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			close(iter.errorCh)
 			si.treeSnap.Close()
 		}()
-		produceItem := func(data []byte) (success bool) {
+		produceItem := func(b *buf.ByteBufExt) (success bool) {
 			select {
-			case iter.dataCh <- data:
+			case iter.dataCh <- b:
 				return true
 			case <-iter.closeCh:
 				return false
@@ -238,9 +242,14 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 
 		if si.SnapFormatVersion == SnapFormatVersion_0 {
 			// process index ID
-			applyIDBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(applyIDBuf, si.applyID)
-			produceItem(applyIDBuf)
+			b := GetMetaItemBuf()
+			if err := b.PutUint64(si.applyID); err != nil {
+				panic(err)
+			}
+			if !produceItem(b) {
+				PutMetaItemBuf(b)
+				return
+			}
 			log.LogDebugf("newMetaItemIterator: SnapFormatVersion_0, partitionId(%v), applyID(%v)",
 				mp.config.PartitionId, si.applyID)
 		} else if si.SnapFormatVersion == SnapFormatVersion_1 {
@@ -248,25 +257,45 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 			snapFormatVerKey := snapItemKey(SiwKeySnapFormatVer)
 			snapFormatVerBuf := make([]byte, 8)
 			binary.BigEndian.PutUint32(snapFormatVerBuf, si.SnapFormatVersion)
-			produceItem(marshalMetaItem(opFSMSnapFormatVersion, snapFormatVerKey, snapFormatVerBuf))
+			b := GetMetaItemBuf()
+			marshalMetaItemToBuf(b, opFSMSnapFormatVersion, snapFormatVerKey, snapFormatVerBuf)
+			if !produceItem(b) {
+				PutMetaItemBuf(b)
+				return
+			}
 
 			// process apply index ID
 			applyIdKey := snapItemKey(SiwKeyApplyId)
 			applyIDBuf := make([]byte, 8)
 			binary.BigEndian.PutUint64(applyIDBuf, si.applyID)
-			produceItem(marshalMetaItem(opFSMApplyId, applyIdKey, applyIDBuf))
+			b = GetMetaItemBuf()
+			marshalMetaItemToBuf(b, opFSMApplyId, applyIdKey, applyIDBuf)
+			if !produceItem(b) {
+				PutMetaItemBuf(b)
+				return
+			}
 
 			// process txId
 			txIdKey := snapItemKey(SiwKeyTxId)
 			txIDBuf := make([]byte, 8)
 			binary.BigEndian.PutUint64(txIDBuf, si.txId)
-			produceItem(marshalMetaItem(opFSMTxId, txIdKey, txIDBuf))
+			b = GetMetaItemBuf()
+			marshalMetaItemToBuf(b, opFSMTxId, txIdKey, txIDBuf)
+			if !produceItem(b) {
+				PutMetaItemBuf(b)
+				return
+			}
 
 			// process cursor
 			cursorKey := snapItemKey(SiwKeyCursor)
 			cursorBuf := make([]byte, 8)
 			binary.BigEndian.PutUint64(cursorBuf, si.cursor)
-			produceItem(marshalMetaItem(opFSMCursor, cursorKey, cursorBuf))
+			b = GetMetaItemBuf()
+			marshalMetaItemToBuf(b, opFSMCursor, cursorKey, cursorBuf)
+			if !produceItem(b) {
+				PutMetaItemBuf(b)
+				return
+			}
 
 			verListKey := snapItemKey(SiwKeyVerList)
 			verListBuf, err := json.Marshal(si.verList)
@@ -274,7 +303,12 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 				produceError(err)
 				return
 			}
-			produceItem(marshalMetaItem(opFSMVerListSnapShot, verListKey, verListBuf))
+			b = GetMetaItemBuf()
+			marshalMetaItemToBuf(b, opFSMVerListSnapShot, verListKey, verListBuf)
+			if !produceItem(b) {
+				PutMetaItemBuf(b)
+				return
+			}
 
 			log.LogDebugf("newMetaItemIterator: SnapFormatVersion_1, partitionId(%v) applyID(%v) txId(%v) cursor(%v) uniqID(%v) verList(%v)",
 				mp.config.PartitionId, si.applyID, si.txId, si.cursor, si.uniqID, si.verList)
@@ -284,7 +318,12 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 				uniqIdKey := snapItemKey(SiwKeyUniqId)
 				uniqIdBuf := make([]byte, 8)
 				binary.BigEndian.PutUint64(uniqIdBuf, si.uniqID)
-				produceItem(marshalMetaItem(opFSMUniqIDSnap, uniqIdKey, uniqIdBuf))
+				b = GetMetaItemBuf()
+				marshalMetaItemToBuf(b, opFSMUniqIDSnap, uniqIdKey, uniqIdBuf)
+				if !produceItem(b) {
+					PutMetaItemBuf(b)
+					return
+				}
 			}
 		} else {
 			panic(fmt.Sprintf("invalid raftSyncSnapFormatVersione: %v", si.SnapFormatVersion))
@@ -321,14 +360,34 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 						return false
 					}
 					inode := item.(*Inode)
-					return produceItem(marshalMetaItem(opFSMCreateInode, inode.MarshalKey(), inode.MarshalValue()))
+					keyBuf := GetInodeBuf()
+					inode.MarshalKeyV2(keyBuf)
+					key := keyBuf.Bytes()
+					valBuf := GetInodeBuf()
+					inode.MarshalValueV2(valBuf)
+					value := valBuf.Bytes()
+					metaBuf := GetMetaItemBuf()
+					marshalMetaItemToBuf(metaBuf, opFSMCreateInode, key, value)
+					success := produceItem(metaBuf)
+					if !success {
+						PutMetaItemBuf(metaBuf)
+					}
+					PutInodeBuf(keyBuf)
+					PutInodeBuf(valBuf)
+					return success
 				})
 			}
 			return iter.treeSnap.RangeRaw(InodeType, func(key, value []byte) bool {
 				if checkClose() {
 					return false
 				}
-				return produceItem(marshalMetaItem(opFSMRawInodeData, key, value))
+				metaBuf := GetMetaItemBuf()
+				marshalMetaItemToBuf(metaBuf, opFSMRawInodeData, key, value)
+				success := produceItem(metaBuf)
+				if !success {
+					PutMetaItemBuf(metaBuf)
+				}
+				return success
 			})
 		})
 
@@ -341,14 +400,34 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 						return false
 					}
 					dentry := item.(*Dentry)
-					return produceItem(marshalMetaItem(opFSMCreateDentry, dentry.MarshalKey(), dentry.MarshalValue()))
+					keyBuf := GetDentryBuf()
+					dentry.MarshalKeyV2(keyBuf)
+					key := keyBuf.Bytes()
+					valBuf := GetDentryBuf()
+					dentry.MarshalValueV2(valBuf)
+					value := valBuf.Bytes()
+					metaBuf := GetMetaItemBuf()
+					marshalMetaItemToBuf(metaBuf, opFSMCreateDentry, key, value)
+					success := produceItem(metaBuf)
+					if !success {
+						PutMetaItemBuf(metaBuf)
+					}
+					PutDentryBuf(keyBuf)
+					PutDentryBuf(valBuf)
+					return success
 				})
 			}
 			return iter.treeSnap.RangeRaw(DentryType, func(key, value []byte) bool {
 				if checkClose() {
 					return false
 				}
-				return produceItem(marshalMetaItem(opFSMRawDentryData, key, value))
+				metaBuf := GetMetaItemBuf()
+				marshalMetaItemToBuf(metaBuf, opFSMRawDentryData, key, value)
+				success := produceItem(metaBuf)
+				if !success {
+					PutMetaItemBuf(metaBuf)
+				}
+				return success
 			})
 		})
 
@@ -367,7 +446,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 						callbackErr = err
 						return false
 					}
-					return produceItem(marshalMetaItem(opFSMSetXAttr, nil, raw))
+					metaBuf := GetMetaItemBuf()
+					marshalMetaItemToBuf(metaBuf, opFSMSetXAttr, nil, raw)
+					success := produceItem(metaBuf)
+					if !success {
+						PutMetaItemBuf(metaBuf)
+					}
+					return success
 				})
 				if callbackErr != nil {
 					return callbackErr
@@ -378,7 +463,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 				if checkClose() {
 					return false
 				}
-				return produceItem(marshalMetaItem(opFSMRawExtendData, key, value))
+				metaBuf := GetMetaItemBuf()
+				marshalMetaItemToBuf(metaBuf, opFSMRawExtendData, key, value)
+				success := produceItem(metaBuf)
+				if !success {
+					PutMetaItemBuf(metaBuf)
+				}
+				return success
 			})
 		})
 
@@ -397,7 +488,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 						callbackErr = err
 						return false
 					}
-					return produceItem(marshalMetaItem(opFSMCreateMultipart, nil, raw))
+					metaBuf := GetMetaItemBuf()
+					marshalMetaItemToBuf(metaBuf, opFSMCreateMultipart, nil, raw)
+					success := produceItem(metaBuf)
+					if !success {
+						PutMetaItemBuf(metaBuf)
+					}
+					return success
 				})
 				if callbackErr != nil {
 					return callbackErr
@@ -408,7 +505,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 				if checkClose() {
 					return false
 				}
-				return produceItem(marshalMetaItem(opFSMRawMultipartData, key, value))
+				metaBuf := GetMetaItemBuf()
+				marshalMetaItemToBuf(metaBuf, opFSMRawMultipartData, key, value)
+				success := produceItem(metaBuf)
+				if !success {
+					PutMetaItemBuf(metaBuf)
+				}
+				return success
 			})
 		})
 
@@ -428,7 +531,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 							callbackErr = err
 							return false
 						}
-						return produceItem(marshalMetaItem(opFSMTxSnapshot, []byte(txInfo.TxID), val))
+						metaBuf := GetMetaItemBuf()
+						marshalMetaItemToBuf(metaBuf, opFSMTxSnapshot, []byte(txInfo.TxID), val)
+						success := produceItem(metaBuf)
+						if !success {
+							PutMetaItemBuf(metaBuf)
+						}
+						return success
 					})
 					if callbackErr != nil {
 						return callbackErr
@@ -439,7 +548,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 					if checkClose() {
 						return false
 					}
-					return produceItem(marshalMetaItem(opFSMRawTxData, key, value))
+					metaBuf := GetMetaItemBuf()
+					marshalMetaItemToBuf(metaBuf, opFSMRawTxData, key, value)
+					success := produceItem(metaBuf)
+					if !success {
+						PutMetaItemBuf(metaBuf)
+					}
+					return success
 				})
 			})
 
@@ -458,7 +573,17 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 							callbackErr = err
 							return false
 						}
-						return produceItem(marshalMetaItem(opFSMTxRbInodeSnapshot, txRbInode.inode.MarshalKey(), val))
+						keyBuf := GetInodeBuf()
+						txRbInode.inode.MarshalKeyV2(keyBuf)
+						key := keyBuf.Bytes()
+						PutInodeBuf(keyBuf)
+						metaBuf := GetMetaItemBuf()
+						marshalMetaItemToBuf(metaBuf, opFSMTxRbInodeSnapshot, key, val)
+						success := produceItem(metaBuf)
+						if !success {
+							PutMetaItemBuf(metaBuf)
+						}
+						return success
 					})
 					if callbackErr != nil {
 						return callbackErr
@@ -469,7 +594,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 					if checkClose() {
 						return false
 					}
-					return produceItem(marshalMetaItem(opFSMRawTxRbInodeData, key, value))
+					metaBuf := GetMetaItemBuf()
+					marshalMetaItemToBuf(metaBuf, opFSMRawTxRbInodeData, key, value)
+					success := produceItem(metaBuf)
+					if !success {
+						PutMetaItemBuf(metaBuf)
+					}
+					return success
 				})
 			})
 
@@ -488,7 +619,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 							callbackErr = err
 							return false
 						}
-						return produceItem(marshalMetaItem(opFSMTxRbDentrySnapshot, []byte(txRbDentry.txDentryInfo.GetKey()), val))
+						metaBuf := GetMetaItemBuf()
+						marshalMetaItemToBuf(metaBuf, opFSMTxRbDentrySnapshot, []byte(txRbDentry.txDentryInfo.GetKey()), val)
+						success := produceItem(metaBuf)
+						if !success {
+							PutMetaItemBuf(metaBuf)
+						}
+						return success
 					})
 					if callbackErr != nil {
 						return callbackErr
@@ -499,7 +636,13 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 					if checkClose() {
 						return false
 					}
-					return produceItem(marshalMetaItem(opFSMRawTxRbDentryData, key, value))
+					metaBuf := GetMetaItemBuf()
+					marshalMetaItemToBuf(metaBuf, opFSMRawTxRbDentryData, key, value)
+					success := produceItem(metaBuf)
+					if !success {
+						PutMetaItemBuf(metaBuf)
+					}
+					return success
 				})
 			})
 		}
@@ -515,7 +658,12 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 				produceError(err)
 				return
 			}
-			produceItem(marshalMetaItem(opFSMUniqCheckerSnap, nil, raw))
+			metaBuf := GetMetaItemBuf()
+			marshalMetaItemToBuf(metaBuf, opFSMUniqCheckerSnap, nil, raw)
+			if !produceItem(metaBuf) {
+				PutMetaItemBuf(metaBuf)
+				return
+			}
 			if checkClose() {
 				return
 			}
@@ -529,7 +677,10 @@ func newMetaItemIterator(mp *metaPartition) (si *MetaItemIterator, err error) {
 				produceError(err)
 				return
 			}
-			if !produceItem(marshalMetaItem(opExtentFileSnapshot, []byte(filename), raw)) {
+			metaBuf := GetMetaItemBuf()
+			marshalMetaItemToBuf(metaBuf, opExtentFileSnapshot, []byte(filename), raw)
+			if !produceItem(metaBuf) {
+				PutMetaItemBuf(metaBuf)
 				return
 			}
 		}
@@ -548,6 +699,25 @@ func (si *MetaItemIterator) Close() {
 	si.closeOnce.Do(func() {
 		close(si.closeCh)
 	})
+
+	// Best-effort: reclaim pooled buffers even if snapshot send terminates early.
+	if si.lastBuf != nil {
+		PutMetaItemBuf(si.lastBuf)
+		si.lastBuf = nil
+	}
+	for {
+		select {
+		case b, ok := <-si.dataCh:
+			if !ok {
+				return
+			}
+			if b != nil {
+				PutMetaItemBuf(b)
+			}
+		default:
+			return
+		}
+	}
 }
 
 // Next returns the next item.
@@ -556,15 +726,23 @@ func (si *MetaItemIterator) Next() (data []byte, err error) {
 		err = si.err
 		return
 	}
+	// Return the previous buffer to the pool. It's safe because the caller will
+	// not access the previous []byte after calling Next() again.
+	if si.lastBuf != nil {
+		PutMetaItemBuf(si.lastBuf)
+		si.lastBuf = nil
+	}
 	for {
 		var open bool
 		select {
-		case data, open = <-si.dataCh:
-			if data == nil || !open {
+		case b, open := <-si.dataCh:
+			if b == nil || !open {
 				err, si.err = io.EOF, io.EOF
 				si.Close()
 				return
 			}
+			si.lastBuf = b
+			data = b.Bytes()
 		case err, open = <-si.errorCh:
 			if !open {
 				// Disable error channel after it's closed so remaining dataCh items can drain.

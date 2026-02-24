@@ -7,8 +7,10 @@ import (
 )
 
 const (
-	inodeBufSize  = 40960 // size about 128G
-	dentryBufSize = 1024
+	inodeBufSize       = 40960 // size about 128G
+	dentryBufSize      = 1024
+	metaItemBufSize    = 64 * 1024
+	metaItemBufMaxKeep = 1 * 1024 * 1024
 )
 
 var inodeBufPool = sync.Pool{
@@ -20,6 +22,12 @@ var inodeBufPool = sync.Pool{
 var dentryBufPool = sync.Pool{
 	New: func() interface{} {
 		return buf.NewByteBufEx(dentryBufSize)
+	},
+}
+
+var metaItemBufPool = sync.Pool{
+	New: func() interface{} {
+		return buf.NewByteBufEx(metaItemBufSize)
 	},
 }
 
@@ -54,6 +62,25 @@ func PutDentryBuf(buf *buf.ByteBufExt) {
 		buf.Reset()
 		dentryBufPool.Put(buf)
 	}
+}
+
+// GetMetaItemBuf retrieves a meta item buffer from the pool
+func GetMetaItemBuf() *buf.ByteBufExt {
+	return metaItemBufPool.Get().(*buf.ByteBufExt)
+}
+
+// PutMetaItemBuf returns a meta item buffer to the pool
+// To avoid pool bloat, only keep buffers with capacity <= metaItemBufMaxKeep.
+func PutMetaItemBuf(b *buf.ByteBufExt) {
+	if b == nil {
+		return
+	}
+	// bytes.Buffer in Go 1.22 exposes Cap(); ByteBufExt embeds bytes.Buffer.
+	if b.Cap() > metaItemBufMaxKeep {
+		return
+	}
+	b.Reset()
+	metaItemBufPool.Put(b)
 }
 
 // GetReadBuf retrieves a read buffer from the pool

@@ -2,6 +2,7 @@ package metanode
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -210,5 +211,79 @@ func TestRocksBaseInfoMarshalWithoutApplyIDCompatibility(t *testing.T) {
 
 	if !bytes.Equal(dataV0, data) {
 		t.Errorf("MarshalWithoutApplyIDV0 and MarshalWithoutApplyID result not equal\nMarshalWithoutApplyIDV0: %v\nMarshalWithoutApplyID: %v", dataV0, data)
+	}
+}
+
+func TestInodeRocksKVFromMemorySnapshot_EncodingCompatibility(t *testing.T) {
+	partitionId := uint64(12345)
+	inodeId := uint64(67890)
+	snapK := make([]byte, 8)
+	binary.BigEndian.PutUint64(snapK, inodeId)
+	snapV := []byte("inode_value_payload")
+
+	// Expected (legacy make+offset layout)
+	expKey := make([]byte, 8+1+8)
+	binary.BigEndian.PutUint64(expKey[0:8], partitionId)
+	expKey[8] = byte(InodeTable)
+	copy(expKey[9:], snapK)
+
+	expVal := make([]byte, 4+8+4+len(snapV))
+	binary.BigEndian.PutUint32(expVal[0:4], uint32(8))
+	copy(expVal[4:12], snapK)
+	binary.BigEndian.PutUint32(expVal[12:16], uint32(len(snapV)))
+	copy(expVal[16:], snapV)
+
+	keyBuf := GetRocksdbNormalKey()
+	defer PutRocksdbNormalKey(keyBuf)
+	valBuf := GetRocksdbValueBuf()
+	defer PutRocksdbValueBuf(valBuf)
+
+	gotKey, gotVal := inodeRocksKVFromMemorySnapshot(partitionId, keyBuf, valBuf, snapK, snapV)
+
+	if !bytes.Equal(expKey, gotKey) {
+		t.Fatalf("inode rocksKey mismatch\nexp: %v\ngot: %v", expKey, gotKey)
+	}
+	if !bytes.Equal(expVal, gotVal) {
+		t.Fatalf("inode rocksValue mismatch\nexp: %v\ngot: %v", expVal, gotVal)
+	}
+}
+
+func TestDentryRocksKVFromMemorySnapshot_EncodingCompatibility(t *testing.T) {
+	partitionId := uint64(12345)
+	parentId := uint64(67890)
+	name := []byte("test_dentry")
+
+	snapK := make([]byte, 8+len(name))
+	binary.BigEndian.PutUint64(snapK[0:8], parentId)
+	copy(snapK[8:], name)
+	snapV := []byte("dentry_value_payload")
+
+	// Expected (legacy make+offset layout)
+	expKey := make([]byte, 8+1+8+1+len(name))
+	binary.BigEndian.PutUint64(expKey[0:8], partitionId)
+	expKey[8] = byte(DentryTable)
+	binary.BigEndian.PutUint64(expKey[9:17], parentId)
+	expKey[17] = 0
+	copy(expKey[18:], name)
+
+	keyDataWithSep := expKey[9:]
+	expVal := make([]byte, 4+len(keyDataWithSep)+4+len(snapV))
+	binary.BigEndian.PutUint32(expVal[0:4], uint32(len(keyDataWithSep)))
+	copy(expVal[4:4+len(keyDataWithSep)], keyDataWithSep)
+	binary.BigEndian.PutUint32(expVal[4+len(keyDataWithSep):4+len(keyDataWithSep)+4], uint32(len(snapV)))
+	copy(expVal[4+len(keyDataWithSep)+4:], snapV)
+
+	keyBuf := GetRocksdbLongKey()
+	defer PutRocksdbLongKey(keyBuf)
+	valBuf := GetRocksdbValueBuf()
+	defer PutRocksdbValueBuf(valBuf)
+
+	gotKey, gotVal := dentryRocksKVFromMemorySnapshot(partitionId, keyBuf, valBuf, snapK, snapV)
+
+	if !bytes.Equal(expKey, gotKey) {
+		t.Fatalf("dentry rocksKey mismatch\nexp: %v\ngot: %v", expKey, gotKey)
+	}
+	if !bytes.Equal(expVal, gotVal) {
+		t.Fatalf("dentry rocksValue mismatch\nexp: %v\ngot: %v", expVal, gotVal)
 	}
 }

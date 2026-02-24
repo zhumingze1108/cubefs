@@ -107,47 +107,7 @@ func (b *MemSnapShot) RangeReuseDentry(cb func(item *Dentry) bool) error {
 
 // RangeRaw for memory mode - marshal items to bytes
 func (b *MemSnapShot) RangeRaw(tp TreeType, cb func(key, value []byte) bool) error {
-	return b.Range(tp, func(item interface{}) bool {
-		// For memory mode, we need to marshal the item
-		// This is not truly zero-copy, but maintains interface compatibility
-		var key, value []byte
-		switch tp {
-		case InodeType:
-			inode := item.(*Inode)
-			key = inode.MarshalKey()
-			value = inode.MarshalValue()
-		case DentryType:
-			dentry := item.(*Dentry)
-			key = dentry.MarshalKey()
-			value = dentry.MarshalValue()
-		case ExtendType:
-			extend := item.(*Extend)
-			if bs, err := extend.Bytes(); err == nil {
-				value = bs
-			}
-		case MultipartType:
-			multipart := item.(*Multipart)
-			if bs, err := multipart.Bytes(); err == nil {
-				value = bs
-			}
-		case TransactionType:
-			tx := item.(*proto.TransactionInfo)
-			if bs, err := tx.Marshal(); err == nil {
-				value = bs
-			}
-		case TransactionRollbackInodeType:
-			rbInode := item.(*TxRollbackInode)
-			if bs, err := rbInode.Marshal(); err == nil {
-				value = bs
-			}
-		case TransactionRollbackDentryType:
-			rbDentry := item.(*TxRollbackDentry)
-			if bs, err := rbDentry.Marshal(); err == nil {
-				value = bs
-			}
-		}
-		return cb(key, value)
-	})
+	return nil
 }
 
 func (b *MemSnapShot) Close() {}
