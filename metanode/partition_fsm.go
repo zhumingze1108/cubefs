@@ -1532,6 +1532,7 @@ func (mp *metaPartition) finalizeApplySnapshot(agg *applySnapshotAggregator) err
 		uniqChecker:  uniqChecker.clone(),
 		multiVerList: mp.GetVerList(),
 		snap:         snap,
+		applyIndex:   appIndexID,
 	}
 
 	// Block until store snapshot completes

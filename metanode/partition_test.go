@@ -16,6 +16,7 @@ package metanode
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path"
@@ -245,7 +246,11 @@ func prepareDataForMpTest(t *testing.T, mp *metaPartition) {
 	_, _, err = mp.multipartTree.ReplaceOrInsert(handle, &Multipart{}, true)
 	require.NoError(t, err)
 
-	_, _, err = mp.txProcessor.txManager.txTree.ReplaceOrInsert(handle, proto.NewTransactionInfo(0, 0), true)
+	tx := proto.NewTransactionInfo(60, proto.TxTypeUndefined)
+	tx.TxID = fmt.Sprintf("tx_%d", time.Now().UnixNano())
+	tx.CreateTime = time.Now().Unix()
+	tx.TmID = int64(mp.config.PartitionId)
+	_, _, err = mp.txProcessor.txManager.txTree.ReplaceOrInsert(handle, tx, true)
 	require.NoError(t, err)
 
 	_, _, err = mp.txProcessor.txResource.txRbInodeTree.ReplaceOrInsert(handle, NewTxRollbackInode(ino, []uint32{}, proto.NewTxInodeInfo("", 0, 0), 0), true)
